@@ -1,4 +1,8 @@
+#include <Poseidon/Game/Compat/ArmaOriginalUi.hpp>
+#include <Poseidon/UI/ArmaContentMenu.hpp>
+#include <Poseidon/UI/Arma3Menu.hpp>
 #include <Poseidon/UI/LocalMapsDisplay.hpp>
+#include <Poseidon/UI/WholeWorldDisplay.hpp>
 #include <Poseidon/UI/LocalMapEditor.hpp>
 
 #include <Poseidon/Foundation/Platform/InitBridge.hpp> // IsMenuOverriddenByMod (custom-menu hijack)
@@ -60,6 +64,7 @@ using namespace Poseidon;
 #include <vector>
 #include <Poseidon/Foundation/Containers/Array.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/Foundation/Framework/AppFrame.hpp>
 #include <Poseidon/Foundation/Strings/RString.hpp>
 #include <Poseidon/Foundation/Types/LLinks.hpp>
@@ -185,6 +190,24 @@ DisplayMain::DisplayMain(ControlsContainer* parent) : Display(parent)
         return;
     }
 
+    // --arma-original-ui with Arma 3 mounted: Arma 3's own RscDisplayMain, read from its config and
+    // drawn by Arma3Menu; none of CWA's entries or branding are added to it.
+    if (Arma3Menu::Active())
+    {
+        _arma3 = std::make_shared<Arma3Menu::Screen>();
+        if (_arma3->Load(*this, "RscDisplayMain", _controlsBackground, _controlsForeground))
+        {
+            _arma3->InitMainMenu();
+            // the version panel: Arma 3 shows its own build there; this is not Arma 3's executable
+            _arma3->SetText(IDC_MAIN_VERSION, RString("OpenPoseidon"));
+            if (IControl* quit = GetCtrl(IDC_MAIN_QUIT))
+                quit->EnableCtrl(true);
+            NextCtrl();
+            return;
+        }
+        _arma3.reset();
+    }
+
     // Remaster main menu: inherits the locked vanilla RscDisplayMain
     // layout but overrides the CWA logo control to use cwr_logo.paa.
     // Defined in resources/menu/splashLogo.hpp, merged at runtime by
@@ -200,11 +223,16 @@ DisplayMain::DisplayMain(ControlsContainer* parent) : Display(parent)
     // menu. Without this the base RscDisplayMainRemaster — restored by
     // MergeBaseResourceExtra so the Options screen works — would replace the mod's
     // menu and lose its branding.
-    const char* mainRsc = (!IsMenuOverriddenByMod() && Res.FindEntry("RscDisplayMainRemaster"))
-                              ? "RscDisplayMainRemaster"
-                              : "RscDisplayMain";
+    // --arma-original-ui: the mounted Arma game's own menu (ArmaOriginalUi), not the remaster's.
+    const char* mainRsc =
+        (!ArmaOriginalUi::Switched("RscDisplayMain") && !IsMenuOverriddenByMod() && Res.FindEntry("RscDisplayMainRemaster"))
+            ? "RscDisplayMainRemaster"
+            : "RscDisplayMain";
+    const ParamEntry& menuCls = ArmaOriginalUi::Resource(mainRsc);
     Load(mainRsc);
-    if (QIFStreamB::FileExist("assets\\ui\\openposeidon_logo.paa"))
+    // The original Arma menu is shown as that game drew it: no OpenPoseidon logo, no added entries.
+    const bool armaMenu = ArmaOriginalUi::Switched("RscDisplayMain");
+    if (!armaMenu && QIFStreamB::FileExist("assets\\ui\\openposeidon_logo.paa"))
     {
         for (int i = 0; i < _controlsForeground.Size(); ++i)
         {
@@ -224,16 +252,23 @@ DisplayMain::DisplayMain(ControlsContainer* parent) : Display(parent)
         logo->Add("text", RString("\\assets\\ui\\openposeidon_logo.paa"));
         // Keep branding within the menu's visible area, below the intro's
         // cinema border and clear of the right-hand menu entries.
-        logo->Add("x", 0.07f);
+        // UI coordinates are fractions of the screen's width and height, so a fixed w/h stretches the
+        // picture on any screen that is not 16:9. Keep the logo's own 1230x1278 proportions at the
+        // real aspect, centred in the box it always had.
+        constexpr float LogoAspect = 1230.0f / 1278.0f, BoxX = 0.07f, BoxW = 0.20f, LogoH = 0.36f;
+        const float screenAspect =
+            GEngine && GEngine->Height() > 0 ? float(GEngine->Width()) / float(GEngine->Height()) : 16.0f / 9.0f;
+        const float logoW = LogoAspect * LogoH / std::max(0.5f, screenAspect);
+        logo->Add("x", BoxX + (BoxW - logoW) * 0.5f);
         logo->Add("y", 0.25f);
-        logo->Add("w", 0.20f);
-        logo->Add("h", 0.36f);
+        logo->Add("w", logoW);
+        logo->Add("h", LogoH);
         ParamEntry* background = logo->AddArray("colorBackground");
         for (int channel = 0; channel < 4; ++channel)
             background->AddValue(0.0f);
         ParamEntry* foreground = logo->AddArray("colorText");
         for (int channel = 0; channel < 4; ++channel)
-            foreground->AddValue(1.0f);
+            foreground->AddValue(channel < 3 ? 1.0f : 0.75f); // a little transparent over the scene
         LoadControl(*logo);
     }
     //	LoadHeader();
@@ -244,10 +279,10 @@ DisplayMain::DisplayMain(ControlsContainer* parent) : Display(parent)
     // row. idc=119 dispatches through GameModuleRegistry (DisplayMain::OnButtonClicked)
     // to the Mods screen, so wiring it is automatic. Heuristic finds Quit by its
     // standard class name; extend as more community menus are tested.
-    if (GetCtrl(IDC_MAIN_MODS) == nullptr && GameModuleRegistry::FindByIDC(IDC_MAIN_MODS) != nullptr)
+    if (!armaMenu && GetCtrl(IDC_MAIN_MODS) == nullptr && GameModuleRegistry::FindByIDC(IDC_MAIN_MODS) != nullptr)
     {
         Control* quit = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_QUIT));
-        ParamEntry* quitCls = Res.FindEntry(mainRsc) ? (Res >> mainRsc).FindEntry("Quit") : nullptr;
+        ParamEntry* quitCls = menuCls.FindEntry("Quit");
         if (quit != nullptr && quitCls != nullptr && quitCls->IsClass())
         {
             static ParamFile s_modsInjectCfg; // outlives the control (it back-references the class)
@@ -284,43 +319,74 @@ DisplayMain::DisplayMain(ControlsContainer* parent) : Display(parent)
         }
     }
 
-    // Local content browser is a normal main-menu entry and does not require --dev.
-    if (Control* quit = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_QUIT)))
+    // Local content browser and whole-world entry are normal main-menu entries (no --dev needed). They are
+    // clones of a column entry (Multiplayer, else Quit) so they share its font and alignment, stacked under
+    // it at the column's own row pitch. Only other menu ENTRIES count as obstacles: the menu also holds
+    // large pictures and lines, and treating those as occupied once pushed both entries onto one spot.
+    const auto injectEntry = [&](ParamFile& resource, const char* className, int idc, const char* label)
     {
-        ParamEntry* source = Res.FindEntry(mainRsc) ? (Res >> mainRsc).FindEntry("Quit") : nullptr;
-        if (source && source->IsClass())
+        const bool menu = menuCls.IsClass();
+        Control* anchor = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_MULTIPLAYER));
+        ParamEntry* source = menu ? menuCls.FindEntry("Multiplayer") : nullptr;
+        if (!anchor || !source || !source->IsClass())
         {
-            static ParamFile mapButtonResource;
-            mapButtonResource.Clear();
-            ParamClass* cls = mapButtonResource.AddClass("LocalMapsButton");
-            cls->Add("idc", LocalMapsMenuId);
-            cls->Add("text", RString("Local maps"));
-            cls->SetBase(source->GetClassInterface());
-            LoadControl(*cls);
-            if (Control* button = dynamic_cast<Control*>(GetCtrl(LocalMapsMenuId)))
-            {
-                std::vector<MainMenuControlRect> foreground;
-                for (int i = 0; i < _controlsForeground.Size(); ++i)
-                {
-                    Control* control = _controlsForeground[i];
-                    if (control && control != quit && control != button)
-                        foreground.push_back({control->X(), control->Y(), control->W(), control->H(), control->IsVisible()});
-                }
-                auto pos = CalculateMainMenuModsPlacement(
-                    {quit->X(), quit->Y(), quit->W(), quit->H(), quit->IsVisible()}, foreground);
-                const auto overlaps = [&](float x, float y) {
-                    for (const auto& other : foreground)
-                        if (other.visible && x < other.x + other.w && x + pos.w > other.x &&
-                            y < other.y + other.h && y + pos.h > other.y) return true;
-                    return false;
-                };
-                // Horizontal custom menus may already have Mods beside Quit.
-                for (int row = 0; row < 12 && overlaps(pos.x, pos.y); ++row)
-                    pos.y = 0.08f + row * (pos.h + 0.01f);
-                button->SetPos(pos.x, pos.y, pos.w, pos.h);
-            }
+            anchor = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_QUIT));
+            source = menu ? menuCls.FindEntry("Quit") : nullptr;
         }
-    }
+        if (armaMenu || !anchor || !source || !source->IsClass())
+            return;
+        resource.Clear();
+        ParamClass* cls = resource.AddClass(className);
+        cls->Add("idc", idc);
+        cls->Add("text", RString(label));
+        cls->SetBase(source->GetClassInterface());
+        LoadControl(*cls);
+        Control* button = dynamic_cast<Control*>(GetCtrl(idc));
+        if (!button)
+            return;
+        std::vector<MainMenuControlRect> entries;
+        for (int i = 0; i < _controlsForeground.Size(); ++i)
+        {
+            Control* control = _controlsForeground[i];
+            if (control && control != button && control->IsVisible() && dynamic_cast<CActiveText*>(control))
+                entries.push_back({control->X(), control->Y(), control->W(), control->H(), true});
+        }
+        const float w = anchor->W(), h = anchor->H();
+        float pitch = h * 1.2f;
+        if (Control* single = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_SINGLE)))
+            if (const float step = anchor->Y() - single->Y(); step > h * 0.9f && step < h * 2.5f)
+                pitch = step;
+        const auto free = [&](float x, float y)
+        {
+            if (y < 0.02f || y + h > 0.97f)
+                return false;
+            for (const auto& other : entries) // a hair of margin: labels are drawn taller than their row
+                if (x < other.x + other.w && x + w > other.x && y < other.y + other.h + 0.004f &&
+                    y + h + 0.004f > other.y)
+                    return false;
+            return true;
+        };
+        for (int k = 1; k <= 12; ++k)
+            for (const float y : {anchor->Y() + k * pitch, anchor->Y() - k * pitch})
+                if (free(anchor->X(), y))
+                {
+                    button->SetPos(anchor->X(), y, w, h);
+                    return;
+                }
+        // No room in the column: the old placement beside Quit.
+        if (Control* quit = dynamic_cast<Control*>(GetCtrl(IDC_MAIN_QUIT)))
+        {
+            const auto pos = CalculateMainMenuModsPlacement({quit->X(), quit->Y(), quit->W(), quit->H(), true}, entries);
+            button->SetPos(pos.x, pos.y, pos.w, pos.h);
+        }
+    };
+    static ParamFile mapButtonResource, worldButtonResource;
+    injectEntry(mapButtonResource, "LocalMapsButton", LocalMapsMenuId, "ARMA CONTENT");
+    injectEntry(worldButtonResource, "WholeWorldButton", WholeWorldMenuId, "WHOLE WORLD");
+#ifdef _WIN32
+    static ParamFile islandEditorButtonResource;
+    injectEntry(islandEditorButtonResource, "IslandEditorButton", IslandEditorMenuId, "ISLAND EDITOR");
+#endif
 
     // Guard every control lookup: when the RscDisplayMain class is absent or
     // minimal (PoseidonUITest's own RESOURCE.BIN, or a headless --test-mission
@@ -455,6 +521,81 @@ void StartCampaign(RString campaign, Display* disp)
     StartMission(disp, true);
 }
 
+// Starts `campaign` at the mission whose template is `missionTemplate` (case-insensitive,
+// e.g. "m09convoyattack.sara"): the campaign flow then continues from there exactly as
+// if the player had reached it (briefing, debriefing, next mission by the end class).
+// An empty or unknown template starts at the campaign's first mission.
+bool StartCampaignAt(RString campaign, RString missionTemplate, Display* disp)
+{
+    if (missionTemplate.GetLength() == 0)
+    {
+        StartCampaign(campaign, disp);
+        return CurrentBattle.GetLength() > 0;
+    }
+    if (!disp)
+    {
+        disp = dynamic_cast<Display*>(GWorld->Options());
+    }
+    if (!disp)
+    {
+        return false;
+    }
+    SetCampaign(campaign);
+    const ParamEntry* campaignCls = ExtParsCampaign.FindEntry("Campaign");
+    if (!campaignCls || !campaignCls->IsClass())
+    {
+        return false;
+    }
+    RString battle, mission;
+    for (int i = 0; i < campaignCls->GetEntryCount() && battle.GetLength() == 0; i++)
+    {
+        const ParamEntry& battleCls = campaignCls->GetEntry(i);
+        if (!battleCls.IsClass())
+        {
+            continue;
+        }
+        for (int j = 0; j < battleCls.GetEntryCount(); j++)
+        {
+            const ParamEntry& missionCls = battleCls.GetEntry(j);
+            if (!missionCls.IsClass())
+            {
+                continue;
+            }
+            const ParamEntry* templ = missionCls.FindEntry("template");
+            if (templ && !templ->IsClass() && !templ->IsArray() &&
+                strcmpi((const char*)templ->GetValueRaw(), (const char*)missionTemplate) == 0)
+            {
+                battle = battleCls.GetName();
+                mission = missionCls.GetName();
+                break;
+            }
+        }
+    }
+    if (battle.GetLength() == 0)
+    {
+        // Not part of the campaign's flow (Arma 1 ships stand-alone copies of some
+        // campaign missions inside the campaign archive): the caller plays it alone.
+        LOG_INFO(Mission, "Campaign '{}' has no mission with template '{}'", (const char*)campaign,
+                 (const char*)missionTemplate);
+        return false;
+    }
+    CurrentBattle = battle;
+    CurrentMission = mission;
+
+    Glob.header.playerSide = TWest;
+    GStats.ClearAll();
+    GetGCampaignHistory().Clear(CurrentCampaign);
+    GetGCampaignHistory().campaignName = CurrentCampaign;
+
+    RString dir = GetTmpSaveDirectory();
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "%s%s.sqc", (const char*)dir, (const char*)CurrentCampaign);
+    SaveMission(buffer);
+
+    StartMission(disp, false);
+    return true;
+}
+
 static void UpdateUserProfile()
 {
     const RString userPath = GetUserParams();
@@ -485,10 +626,52 @@ void __cdecl CreateOutro(Display* disp, EndMode end)
     disp->CreateChild(new DisplayOutro(disp, end));
 }
 
+bool ProcessFullName(RString name); // UIArcadeWaypoint.cpp: a mission.sqm path, archive or folder
+
 void DisplayMain::OnChildDestroyed(int idd, int exit)
 {
     switch (idd)
     {
+        case ArmaContentIdd: // the mounted Arma game's campaign or mission (ArmaContentMenu)
+        {
+            bool campaign = false;
+            std::string value;
+            const bool chosen = exit == IDC_OK && ArmaContentChoice(_child, campaign, value);
+            Display::OnChildDestroyed(idd, exit);
+            if (!chosen)
+                break;
+            CurrentTemplate.Clear();
+            if (GWorld->UI())
+                GWorld->UI()->Init();
+            CurrentBattle = "";
+            CurrentMission = "";
+            if (campaign)
+            {
+                LOG_INFO(UI, "Arma content: campaign {}", value);
+                StartCampaign(RString(value.c_str()), this);
+                // StartCampaign returns quietly when the campaign's description.ext names no first
+                // battle or mission (Arma 3's Apex, for one): say so instead of doing nothing.
+                if (CurrentBattle.GetLength() == 0 || CurrentMission.GetLength() == 0)
+                {
+                    LOG_WARN(UI, "Arma content: campaign {} has no first battle/mission this engine can start", value);
+                    CreateMsgBox(MB_BUTTON_OK, RString("This campaign cannot be started yet: its description.ext "
+                                                       "names no first battle or mission this engine reads."));
+                }
+                break;
+            }
+            CurrentCampaign = "";
+            SetCampaign("");
+            LOG_INFO(UI, "Arma content: mission {}", value);
+            if (!ProcessFullName(RString(value.c_str())))
+            {
+                CreateMsgBox(MB_BUTTON_OK, RString(("This mission could not be loaded: " + value).c_str()));
+                break;
+            }
+            GStats.ClearAll();
+            ApplyCurrentMissionViewDistance();
+            CreateChild(new DisplayIntro(this));
+            break;
+        }
         case IDD_CAMPAIGN_LOAD: // Campaign
             if (exit == IDC_OK)
             {
@@ -2245,6 +2428,60 @@ void DisplayModDownload::OnSimulate(EntityAI* vehicle)
 void DisplayMain::OnButtonClicked(int idc)
 {
     if (idc == LocalMapsMenuId) { CreateChild(CreateLocalMapsDisplay(this)); return; }
+    if (idc == WholeWorldMenuId) { CreateChild(CreateWholeWorldDisplay(this)); return; }
+    if (_arma3)
+    {
+        const char* message = nullptr;
+        const Arma3Menu::Action action = _arma3->MainMenuClick(idc, message);
+        switch (action)
+        {
+            case Arma3Menu::Action::Handled:
+                return;
+            case Arma3Menu::Action::Campaigns:
+            case Arma3Menu::Action::Missions:
+                // Arma 3's own campaign / scenario screen, filled from CfgMissions; else the plain list
+                if (Display* screen = Arma3Menu::CreateContentDisplay(this, idc))
+                    CreateChild(screen);
+                else
+                    CreateChild(CreateArmaContentDisplay(this, action == Arma3Menu::Action::Campaigns
+                                                                   ? ArmaContentKind::Campaigns
+                                                                   : ArmaContentKind::Missions));
+                return;
+            case Arma3Menu::Action::Tutorials:
+                CreateChild(CreateArmaContentDisplay(this, ArmaContentKind::Tutorials));
+                return;
+            case Arma3Menu::Action::Options:
+                idc = IDC_MAIN_OPTIONS;
+                break;
+            case Arma3Menu::Action::Unavailable:
+                CreateMsgBox(MB_BUTTON_OK, RString(message));
+                return;
+            case Arma3Menu::Action::None:
+                // Quit (106), Player (109) and Server Browser (105) share CWA's idcs: handled below
+                break;
+        }
+    }
+    if (idc == IslandEditorMenuId)
+    {
+        std::string error;
+        if (!LaunchIslandEditor(error))
+            CreateMsgBox(MB_BUTTON_OK, RString(error.c_str()));
+        return;
+    }
+    // An Arma game is mounted: Campaign / Missions / Tutorials list that game's content, Arma 1's
+    // Options shortcuts open Options, and what cannot work here says so instead of doing nothing.
+    if (ArmaContentKind kind; ArmaMenuContentKind(idc, kind))
+    {
+        CreateChild(CreateArmaContentDisplay(this, kind));
+        return;
+    }
+    if (const char* unavailable = ArmaMenuUnavailable(idc))
+    {
+        CreateMsgBox(MB_BUTTON_OK, RString(unavailable));
+        return;
+    }
+    if (ArmaMenuOpensOptions(idc))
+        idc = IDC_MAIN_OPTIONS;
     // Dispatch registered game module buttons via registry
     if (auto* mod = GameModuleRegistry::FindByIDC(idc))
     {
@@ -2299,6 +2536,17 @@ void DisplayMain::OnDraw(EntityAI* vehicle, float alpha)
     // IDC_MAIN_PLAYER's resource class (Player in RscDisplayMain) has no explicit
     // `type`, so some configs create it as CStatic instead of CActiveText.
     // Tolerate either rather than null-deref on dynamic_cast failure.
+    if (_arma3)
+    {
+        // the cursor opens Arma 3's menu rows and spotlight frames (RscDisplayMain.sqf's handlers)
+        auto& input = InputSubsystem::Instance();
+        if (!Child())
+            _arma3->UpdateMainMenu(0.5f + input.GetCursorX() * 0.5f, 0.5f + input.GetCursorY() * 0.5f);
+        if (GWorld && GWorld->GetMode() == GModeIntro)
+            Arma3Menu::TickMenuMusic();
+        Display::OnDraw(vehicle, alpha);
+        return;
+    }
     SetMainPlayerControlText(GetCtrl(IDC_MAIN_PLAYER));
 
     Display::OnDraw(vehicle, alpha);

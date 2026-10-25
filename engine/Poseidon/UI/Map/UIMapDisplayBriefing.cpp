@@ -1,5 +1,7 @@
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/UI/Map/UIMap.hpp>
+#include <Poseidon/UI/Arma3Menu.hpp>
+#include <Poseidon/Game/Scripting/Scripts.hpp>
 #include <Poseidon/UI/Map/UIMapCommon.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
@@ -20,6 +22,8 @@
 #include <Poseidon/Graphics/Textures/TexturePreload.hpp>
 #include <Poseidon/UI/Locale/StringtableExt.hpp>
 #include <Poseidon/UI/Locale/MissionHtmlLocalization.hpp>
+
+int Arma2BriefingRevision(); // GameStateExtA2.cpp
 #include <Poseidon/Foundation/Strings/Mbcs.hpp>
 #include <Poseidon/Foundation/Strings/Bstring.hpp>
 #include <Poseidon/AI/AIRadio.hpp>
@@ -916,7 +920,7 @@ void DisplayMap::AddUsableMagazines(UnitWeaponsInfo& info, const WeaponType* wea
 
 void DisplayMap::AddUsableHandGunMagazines(UnitWeaponsInfo& info, const WeaponType* weapon, int from, int to)
 {
-    saturateMin(to, 10 + GetHandGunItemSlotsCount(info.weaponSlots));
+    saturateMin(to, HANDGUN_MAGAZINE_START + GetHandGunItemSlotsCount(info.weaponSlots));
     if (from >= to)
     {
         return;
@@ -1137,7 +1141,7 @@ void DisplayMap::OnHTMLLink(int idc, RString link)
                             RemoveUnusableMagazines(info);
                         }
                         info.weapons[0] = weapon;
-                        AddUsableMagazines(info, weapon, 0, 4);
+                        AddUsableMagazines(info, weapon, 0, ITEM_ROW_SPLIT);
                     }
                     if (weapon->_weaponType & MaskSlotSecondary)
                     {
@@ -1148,7 +1152,7 @@ void DisplayMap::OnHTMLLink(int idc, RString link)
                             RemoveUnusableMagazines(info);
                         }
                         info.weapons[1] = weapon;
-                        AddUsableMagazines(info, weapon, 4, 10);
+                        AddUsableMagazines(info, weapon, ITEM_ROW_SPLIT, HANDGUN_MAGAZINE_START);
                     }
                     if (weapon->_weaponType & MaskSlotHandGun)
                     {
@@ -1159,7 +1163,7 @@ void DisplayMap::OnHTMLLink(int idc, RString link)
                             RemoveUnusableMagazines(info);
                         }
                         info.weapons[4] = weapon;
-                        AddUsableHandGunMagazines(info, weapon, 10, MAGAZINE_SLOTS);
+                        AddUsableHandGunMagazines(info, weapon, HANDGUN_MAGAZINE_START, MAGAZINE_SLOTS);
                     }
                 }
                 else
@@ -1197,7 +1201,7 @@ void DisplayMap::OnHTMLLink(int idc, RString link)
                 bool handGun = (type->_magazineType & MaskSlotHandGunItem) != 0;
 
                 int maxItems = handGun
-                                   ? GetItemSlotsCount(info.weaponSlots) + GetHandGunItemSlotsCount(info.weaponSlots)
+                                   ? HANDGUN_MAGAZINE_START + GetHandGunItemSlotsCount(info.weaponSlots)
                                    : GetItemSlotsCount(info.weaponSlots);
 
                 Ref<Magazine> magazine;
@@ -1352,7 +1356,7 @@ void DisplayMap::OnHTMLLink(int idc, RString link)
         }
 
         // remove all magazines from items 1
-        int iMin = 10, iMax = iMin + iCnt;
+        int iMin = HANDGUN_MAGAZINE_START, iMax = iMin + iCnt;
         for (int i = iMin; i < iMax; i++)
         {
             Magazine* magazine = info.magazines[i];
@@ -1544,7 +1548,8 @@ void DisplayMap::OnDraw(EntityAI* vehicle, float alpha)
     // Radio slots
     SetRadioText();
     // Show / hide mission name
-    _name->ShowCtrl(_briefing->ActiveBookmark() >= 0);
+    if (!_arma3)
+        _name->ShowCtrl(_briefing->ActiveBookmark() >= 0);
     // GPS position
     Object* cameraOn = GWorld->CameraOn();
     if (cameraOn)
@@ -1575,12 +1580,39 @@ void DisplayMap::OnDraw(EntityAI* vehicle, float alpha)
         ShowNotepad(false);
     }
 
+    if (_arma3)
+    {
+        // Arma 3 runs a mission's scheduled scripts behind its briefing (time stays 0): init.sqf and
+        // the function library write the diary and the tasks the briefing shows. Neither the world
+        // nor this display is simulated while the briefing is up, so they are run from here.
+        if (!IsInGame() && GWorld)
+        {
+            SetScriptTimeStands(true);
+            GWorld->SimulateScripts();
+            SetScriptTimeStands(false);
+        }
+        ApplyArma3Look();
+        _arma3->UpdateDiary();
+    }
+
     Display::OnDraw(vehicle, alpha);
 }
 
 void DisplayMap::OnSimulate(EntityAI* vehicle)
 {
     Display::OnSimulate(vehicle);
+
+    // Arma 2: diary records and tasks arrive from scripts while the mission runs.
+    {
+        static int shownRevision = -1;
+        const int revision = Arma2BriefingRevision();
+        if (revision != shownRevision && revision > 0 && _briefing)
+        {
+            shownRevision = revision;
+            ReloadBriefingContent(GetCurrentHtmlSectionName(_briefing));
+            UpdatePlan();
+        }
+    }
 
     // JIP deferred refresh: unit wasn't assigned at init, retry now
     if (_needsHUDRefresh && GWorld->FocusOn())

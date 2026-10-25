@@ -4,6 +4,12 @@
 #include "GroundMeshSurface.hpp"
 #include "TreeSnowSurface.hpp"
 #include "RainWaterPublication.hpp"
+#include <Poseidon/Foundation/Platform/EnvOnce.hpp>
+#include <Poseidon/Asset/Formats/Enfusion/EnfusionMount.hpp>
+#include <Poseidon/Graphics/Textures/EddsReader.hpp>
+#include <Poseidon/Foundation/Threads/PoThread.hpp>
+#include <future>
+#include <Poseidon/Graphics/Textures/Image.hpp>
 #include <Poseidon/World/Weather/SnowField.hpp>
 #include <Poseidon/World/Entities/Vehicles/Tracks.hpp>
 #include <Poseidon/Graphics/Rendering/GeometryPageCameraDemand.hpp>
@@ -31,9 +37,15 @@
 #include <Poseidon/Foundation/Algorithms/Sha256.hpp>
 #include <Poseidon/Dev/Diag/StreamingDiag.hpp> // RFG-085 residency levers
 #include <Poseidon/World/Scene/MapThings.hpp>    // RFG-095 hidden proxies
+#include <Poseidon/Game/Compat/Arma1Compat.hpp> // Arma 3 worlds adapt like Arma 3
 #include <Poseidon/Dev/Diag/FixedStepStats.hpp> // REN-THR-004: ticks per frame beside the frame hash
 #include <Poseidon/Dev/Diag/FramePaceTrace.hpp> // PACE-001: per-frame pacing trace
 #include "EngineWgpu.hpp"
+#include "EarthRoadCoverage.hpp"
+#include "EarthGroundDetail.hpp"
+#include "TerrainWgpuTidewaterDetail.hpp"
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthMoonFrame.hpp>
 #include "ForestSnowSurface.hpp"
 #include <typeinfo>
 #include "GeometryOwnerLedger.hpp"
@@ -68,6 +80,7 @@
 #include <Poseidon/Graphics/Core/ParkedModelRefill.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/LegacyGlass.hpp>
 #include <Poseidon/Graphics/Shared/SdlWindow.hpp>
+#include <Poseidon/Graphics/Shared/WindowPlacement.hpp>
 #include <Poseidon/Graphics/Core/TLVertex.hpp>
 #include <Poseidon/Graphics/Rendering/Effects/SmokeVolumetric.hpp> // SMK-037 soft particles
 #include <Poseidon/Graphics/Rendering/Primitives/Draw2DGeometry.hpp>
@@ -85,6 +98,7 @@
 #include <Poseidon/Graphics/Rendering/RenderFlags.hpp>
 #include <Poseidon/Graphics/Rendering/DecalDepth.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Material.hpp> // TexMaterial::Combine (GPU-driven material extract)
+#include "EngineWgpuReflect.hpp"                                  // REFLECT-001 surface class lanes
 #include <Poseidon/Graphics/Rendering/Lighting/MuzzleFlashAppearance.hpp>
 #include <Poseidon/Asset/Formats/Material/EmatMaterialAdapter.hpp>
 #include <Poseidon/Asset/Formats/Material/MaterialChannels.hpp>
@@ -105,6 +119,9 @@
 #include <Poseidon/World/Terrain/Landscape.hpp>                // GLandscape->SurfaceY (GPU-driven conform bcSurfaceY)
 #include <Poseidon/World/Weather/WindModel.hpp>
 #include <Poseidon/World/Effects/SmokeSystem.hpp>                // the one wind authority (grass sway, cloud drift)
+#include <Poseidon/World/Effects/FireVolumes.hpp>                // FIRE-001
+#include <Poseidon/Graphics/Rendering/Effects/MuzzleBurst.hpp>   // BOOM-005
+#include <Poseidon/World/Effects/MudSpray.hpp>                   // MUD-001
 #include <Poseidon/Graphics/Shared/PNGWriter.hpp>
 #include <Poseidon/Graphics/Shared/ScreenshotWriter.hpp>
 #include <Poseidon/Graphics/Textures/ProceduralTexture.hpp>
@@ -153,6 +170,20 @@ namespace
 bool GpuSectionMaterialUsesLeafCards(const Ref<TexMaterial>& surfMat);
 bool GpuSectionMaterialIsCutout(const Ref<TexMaterial>& surfMat, TextureWgpu* texture);
 bool GpuEmatIsOpaqueSolid(const Ref<TexMaterial>& surfMat);
+
+// RFG-200: how much brighter a native world's sky DOME is drawn than the physical atmosphere
+// (Reforger's pale sky, Atmosphere.emat SkyIntensityLV). WGR_NATIVE_SKY_SCALE; 1 = physical.
+// Mirrored by sky/mod.rs, which undoes it for the sky's light.
+static float NativeSkyDomeScale()
+{
+    static const float scale = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_SKY_SCALE");
+        const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+        return f > 0.0f ? f : 2.5f;
+    }();
+    return scale;
+}
 bool GpuEmatCullNone(const Ref<TexMaterial>& surfMat);
 std::string GpuEmatFamily(const Ref<TexMaterial>& surfMat);
 bool GpuEmatIsGlass(const Ref<TexMaterial>& surfMat);
@@ -248,7 +279,10 @@ static bool FaceTextureIsEnfusionComposite(const ShapeSection& section)
     // The material's Stage0 is the RAW `_BCR.edds` -- untinted as well as uncovered -- so
     // letting it win here throws away the layer colour at the same moment it throws away
     // the coverage.
-    return name != nullptr && std::strncmp(Poseidon::Enfusion::SkipLayerTint(name), "enfa|", 5) == 0;
+    // RFG-119: an `enfk|` constant-coverage glass pane is the same statement -- its alpha is the
+    // material's AlphaMul, and the raw Stage0 BCR would put the roughness-alpha opaque pane back.
+    const char* inner = name != nullptr ? Poseidon::Enfusion::SkipLayerTint(name) : nullptr;
+    return inner != nullptr && (std::strncmp(inner, "enfa|", 5) == 0 || std::strncmp(inner, "enfk|", 5) == 0);
 }
 
 // PERF-015 A/B lever, and it governs BOTH halves of the per-section classification cost:
@@ -411,6 +445,7 @@ bool MaterialIsWindowUncached(const Ref<TexMaterial>& surfMat)
 struct MaterialClass
 {
     std::string path;
+    uint64_t serial = 0; //!< TexMaterial::Serial of the material this slot describes
     float       emitterTarget = 1.0f;
     bool        isWindow = false;
     bool        leafCards = false;
@@ -471,10 +506,14 @@ MaterialClass* MaterialClassSlot(const Ref<TexMaterial>& surfMat)
     thread_local std::unordered_map<const void*, MaterialClass> cache;
     MaterialClass& slot = cache[static_cast<const void*>(surfMat.GetRef())];
     Pass1Submit::gSecClassCalls.fetch_add(1, std::memory_order_relaxed);
-    if (slot.path.empty() || slot.path != path)
+    // Validated by the material's serial, not its path: a recycled address is a different
+    // material with a different serial, and a material's path never changes. The string
+    // compare this replaces was a strlen + memcmp per section per frame.
+    if (slot.serial != surfMat->Serial())
     {
         Pass1Submit::gSecClassMisses.fetch_add(1, std::memory_order_relaxed);
         slot.path = path;
+        slot.serial = surfMat->Serial();
         slot.emitterTarget = StaticEmitterRadianceTargetUncached(surfMat);
         slot.isWindow = MaterialIsWindowUncached(surfMat);
         slot.leafCardsResolved = false;
@@ -637,6 +676,19 @@ float LerpF(float a, float b, float t)
 // toward the sun: per-channel atmospheric transmittance (0 = sun below the horizon / fully
 // occluded by the planet). Feeds sky-based scene lighting so the surface sun colour reddens
 // at dusk and fades to zero at night, on the same physical radiance scale as the sky/fog.
+// The camera's height above the Earth for the atmosphere and sky: its world Y in the Earth frame (as
+// always), its true altitude when the world is in the moon frame (EarthMoonFrame.hpp).
+float EarthCameraAltitude(const Vector3& camera)
+{
+    if (!EarthStreaming::Enabled() || !EarthStreaming::MoonFrameActive())
+        return camera.Y();
+    const auto location = EarthStreaming::GetLocation();
+    EarthStreaming::Basis world;
+    if (!EarthStreaming::WorldBasis(location.latitude, location.longitude, world))
+        return camera.Y();
+    return float(EarthStreaming::Length(EarthStreaming::ToEcef(world, camera.X(), camera.Y(), camera.Z())) - Earth::Radius);
+}
+
 Vector3 AtmosphereSunTransmittance(const Engine::SkySettings& s, float camAlt, Vector3 dirToSun)
 {
     const float Rg = s.planetRadius;
@@ -704,6 +756,57 @@ Engine::TonemapSettings LerpTonemap(const Engine::TonemapSettings& a, const Engi
     r.hable = (t < 0.5f ? a : b).hable;
     r.encode = (t < 0.5f ? a : b).encode;
     return r;
+}
+
+// The look presets (sky + tonemap) are keyed by clock hour, tuned for one island's sun: dawn 5:50,
+// dusk 18:30. Whole-world mode has the real sun for the real place, so a Grand Canyon sunset at 18:54
+// was already being darkened toward the 20:00 night preset. There the key is the hour at which the
+// tuned island has the same sun elevation: dawn keys while the sun is in the east, dusk keys in the west.
+float LookHourAt(double r, double ox, double oy, double oz, const Vector3& toSun, bool skyRadiance);
+float LookHour(float clockHour, bool skyRadiance = false)
+{
+    if (!EarthStreaming::Enabled())
+        return clockHour;
+    // At the moon (its frame, EarthMoonFrame.hpp) there is no air: the airless look, as from space. The
+    // camera's local height there is above the MOON, and read as the Earth's it graded the black lunar
+    // sky with a low sun's warm haze.
+    if (EarthStreaming::MoonFrameActive())
+        return 12.0f;
+    const auto& snap = render::frame::GPresentationSnapshot();
+    const Vector3 toSun = -snap.sunDirection;
+    // The sun's height where the CAMERA is on the globe (radial up from the planet centre), not at the
+    // map origin; and from space (above 60 km) the lit hemisphere is exposed as daylight -- with the
+    // origin's evening look the day side saturated up to a knife-edge terminator.
+    const double ox = double(snap.cameraPos.X()) - 6400.0, oz = double(snap.cameraPos.Z()) - 6400.0;
+    const double oy = double(snap.cameraPos.Y()) + 6378137.0;
+    const double r = std::sqrt(ox * ox + oy * oy + oz * oz);
+    // From space the lit hemisphere is exposed as daylight. Blended in over 30-90 km: switching at
+    // 60 km changed the whole grade in one frame on the way up at night.
+    const float space = float(std::clamp((r - 6378137.0 - 30000.0) / 60000.0, 0.0, 1.0));
+    if (space >= 1.0f)
+        return 12.0f;
+    const float local = LookHourAt(r, ox, oy, oz, toSun, skyRadiance);
+    return local + (12.0f - local) * space * space * (3.0f - 2.0f * space);
+}
+
+float LookHourAt(double r, double ox, double oy, double oz, const Vector3& toSun, bool skyRadiance)
+{
+    const float sinE = r > 0.0 ? float((ox * toSun.X() + oy * toSun.Y() + oz * toSun.Z()) / r) : toSun.Y();
+    const float e = std::asin(std::clamp(sinE, -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+    const auto lerp = [](float a, float b, float t) { return a + (b - a) * std::clamp(t, 0.0f, 1.0f); };
+    // The SKY presets scale the sun's radiance down toward evening (noon 22.5, dusk 3.2, night 0.56
+    // as intensity x exposure): the island's stand-in for twilight. The real atmosphere already
+    // darkens a low sun's sky, so on top of it the sky went black the moment the sun touched the
+    // horizon. Keep the noon scale through civil twilight (sun -6 deg) and ease to night by -12.
+    if (skyRadiance)
+        return e > -6.0f ? 12.0f : lerp(12.0f, 20.0f, (-6.0f - e) / 6.0f);
+    // Mornings are graded with the evening curve as well: the island's 5:50 dawn key carries a 2.76x
+    // gain that, under real twilight exposure, blew the dawn out to white (day-cycle test, 04:24).
+    if (e >= 20.0f) // afternoon: 17:00 at 20 degrees .. noon at 60
+        return lerp(17.0f, 12.0f, (e - 20.0f) / 40.0f);
+    if (e >= 3.0f) // 18:30 dusk at 3 degrees .. 17:00 at 20
+        return lerp(18.5f, 17.0f, (e - 3.0f) / 17.0f);
+    return lerp(20.0f, 18.5f, (e + 12.0f) / 15.0f); // night 20:00 at -12 .. dusk at 3
 }
 
 Engine::TonemapSettings TonemapAtHour(float hour)
@@ -818,15 +921,67 @@ constexpr int kReservedBone = WGR_PALETTE_SIZE - 1;
 // FNV-1a 64 over raw bytes; used to detect unchanged vertex data so a redundant
 // GPU re-upload can be skipped. Cheap relative to the staging copy + barrier it
 // avoids, and only paid on meshes whose Update trigger already fires.
+// PERF (REFLECT-001 measurement, 2026-10-23): this was byte-wise FNV-1a, ~3.5 GB/s. On the
+// owner's 21-Peugeot test (282 332 vertices, 24 MB per buffer, rebuilt and hashed for every
+// visible car every frame, every one a hash-skip) it cost 6.9 of the 8.2 ms per car and most
+// of a 116 ms frame. Four independent xxHash64-style lanes over 8-byte words: same purpose
+// (detect identical bytes), several times the throughput.
+inline uint64_t HashBytesFast(const void* data, size_t bytes, uint64_t seed = 0)
+{
+    constexpr uint64_t P1 = 0x9E3779B185EBCA87ULL, P2 = 0xC2B2AE3D27D4EB4FULL, P3 = 0x165667B19E3779F9ULL;
+    const auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+    const auto round = [&](uint64_t acc, uint64_t w) { return rotl(acc + w * P2, 31) * P1; };
+    const auto* p = static_cast<const uint8_t*>(data);
+    uint64_t a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1;
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32)
+    {
+        uint64_t w[4];
+        std::memcpy(w, p + i, 32);
+        a = round(a, w[0]);
+        b = round(b, w[1]);
+        c = round(c, w[2]);
+        d = round(d, w[3]);
+    }
+    uint64_t h = rotl(a, 1) + rotl(b, 7) + rotl(c, 12) + rotl(d, 18) + bytes;
+    for (; i + 8 <= bytes; i += 8)
+    {
+        uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = rotl(h ^ round(0, w), 27) * P1 + P3;
+    }
+    for (; i < bytes; i++)
+        h = rotl(h ^ (p[i] * P3), 11) * P1;
+    h ^= h >> 33;
+    h *= P2;
+    h ^= h >> 29;
+    h *= P3;
+    h ^= h >> 32;
+    return h;
+}
+
 inline uint64_t HashVertices(const void* data, size_t bytes)
 {
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < bytes; i++)
-    {
-        h ^= p[i];
-        h *= 0x100000001b3ULL;
-    }
+    return HashBytesFast(data, bytes);
+}
+
+// The streams an animation can change, hashed where they lie: no SVertex rebuild needed to learn
+// that an animated shape came back from Animate/Deanimate exactly as it was.
+//
+// Positions and texture coordinates only. Every vertex-mutating path (selection rotation and
+// translation, deform, damage) moves positions, and the normals and tangent frame it rewrites
+// follow from the same transform; UVs are the one stream that animates on its own (track and
+// texture scrolling). Hashing the normals and the tangent frame too doubled the cost -- after
+// the first PERF fix this hash was still ~18 ms of a 24 ms frame on the owner's 21-Peugeot test,
+// at memory bandwidth, so the bytes read are the cost.
+inline uint64_t HashShapeStreams(const Shape& src)
+{
+    const int n = src.NVertex();
+    uint64_t h = HashBytesFast(&src.Pos(0), sizeof(Vector3) * size_t(n), uint64_t(n));
+    if (src.NTex() > 0)
+        h = HashBytesFast(&src.UV(0), sizeof(UVPair) * size_t(src.NTex()), h);
+    if (src.HasUV1())
+        h = HashBytesFast(&src.UV1(0), sizeof(UVPair) * size_t(src.NTex1()), h);
     return h;
 }
 
@@ -1007,6 +1162,11 @@ class VertexBufferWgpu : public VertexBuffer
     // produced a per-frame `wgr_3d_vbuf` staging copy + barrier for unchanged data.
     uint64_t lastUploadHash = 0;
     bool haveUploadHash = false;
+    // Hash of the SOURCE streams (HashShapeStreams) the last upload was built from; lets a
+    // re-dirtied but unchanged shape skip the rebuild entirely. Valid only for the plain
+    // BuildVertices path (not conformed, not CPU-posed).
+    uint64_t lastSourceHash = 0;
+    bool haveSourceHash = false;
     // Queued draws must not all observe the last helicopter's CPU pose.
     // Copies belong to this shape buffer and are reused only in a later frame.
     std::vector<std::unique_ptr<VertexBufferWgpu>> poseCopies;
@@ -1057,7 +1217,12 @@ class VertexBufferWgpu : public VertexBuffer
         // VBSmallDiscardable shadow meshes do exactly this. Cancelling the queued create is
         // strictly better than fulfilling it and then destroying it: no pool allocation, no
         // bind-cache clear, no generation bump for a mesh nobody can name any more.
-        slot->dead = true;
+        {
+            // CRASH-20261022: once `dead` is set under the lock, a drain either finished its
+            // create before we got here or will skip the slot, so the frees below are safe.
+            std::lock_guard payloadLock(slot->payloadMutex);
+            slot->dead = true;
+        }
         if (VbUpdateStatsEnabled())
         {
             const size_t typeIndex = static_cast<size_t>(bufferType);
@@ -1146,16 +1311,20 @@ class VertexBufferWgpu : public VertexBuffer
                     std::vector<SVertex> bind(static_cast<size_t>(vertexCount));
                     render::mesh::BuildOrigVertices(src, bind.data());
                     haveUploadHash = false;
+                    haveSourceHash = false;
                     bufferDirty = false;
-                    if (slot->renderer == 0)
+                    bool pending = false;
                     {
-                        slot->verts = std::move(bind);
+                        std::lock_guard payloadLock(slot->payloadMutex); // CRASH-20261022
+                        pending = slot->renderer == 0;
+                        if (pending)
+                            slot->verts = std::move(bind);
                     }
-                    else if (uploader)
+                    if (!pending && uploader)
                     {
                         wgr_uploader_mesh_update(uploader, slot->renderer, AsMeshVerts(bind));
                     }
-                    else
+                    else if (!pending)
                     {
                         wgr_mesh_update(renderer, slot->renderer, AsMeshVerts(bind));
                     }
@@ -1217,6 +1386,22 @@ class VertexBufferWgpu : public VertexBuffer
             if (cpuPosed) { Poseidon::GFaceDiag().updCount++; }
             return;
         }
+        // PERF: Animate/Deanimate re-dirty an animated shape every frame even when they put it
+        // back exactly as it was -- every parked car. Hash the source streams in place first;
+        // identical to what the last upload was built from means identical bytes, without the
+        // SVertex rebuild or its hash (both ~half a ms per 100k vertices).
+        const bool plainBuild = !(GCurrentConformPlane.active && src.OriginalPosValid()) && !cpuPosed;
+        uint64_t sourceHash = 0;
+        if (plainBuild && vertexCount > 0)
+        {
+            sourceHash = HashShapeStreams(src);
+            if (haveUploadHash && haveSourceHash && sourceHash == lastSourceHash)
+            {
+                bufferDirty = false;
+                if (diag) { diag->hashSkips.fetch_add(1, std::memory_order_relaxed); }
+                return;
+            }
+        }
         std::vector<SVertex> verts(static_cast<size_t>(vertexCount));
         if (diag) { diag->builds.fetch_add(1, std::memory_order_relaxed); }
         // A terrain-conform plane is active only inside a conformed object's draw
@@ -1256,6 +1441,8 @@ class VertexBufferWgpu : public VertexBuffer
         const auto hashStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const uint64_t hash = HashVertices(verts.data(), verts.size() * sizeof(SVertex));
         RecordVbHashTime(diag, hashStart);
+        lastSourceHash = sourceHash;
+        haveSourceHash = plainBuild && vertexCount > 0;
         if (haveUploadHash && hash == lastUploadHash)
         {
             if (diag) { diag->hashSkips.fetch_add(1, std::memory_order_relaxed); }
@@ -1278,7 +1465,9 @@ class VertexBufferWgpu : public VertexBuffer
         // and it is what keeps the conformed-road case exact: that road's FIRST Update is the
         // one that replaces BuildVertices bytes with BuildOrigVertices bytes carrying the
         // ClipLand selector, and it runs in the same draw phase as the create.
-        if (slot->renderer == 0)
+        // CRASH-20261022: checked and rewritten under the payload lock -- the drain may be
+        // copying these very bytes on the render thread right now.
+        if (std::lock_guard payloadLock(slot->payloadMutex); slot->renderer == 0)
         {
             if (diag) { diag->pendingRewrites.fetch_add(1, std::memory_order_relaxed); }
             if (cpuPosed) { Poseidon::GFaceDiag().updPending++; }
@@ -1456,6 +1645,27 @@ EngineWgpu::EngineWgpu(const GraphicsEngineParams& params) : _windowed(params.us
     // authoritative when the owner switches fog mode or edits a layer later.
     if (const char* fogMode = std::getenv("WGR_LAYERED_FOG"))
         _sky.layeredFog = std::strcmp(fogMode, "1") == 0;
+    // Whole world: the island fog is a 35 m film over the ground with valleys found within 150 m.
+    // Real valleys are kilometres wide and fog pools hundreds of metres deep in them, so scale the
+    // layers and the valley search to that (env profiles below still override).
+    if (EarthStreaming::Enabled())
+    {
+        // Fully terrain-relative: with 0.7 the layer was measured from 0.7 x the ground height, so on an
+        // 800 m valley floor the ground already stood 240 m above the layer top -- no fog above ~670 m.
+        // Pooling in valleys comes from the valley term, not from partial following.
+        _sky.fogTerrainFollow = 1.0f;
+        _sky.fogTerrainReference = 0.0f;
+        _sky.fogValleyStrength = 1.5f;
+        _sky.fogValleyRadius = 1000.0f;
+        _sky.fogLayerBase[0] = 0.0f;
+        _sky.fogLayerTop[0] = 200.0f;
+        _sky.fogLayerFeather[0] = 60.0f;
+        _sky.fogLayerExtinction[0] = 0.006f;
+        _sky.fogLayerBase[1] = 200.0f;
+        _sky.fogLayerTop[1] = 600.0f;
+        _sky.fogLayerFeather[1] = 120.0f;
+        _sky.fogLayerExtinction[1] = 0.0012f;
+    }
     for (int i = 0; i < 2; ++i)
     {
         const char* profile = std::getenv(i == 0 ? "WGR_FOG_LAYER0" : "WGR_FOG_LAYER1");
@@ -1625,12 +1835,48 @@ EngineWgpu::EngineWgpu(const GraphicsEngineParams& params) : _windowed(params.us
     _w = win.widthPx;
     _h = win.heightPx;
     _windowed = win.windowed;
+    _windowedRestoreW = params.width;
+    _windowedRestoreH = params.height;
+    if (_windowed)
+        SDL_GetWindowSize(_window, &_windowedRestoreW, &_windowedRestoreH);
 
     WgrSurfaceDesc desc{};
     DescribeSurface(_window, desc);
     desc.width = U32(_w > 0 ? _w : 1);
     desc.height = U32(_h > 0 ? _h : 1);
 
+    // RFG-PBR: native Reforger materials shade with their authored roughness, metalness and AO by
+    // default (the previews below, each read across C++ and Rust as "=1 enables"). Once their
+    // specular was energy-normalised (an F0 of 0.22 on a bare N.H^n lobe had washed every rough
+    // roof to cream) the whole stack rendered Everon's village correctly in capture, so every
+    // switch the user has not set is set to 1 here, before anything reads it. WGR_REFORGER_PBR=0
+    // leaves them all unset (the previous default path); an individual switch set to 0 still wins.
+    {
+        const char* master = std::getenv("WGR_REFORGER_PBR");
+        if (!(master && master[0] == '0'))
+        {
+            static const char* const previews[] = {
+                "WGR_REFORGER_PBR_PREVIEW",           "WGR_REFORGER_SRGB_PREVIEW",
+                "WGR_REFORGER_LAYER_ORDER_PREVIEW",   "WGR_REFORGER_TANGENT_PREVIEW",
+                "WGR_REFORGER_NORMAL_PREVIEW",        "WGR_REFORGER_GLOBAL_OVERLAY_PREVIEW",
+                "WGR_REFORGER_AO_PREVIEW",            "WGR_REFORGER_MASK_SCALE_PREVIEW"};
+            int set = 0;
+            for (const char* name : previews)
+            {
+                if (std::getenv(name))
+                    continue;
+#ifdef _WIN32
+                _putenv_s(name, "1");
+                SetEnvironmentVariableA(name, "1");
+#else
+                setenv(name, "1", 0);
+#endif
+                ++set;
+            }
+            LOG_INFO(Graphics, "Wgpu: native Reforger PBR on by default ({} preview switch(es) defaulted to 1; "
+                               "WGR_REFORGER_PBR=0 turns the stack off)", set);
+        }
+    }
     const WgrLogCallbacks log{&WgrLogThunk, nullptr};
     LOG_INFO(Graphics, "Wgpu: creating renderer {} ({}x{}), crate v{}, build {}", GetRendererName().Data(), _w, _h,
              wgr_version(), wgr_build_id());
@@ -1723,6 +1969,9 @@ EngineWgpu::EngineWgpu(const GraphicsEngineParams& params) : _windowed(params.us
         _window = nullptr;
         return;
     }
+    // RFG-162: asked once here, before any render thread exists (SupportsRiverSurfaces is called
+    // from the loader while frames are in flight).
+    _riverSurfaces = wgr_river_supported(_renderer) != 0;
 
     _gpuMemoryProbe.Register(
         "WGPU.Dynamic", 0.35f,
@@ -2361,7 +2610,9 @@ struct EngineWgpu::SharedMeshFixtureState
 
 EngineWgpu::~EngineWgpu()
 {
+    _canopyJob.reset(); // joins a canopy build still in flight
     StopRenderThread();
+    _terrain.reset(); // Its Earth worker/mesh must be gone before wgr_destroy.
     _retailWorldVisible.reset();
     _retailPagePilot.reset(); // release private texture holds while its bank/renderer are alive
     _retailWorldSource.reset();
@@ -2371,6 +2622,13 @@ EngineWgpu::~EngineWgpu()
     if (_sharedMeshEpoch) _sharedMeshEpoch->Close();
     if (_geometryOwnerLedger) _geometryOwnerLedger->CloseEpoch(_geometryOwnerEpoch);
     ClearFarObjects();
+    // RFG-153's near clutter holds model references exactly like the far tier. Left to the
+    // member destructor, they were released AFTER wgr_destroy, and each VertexBufferWgpu then
+    // called wgr_uploader_mesh_destroy on the freed uploader: the hash lookup spun forever and
+    // the game never exited (owner, 2026-10-13: window closed, process still burning a core).
+    ClearClutterObjects();
+    ClearEarthWorldgenObjects();
+    ClearEarthTreeObjects();
     s_self = nullptr;
     // FIRST: every VertexBufferWgpu still alive holds this link, and Shapes outlive the
     // engine on some teardown orders. Nulling it here turns a late SetSkinData into a no-op
@@ -2419,6 +2677,35 @@ AbstractTextBank* EngineWgpu::TextBank()
     return _wbank;
 }
 
+void EngineWgpu::ResetForRemount()
+{
+    // Terrain first: it holds raw TextureWgpu pointers (terrain pages, Tidewater bakes) that
+    // must be forgotten before the bank lets those textures die.
+    if (_terrain)
+    {
+        _terrain->ResetForRemount();
+    }
+    // The base class releases EngineDummy's own bank, which nothing under WGPU loads into;
+    // the real bank is _wbank. Without this every texture survived a re-mount by name, so a
+    // mod replacing a file under the same path drew the old image. Textures still referenced
+    // elsewhere (a shape the content reload kept) stay alive through their Refs; the rest are
+    // destroyed here, and their destructors touch the renderer, hence the window.
+    if (_wbank)
+    {
+        AcquireProducerWindow("remount texture release");
+        _wbank->ReleaseAllTextures();
+    }
+    EngineDummy::ResetForRemount();
+}
+
+void EngineWgpu::NoteDetailTextureLoad()
+{
+    if (_wbank)
+    {
+        _wbank->NoteDetailTextureLoad();
+    }
+}
+
 RString EngineWgpu::GetDebugName() const
 {
     return "Wgpu";
@@ -2441,6 +2728,99 @@ WindowMode EngineWgpu::GetCurrentWindowMode() const
     if (flags & SDL_WINDOW_BORDERLESS)
         return WindowMode::Borderless;
     return WindowMode::Windowed;
+}
+
+bool EngineWgpu::SetWindowMode(WindowMode mode)
+{
+    if (!_window || (mode != WindowMode::Windowed && mode != WindowMode::Borderless && mode != WindowMode::Fullscreen))
+        return false;
+    const WindowMode previous = GetCurrentWindowMode();
+    if (previous == mode)
+    {
+        _windowed = mode == WindowMode::Windowed;
+        return true;
+    }
+    // SDL owns the actual window. Keep its logical restore size separate from
+    // the renderer's pixel dimensions, as the GL/SDL path does on HighDPI.
+    if (previous == WindowMode::Windowed)
+        SDL_GetWindowSize(_window, &_windowedRestoreW, &_windowedRestoreH);
+    const SDL_DisplayID current = SDL_GetDisplayForWindow(_window);
+    const SDL_DisplayID display = current ? current : SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+    if (!desktop)
+    {
+        LOG_WARN(Graphics, "Wgpu: cannot resolve display mode: {}", SDL_GetError());
+        return false;
+    }
+    DisplayPlacementInput input;
+    input.displayMode = mode == WindowMode::Windowed ? "windowed" : mode == WindowMode::Borderless ? "borderless" : "exclusive";
+    input.width = mode == WindowMode::Windowed ? _windowedRestoreW : _w;
+    input.height = mode == WindowMode::Windowed ? _windowedRestoreH : _h;
+    // Borderless placement may deliberately extend one column beyond the
+    // monitor. That workaround is not an exclusive display resolution.
+    if (mode == WindowMode::Fullscreen && previous == WindowMode::Borderless)
+    {
+        input.width = desktop->w;
+        input.height = desktop->h;
+    }
+    const auto placement = ResolveWindowPlacement(input, desktop->w, desktop->h, static_cast<int>(desktop->refresh_rate + .5f));
+    SDL_DisplayMode exclusive{};
+    if (mode == WindowMode::Fullscreen &&
+        !SDL_GetClosestFullscreenDisplayMode(display, placement.width, placement.height,
+                                            static_cast<float>(placement.refreshHz), true, &exclusive))
+    {
+        LOG_WARN(Graphics, "Wgpu: no matching exclusive display mode: {}", SDL_GetError());
+        return false;
+    }
+    WaitRenderIdle(); // Do not mutate the surface while the render owner uses it.
+    bool ok = true;
+    const auto check = [&](bool result)
+    {
+        if (!result)
+        {
+            LOG_WARN(Graphics, "Wgpu: SDL window mode request failed: {}", SDL_GetError());
+            ok = false;
+        }
+    };
+    if (mode == WindowMode::Windowed)
+    {
+        check(SDL_SetWindowFullscreenMode(_window, nullptr));
+        check(SDL_SetWindowFullscreen(_window, false));
+        check(SDL_SetWindowBordered(_window, true));
+        check(SDL_SetWindowResizable(_window, true));
+        check(SDL_SetWindowSize(_window, placement.width, placement.height));
+        check(SDL_SetWindowPosition(_window, SDL_WINDOWPOS_CENTERED_DISPLAY(display), SDL_WINDOWPOS_CENTERED_DISPLAY(display)));
+    }
+    else if (mode == WindowMode::Fullscreen)
+    {
+        check(SDL_SetWindowFullscreenMode(_window, &exclusive));
+        check(SDL_SetWindowFullscreen(_window, true));
+    }
+    else
+    {
+        // Match CreateGameWindow/GL: Windows uses a positioned borderless
+        // window; other compositors receive real desktop-fullscreen state.
+        check(SDL_SetWindowFullscreenMode(_window, nullptr));
+#ifdef _WIN32
+        check(SDL_SetWindowFullscreen(_window, false));
+        check(SDL_SetWindowBordered(_window, false));
+        check(SDL_SetWindowSize(_window, placement.width, placement.height));
+        SDL_Rect bounds{};
+        SDL_GetDisplayBounds(display, &bounds);
+        check(SDL_SetWindowPosition(_window, bounds.x + placement.posX, bounds.y + placement.posY));
+#else
+        check(SDL_SetWindowFullscreen(_window, true));
+#endif
+    }
+    _windowed = GetCurrentWindowMode() == WindowMode::Windowed;
+    int width = 0, height = 0;
+    if (SDL_GetWindowSizeInPixels(_window, &width, &height) && width > 0 && height > 0 && (width != _w || height != _h))
+        OnWindowResized(width, height);
+    // Asynchronous compositor changes still arrive through SDLEventWindow's
+    // existing resize/fullscreen events and the same wgr_resize path.
+    LOG_INFO(Graphics, "Wgpu: window mode request {} -> {}x{} pixels (success={})",
+             input.displayMode, _w, _h, ok);
+    return ok;
 }
 
 int EngineWgpu::Width() const
@@ -2601,11 +2981,13 @@ uint32_t EngineWgpu::LocalShadowCasterMask(float relX, float relY, float relZ) c
 
 void EngineWgpu::ResizeSurface(int w, int h)
 {
-    WaitRenderIdle(); // exclusive renderer handle below (REN-THR-012)
-    if (w <= 0 || h <= 0)
+    // SDL may report the same final extent again after SetWindowMode's pixel
+    // readback. Avoid a redundant swapchain/optional-effects recreation.
+    if (w <= 0 || h <= 0 || (w == _w && h == _h))
     {
         return;
     }
+    WaitRenderIdle(); // exclusive renderer handle below (REN-THR-012)
     _w = w;
     _h = h;
     if (_renderer)
@@ -2881,6 +3263,8 @@ void EngineWgpu::InitDraw(bool clear, PackedColor color)
     // Indices into _draws3d; they must die with it or they patch a stranger (REN-THR-011).
     _draws3dPendingMesh.clear();
     _cmds.clear();
+    _blendStash.clear();
+    _blendCapture = false;
     _palette.clear();
     _cameras.clear();
     _currentCamera = 0;
@@ -2907,6 +3291,133 @@ void EngineWgpu::InitDraw(bool clear, PackedColor color)
         _wbank->StartFrame();
         _wbank->UpdateAdaptiveTextureDetail();
     }
+    UpdateLodStreaming();
+}
+
+// LOD-STREAM: keep in the geometry pool only the LOD levels some instance needs at its distance.
+//
+// Measured on native Everon at the owner's pose (PERF-LOD-USAGE, 2026-10-19): 542 MB of retained
+// meshes resident, 12 MB of them drawn, 25 MB with one finer margin level. The process sat over
+// the Windows VRAM budget and WDDM demoted memory (GPU passes 10-20x slower). Every registered
+// level used to stay resident for the model's whole life.
+//
+// The renderer computes, per model, the finest level any instance needs by DISTANCE (no frustum,
+// so turning never finds a level missing) minus one margin level. A level finer than that for
+// WGR_LOD_STREAM_GRACE_S (10 s) is evicted -- its pool ranges freed, handle kept -- and the cull
+// draws the next coarser resident level. A level needed again is rebuilt from the shape (still in
+// RAM) and restored at once. WGR_LOD_STREAM=0 = everything stays resident (the old behaviour).
+static uint64_t cpuVbReleasedBytes = 0, cpuVbReleases = 0; // CPU-VB-STREAM totals for the log
+
+void EngineWgpu::UpdateLodStreaming()
+{
+    static const bool enabled = [] { const char* v = std::getenv("WGR_LOD_STREAM"); return !(v && v[0] == '0'); }();
+    static const double grace = [] { const char* v = std::getenv("WGR_LOD_STREAM_GRACE_S"); return v ? std::max(1.0, std::atof(v)) : 10.0; }();
+    // CPU-VB-STREAM: the direct (CPU) path's level buffers -- built for every level at shape
+    // load and kept for the shape's life (measured: 7,894 buffers / 456 MB on native Everon).
+    // One epoch per second; static buffers untouched by any draw or shadow submission for
+    // WGR_CPU_VB_IDLE_S (30) are freed and rebuilt on their next use. WGR_CPU_VB_STREAM=0 = off.
+    static const bool cpuVbStream = [] { const char* v = std::getenv("WGR_CPU_VB_STREAM"); return !(v && v[0] == '0'); }();
+    static const uint32_t cpuVbIdle = [] { const char* v = std::getenv("WGR_CPU_VB_IDLE_S"); return v ? uint32_t(std::max(5, std::atoi(v))) : 30u; }();
+    const double cpuNow = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    static double lastEpoch = 0;
+    if (cpuVbStream && cpuNow - lastEpoch >= 1.0)
+    {
+        lastEpoch = cpuNow;
+        ++Shape::VbEpoch;
+        uint32_t n = 0;
+        cpuVbReleasedBytes += Shapes.ReleaseIdleVBuffers(cpuVbIdle, 512, &n);
+        cpuVbReleases += n;
+    }
+    if (!enabled || !_renderer || _gpuModelLodMeshes.empty()) return;
+    if ((++_lodStreamFrame % 15) != 0) return;
+    {
+        ResourceOp tick;
+        tick.kind = ResourceOp::LodStreamTick;
+        _resourceOps.push_back(std::move(tick));
+    }
+    std::vector<uint8_t> demand;
+    {
+        std::lock_guard lock(_lodStreamMutex);
+        if (_lodStreamDemandSerial == _lodStreamSeenSerial) return;
+        _lodStreamSeenSerial = _lodStreamDemandSerial;
+        demand = _lodStreamDemand;
+    }
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Restores are bounded per tick by bytes rebuilt (BuildVertices is CPU work on this thread).
+    uint64_t restoreBudget = 48ull << 20;
+    uint32_t evictBudget = 256;
+    uint64_t evictedNow = 0, restoredNow = 0;
+    for (auto& [shape, levels] : _gpuModelLodMeshes)
+    {
+        const auto model = _gpuModels.find(shape);
+        if (model == _gpuModels.end() || model->second == WGR_INVALID_MODEL || model->second >= demand.size()) continue;
+        const uint8_t need = demand[model->second];
+        if (need == 255) continue; // no live instance: parked or streaming out, leave it be
+        for (LodLevelMesh& lm : levels)
+        {
+            if (lm.lodIndex < 0 || !lm.streamable) continue;
+            const bool needed = lm.lodIndex >= int(need);
+            if (needed)
+            {
+                lm.unneededSince = 0;
+                if (lm.evicted && restoreBudget >= lm.bytes)
+                {
+                    const Shape* s = lm.src;
+                    const int nv = s->NVertex();
+                    const int ni = render::mesh::CountIndices(*s);
+                    if (nv <= 0 || ni <= 0) continue;
+                    ResourceOp op;
+                    op.kind = ResourceOp::MeshRestore;
+                    op.mesh = lm.mesh;
+                    op.verts.resize(size_t(nv));
+                    op.indices.resize(size_t(ni));
+                    render::mesh::BuildVertices(*s, op.verts.data());
+                    render::mesh::BuildIndices(*s, op.indices.data());
+                    _resourceOps.push_back(std::move(op));
+                    lm.evicted = false;
+                    _retainedMeshOfLevel[s] = lm.mesh; // CPU buffers may share it again
+                    restoreBudget -= lm.bytes;
+                    restoredNow += lm.bytes;
+                    ++_lodStreamRestores;
+                    _lodStreamEvictedBytes -= std::min(_lodStreamEvictedBytes, lm.bytes);
+                }
+                continue;
+            }
+            if (lm.evicted) continue;
+            if (lm.unneededSince == 0) { lm.unneededSince = now; continue; }
+            if (now - lm.unneededSince < grace || evictBudget == 0) continue;
+            // Never evict under a CPU buffer that shares this mesh (RFG-088): it would draw freed ranges.
+            {
+                std::lock_guard lock(_sharedMeshLifetimeMutex);
+                if (const auto found = _sharedMeshLifetime.find(lm.mesh); found != _sharedMeshLifetime.end() &&
+                    found->second->SnapshotBorrowers() != 0)
+                    continue;
+            }
+            if (const auto shared = _retainedMeshOfLevel.find(lm.src);
+                shared != _retainedMeshOfLevel.end() && shared->second == lm.mesh)
+                _retainedMeshOfLevel.erase(shared); // a CPU buffer made from now on builds its own copy
+            ResourceOp op;
+            op.kind = ResourceOp::MeshEvict;
+            op.mesh = lm.mesh;
+            _resourceOps.push_back(std::move(op));
+            lm.evicted = true;
+            --evictBudget;
+            evictedNow += lm.bytes;
+            ++_lodStreamEvictions;
+            _lodStreamEvictedBytes += lm.bytes;
+        }
+    }
+    static double lastLog = 0;
+    if (now - lastLog >= 10.0)
+    {
+        lastLog = now;
+        LOG_INFO(Graphics, "LOD streaming: {:.0f} MB of LOD levels evicted ({} evictions, {} restores, {} refused by "
+                           "the renderer as shared); CPU-path buffers released: {} ({:.0f} MB as built) (WGR_LOD_STREAM, "
+                           "WGR_CPU_VB_STREAM)",
+                 _lodStreamEvictedBytes / 1048576.0, _lodStreamEvictions, _lodStreamRestores,
+                 _lodStreamEvictRefused.load(std::memory_order_relaxed), cpuVbReleases, cpuVbReleasedBytes / 1048576.0);
+    }
+    (void)evictedNow; (void)restoredNow;
 }
 
 void EngineWgpu::Clear(bool clearZ, bool clearColor, PackedColor color)
@@ -2977,6 +3488,21 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
 {
     if (!_renderer)
         return;
+    // PERF-HITCH: which setting push is slow. A moving camera showed 27-35 ms in this function on
+    // one frame in three (Wgpu slow block "settings="), and the block log cannot say which call.
+    // Each wrapped call over 4 ms is named, at most one line a second.
+    const auto timed = [](const char* what, auto&& call)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        call();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static auto nextLog = std::chrono::steady_clock::time_point{};
+        if (ms >= 4.0 && std::chrono::steady_clock::now() >= nextLog)
+        {
+            nextLog = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            LOG_INFO(Graphics, "Wgpu slow setting: {} {:.1f} ms", what, ms);
+        }
+    };
     if (p.suppressWorldDirty)
     {
         wgr_set_suppress_world_objects(_renderer, p.suppressWorld);
@@ -2996,6 +3522,40 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
     {
         wgr_grass_set_card_spacing(_renderer, p.grassCardSpacing);
         p.grassSpacingDirty = false;
+    }
+    if (p.mudDirty)
+    {
+        wgr_set_mud_emitters(_renderer, p.mudEmitters.data(), static_cast<uint32_t>(p.mudEmitters.size()));
+        static auto nextMudLog = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() >= nextMudLog)
+        {
+            nextMudLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            LOG_INFO(Graphics, "Mud: {} spray(s) this frame, {} blobs thrown so far", p.mudEmitters.size(),
+                     wgr_get_mud_emitted(_renderer));
+        }
+        p.mudEmitters.clear();
+        p.mudDirty = false;
+    }
+    if (!p.muzzleFlashData.empty())
+    {
+        wgr_fire_set_muzzle_flashes(_renderer, p.muzzleFlashData.data(), static_cast<uint32_t>(p.muzzleFlashData.size()));
+        p.muzzleFlashData.clear();
+    }
+    if (p.fireDirty)
+    {
+        wgr_set_fire_sources(_renderer, p.fireSources.empty() ? nullptr : p.fireSources.data(),
+                             static_cast<uint32_t>(p.fireSources.size()));
+        p.fireDirty = false;
+        static auto nextLog = std::chrono::steady_clock::now();
+        if (!p.fireSources.empty() && std::chrono::steady_clock::now() >= nextLog)
+        {
+            nextLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            const uint64_t stats = wgr_get_fire_stats(_renderer);
+            LOG_INFO(Graphics, "Fire: {} reported, {} boxes, {} solver steps; first at {:.1f} {:.1f} {:.1f} r {:.2f} i {:.2f}",
+                     p.fireSources.size(), stats & 0xffffffffu, stats >> 32, p.fireSources[0].pos_radius[0],
+                     p.fireSources[0].pos_radius[1], p.fireSources[0].pos_radius[2], p.fireSources[0].pos_radius[3],
+                     p.fireSources[0].params[0]);
+        }
     }
     if (p.smokeVolumeDirty)
     {
@@ -3043,7 +3603,7 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
     }
     if (p.grassParamsDirty)
     {
-        wgr_grass_set_params(_renderer, &p.grassParams);
+        timed("grass params", [&] { wgr_grass_set_params(_renderer, &p.grassParams); });
         p.grassParamsDirty = false;
     }
     if (p.cullParamsDirty)
@@ -3053,13 +3613,24 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
     }
     if (p.farParamsDirty)
     {
-        wgr_far_set_params(_renderer, p.farNearCutoff, p.farDistance, p.farPixelLimit, p.farEnabled);
+        timed("far params", [&] { wgr_far_set_params(_renderer, p.farNearCutoff, p.farDistance, p.farPixelLimit, p.farEnabled); });
         p.farParamsDirty = false;
+    }
+    if (p.canopyDirty)
+    {
+        if (p.canopyBand && !p.canopyTop.empty() && !p.canopyCover.empty())
+            timed("canopy", [&] { wgr_terrain_set_canopy_band(_renderer, p.canopyN, p.canopyZ0, p.canopyZ1,
+                                                               p.canopyTop.data(), p.canopyCover.data()); });
+        else
+            timed("canopy", [&] { wgr_terrain_set_canopy(_renderer, p.canopyN, p.canopyTop.empty() ? nullptr : p.canopyTop.data(),
+                                   p.canopyCover.empty() ? nullptr : p.canopyCover.data()); });
+        p.canopyDirty = false;
+        p.canopyBand = false;
     }
     // REN-THR-013
     if (p.renderParamsDirty)
     {
-        wgr_set_render_params(_renderer, &p.renderParams);
+        timed("render params", [&] { wgr_set_render_params(_renderer, &p.renderParams); });
         p.renderParamsDirty = false;
     }
     if (p.skyExtrasDirty)
@@ -3090,27 +3661,57 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
     }
     if (p.skyRuntimeDirty)
     {
-        wgr_set_sky_runtime(_renderer, &p.skyRuntime);
+        timed("sky runtime", [&] { wgr_set_sky_runtime(_renderer, &p.skyRuntime); });
         p.skyRuntimeDirty = false;
     }
     if (p.terrainParamsDirty)
     {
-        wgr_terrain_set_params(_renderer, &p.terrainParams);
+        timed("terrain params", [&] { wgr_terrain_set_params(_renderer, &p.terrainParams); });
         p.terrainParamsDirty = false;
     }
     if (!p.snowData.empty())
     {
-        wgr_terrain_set_snow(_renderer, p.snowData.data(), static_cast<uint32_t>(p.snowData.size()));
+        timed("snow", [&] { wgr_terrain_set_snow(_renderer, p.snowData.data(), static_cast<uint32_t>(p.snowData.size())); });
         p.snowData.clear();
     }
     if (!p.mudData.empty())
     {
-        wgr_terrain_set_mud(_renderer, p.mudData.data(), static_cast<uint32_t>(p.mudData.size()));
+        timed("mud", [&] { wgr_terrain_set_mud(_renderer, p.mudData.data(), static_cast<uint32_t>(p.mudData.size())); });
         p.mudData.clear();
+    }
+    if (!p.mudFarData.empty())
+    {
+        timed("mud far", [&] { wgr_terrain_set_mud_far(_renderer, p.mudFarData.data(), static_cast<uint32_t>(p.mudFarData.size())); });
+        p.mudFarData.clear();
+    }
+    if (!p.craterNearData.empty())
+    {
+        wgr_terrain_set_craters(_renderer, p.craterNearData.data(), static_cast<uint32_t>(p.craterNearData.size()), 0);
+        p.craterNearData.clear();
+    }
+    if (!p.craterFarData.empty())
+    {
+        wgr_terrain_set_craters(_renderer, p.craterFarData.data(), static_cast<uint32_t>(p.craterFarData.size()), 1);
+        p.craterFarData.clear();
+    }
+    if (!p.snowMarkData.empty())
+    {
+        wgr_terrain_set_snow_marks(_renderer, p.snowMarkData.data(), static_cast<uint32_t>(p.snowMarkData.size()));
+        p.snowMarkData.clear();
+    }
+    if (!p.grassCraterData.empty())
+    {
+        wgr_grass_set_craters(_renderer, p.grassCraterData.data(), static_cast<uint32_t>(p.grassCraterData.size()));
+        p.grassCraterData.clear();
+    }
+    if (p.mudWater >= 0.0f)
+    {
+        wgr_terrain_set_mud_water(_renderer, p.mudWater);
+        p.mudWater = -1.0f;
     }
     if (!p.sandData.empty())
     {
-        wgr_terrain_set_sand(_renderer, p.sandData.data(), static_cast<uint32_t>(p.sandData.size()));
+        timed("sand", [&] { wgr_terrain_set_sand(_renderer, p.sandData.data(), static_cast<uint32_t>(p.sandData.size())); });
         p.sandData.clear();
     }
     if (p.terrainHolesDirty)
@@ -3158,7 +3759,7 @@ void EngineWgpu::ApplyPendingRendererSettings(PendingRendererSettings& p)
     }
     if (p.waterParamsDirty)
     {
-        wgr_water_set_params(_renderer, &p.waterParams);
+        timed("water params", [&] { wgr_water_set_params(_renderer, &p.waterParams); });
         p.waterParamsDirty = false;
     }
     if (p.rainWaterDirty)
@@ -3613,7 +4214,9 @@ void EngineWgpu::DrainResourceOps(std::vector<ResourceOp>& ops)
                     op.verts[vi].conform = base + op.crownComp[vi];
                 }
             }
-            _meshIdOf[op.mesh] = wgr_mesh_create(
+            // RFG-127: retained geometry is never rewritten in place, so identical copies
+            // (a prefab's colour variants) share one pool allocation.
+            _meshIdOf[op.mesh] = wgr_mesh_create_shared(
                 _renderer, AsMeshVerts(op.verts),
                 WgrSlice<uint32_t>{reinterpret_cast<const uint32_t*>(op.indices.data()), U32(op.indices.size())});
             if (_geometryOwnerLedger)
@@ -3679,6 +4282,11 @@ void EngineWgpu::DrainResourceOps(std::vector<ResourceOp>& ops)
             // REN-THR-011. `dead` means the VertexBufferWgpu was destroyed before this drain
             // ran, so nothing can name the mesh any more: skipping the create is the whole
             // handling of that case, and it is cheaper than creating and then destroying.
+            // CRASH-20261022: the producer may rewrite or release the payload concurrently
+            // (render overlap); hold the slot's payload lock for the whole create.
+            std::unique_lock<std::mutex> payloadLock;
+            if (op.cpu)
+                payloadLock = std::unique_lock<std::mutex>(op.cpu->payloadMutex);
             if (!op.cpu || op.cpu->dead)
             {
                 if (_geometryOwnerLedger) _geometryOwnerLedger->NoteCancelledBeforeCreate(_geometryOwnerEpoch);
@@ -3756,6 +4364,41 @@ void EngineWgpu::DrainResourceOps(std::vector<ResourceOp>& ops)
             }
             wgr_mesh_update(_renderer, op.cpu->renderer, AsMeshVerts(op.verts));
             wgr_mesh_set_skin(_renderer, op.cpu->renderer, op.bones, op.weights);
+            break;
+        }
+        case ResourceOp::MeshEvict:
+        {
+            const auto it = _meshIdOf.find(op.mesh);
+            if (it != _meshIdOf.end() && it->second && !wgr_mesh_evict(_renderer, it->second))
+                _lodStreamEvictRefused.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        case ResourceOp::MeshRestore:
+        {
+            const auto it = _meshIdOf.find(op.mesh);
+            if (it != _meshIdOf.end() && it->second)
+                wgr_mesh_restore(_renderer, it->second, AsMeshVerts(op.verts),
+                    WgrSlice<uint32_t>{reinterpret_cast<const uint32_t*>(op.indices.data()), U32(op.indices.size())});
+            break;
+        }
+        case ResourceOp::Callback:
+            if (op.callback)
+                op.callback(_renderer);
+            break;
+        case ResourceOp::LodStreamTick:
+        {
+            // Renderer ids are drain-side; translate to producer handles here.
+            const uint32_t n = wgr_lod_distance_demand(_renderer, 1, nullptr, 0);
+            std::vector<uint8_t> byRenderer(n, 255);
+            if (n) wgr_lod_distance_demand(_renderer, 1, byRenderer.data(), n);
+            uint32_t maxProducer = 0;
+            for (const auto& [producer, rid] : _modelIdOf) maxProducer = std::max(maxProducer, producer);
+            std::vector<uint8_t> byProducer(size_t(maxProducer) + 1, 255);
+            for (const auto& [producer, rid] : _modelIdOf)
+                if (rid < n) byProducer[producer] = byRenderer[rid];
+            std::lock_guard lock(_lodStreamMutex);
+            _lodStreamDemand = std::move(byProducer);
+            ++_lodStreamDemandSerial;
             break;
         }
         case ResourceOp::ModelRetire:
@@ -5134,7 +5777,7 @@ Engine::RenderThreadInfo EngineWgpu::GetRenderThreadInfo() const
 // keep their capacity and come back on the slot's next turn.
 void EngineWgpu::MoveQueuesInto(FrameQueues& q)
 {
-    q.settings = _pendingSet;
+    q.settings = std::move(_pendingSet);
     _pendingSet = PendingRendererSettings{};
     q.resourceOps.swap(_resourceOps);
     _resourceOps.clear();
@@ -5186,6 +5829,12 @@ bool EngineWgpu::TryAcquireProducerWindow()
     return true;
 }
 
+namespace
+{
+std::atomic<uint64_t> g_producerWaitMicros{0};
+}
+uint64_t EngineWgpu::ProducerWaitMicros() { return g_producerWaitMicros.load(std::memory_order_relaxed); }
+
 void EngineWgpu::AcquireProducerWindow(const char* what)
 {
     if (g_rendererQuiescent.load(std::memory_order_acquire))
@@ -5196,6 +5845,7 @@ void EngineWgpu::AcquireProducerWindow(const char* what)
     const auto t0 = std::chrono::steady_clock::now();
     self->WaitRenderIdle();
     const double lazyMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    g_producerWaitMicros.fetch_add(uint64_t(lazyMs * 1000.0), std::memory_order_relaxed);
     self->_rtLazyWaitMsAccum += lazyMs;
     self->_rtLazyWaitMsFrame += lazyMs;
     self->_rtLazyWaitCountAccum++;
@@ -5313,6 +5963,7 @@ void EngineWgpu::WaitRenderIdle()
 
 void EngineWgpu::RenderThreadMain()
 {
+    Foundation::SetCurrentThreadName("wgr-render");
     for (;;)
     {
         WgrFrame* frame = nullptr;
@@ -5517,6 +6168,47 @@ void EngineWgpu::NextFrame()
         {
             fogEnabled = 2.0f;
         }
+        // RFG-192: a native Reforger world always has aerial perspective, weather fog or not --
+        // its Atmosphere.emat scales the atmosphere's in-scatter by AerialPerspectiveStrength 5.735,
+        // which is the blue-grey distance in every Workbench frame; ours had none at fog 0 (the
+        // parity captures' crisp 5 km). Carried as 2 + k, k = extinction x 1e3 per metre (every
+        // reader tests fog_enabled against 0.5 / 1.5 only): frame.wgsl adds 1 - exp(-d sigma)
+        // toward the full airlight. WGR_NATIVE_AERIAL=0 off; WGR_NATIVE_AERIAL_STRENGTH scales.
+        static const float nativeAerialStrength = []
+        {
+            const char* v = std::getenv("WGR_NATIVE_AERIAL");
+            if (v && v[0] == '0')
+                return 0.0f;
+            const char* s = std::getenv("WGR_NATIVE_AERIAL_STRENGTH");
+            const float f = s ? std::strtof(s, nullptr) : 0.0f;
+            return f > 0.0f ? f : 5.735f;
+        }();
+        // RFG-206 (owner, 2026-10-20: "reforger map has fog even when i set the fog all the way
+        // down"): the haze now follows the weather fog the player sets -- none at 0, rising to the
+        // full Workbench strength at NativeAerialFullFog and above. Fog 0 is a clear view on every
+        // world, as the line above already says for the weather fog itself.
+        // WGR_NATIVE_AERIAL=always = the RFG-192 behaviour (full haze at any fog; parity captures).
+        static const bool nativeAerialAlways = []
+        {
+            const char* v = std::getenv("WGR_NATIVE_AERIAL");
+            return v && std::strcmp(v, "always") == 0;
+        }();
+        constexpr float NativeAerialFullFog = 0.2f;
+        const float nativeAerialFog = nativeAerialAlways ? 1.0f
+            : std::clamp(snap.weatherFog / NativeAerialFullFog, 0.0f, 1.0f);
+        if (snap.hasScene && _hdrEnabled && _sky.enabled && nativeAerialStrength > 0.0f && nativeAerialFog > 0.0f &&
+            GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0 && fogInvRange > 0.0f)
+        {
+            // Green-channel Rayleigh plus Mie extinction (Mie extinction ~1.1 x scattering).
+            const float sigma = (_sky.rayleigh[1] + _sky.mie * 1.1f) * nativeAerialStrength * nativeAerialFog;
+            // RFG-202: the airlight is read from the atmosphere, which RFG-200 brightens 2.5x for the
+            // dome. Brightened, the haze laid a blue-grey veil over the mid-distance forest
+            // (forestOwner +1.13 EV, blue 51 vs Reforger 30; aerial off: +0.80, 39) -- so the haze
+            // takes the physical airlight: its scale (x100) rides the tens of the code, the
+            // extinction the fraction (frame.wgsl apply_fog_receiver).
+            const float airScale = std::clamp(1.0f / NativeSkyDomeScale(), 0.01f, 9.99f);
+            fogEnabled = 2.0f + 10.0f * std::round(airScale * 100.0f) + std::clamp(sigma * 1000.0f, 0.0f, 0.999f);
+        }
 
         // Sun light for GPU-lit terrain, matching GL33's material upload:
         // light colour x eye accommodation, plus the raw travel direction
@@ -5550,7 +6242,7 @@ void EngineWgpu::NextFrame()
         float daylight = 1.0f - (snap.hasMainLight ? snap.nightEffect : 0.0f);
         if (_hdrEnabled && _sky.enabled && _sky.skyLighting && snap.hasMainLight)
         {
-            const float camAlt = snap.hasCamera ? static_cast<float>(snap.cameraPos.Y()) : 0.0f;
+            const float camAlt = snap.hasCamera ? EarthCameraAltitude(snap.cameraPos) : 0.0f;
             const Vector3 tr = AtmosphereSunTransmittance(_sky, camAlt, -snap.sunDirection);
             const float rad = _sky.sunIntensity * _sky.exposure;
             sunLin[0] = tr.X() * rad;
@@ -5617,7 +6309,7 @@ void EngineWgpu::NextFrame()
         // hoisted so it also fades the shadow darkness. The terrain/object ambient greys via the
         // env->SH bake (clouds are in the env map) so the ambient lift here is modest.
         float cloudDim = 0.0f;
-        if (_sky.enabled && _sky.cloudCoverage > 0.0f)
+        if (_sky.enabled && _sky.cloudCoverage > 0.0f && !(EarthStreaming::Enabled() && EarthStreaming::MoonFrameActive()))
         {
             // Saturate by ~0.8 coverage: the sky reads as fully overcast there, so the light should
             // be fully diffuse by then too (higher coverage only thickens the deck).
@@ -5736,7 +6428,7 @@ void EngineWgpu::NextFrame()
                 _lights.push_back(pl);
             }
             _localShadowCount = localShadowSlots;
-            if (std::getenv("WGR_LOCAL_REACH_TRACE"))
+            if (POSEIDON_GETENV_ONCE("WGR_LOCAL_REACH_TRACE"))
             {
                 static unsigned int traceFrame = 0;
                 if ((traceFrame++ % 120) == 0)
@@ -5784,7 +6476,7 @@ void EngineWgpu::NextFrame()
             }
             Poseidon::Dev::GLightCounters().candidates = snap.lightCandidates;
             Poseidon::Dev::GLightCounters().cap = static_cast<uint32_t>(envCap);
-            if (!_lights.empty() && std::getenv("WGR_STATIC_LIGHT_TRACE"))
+            if (!_lights.empty() && POSEIDON_GETENV_ONCE("WGR_STATIC_LIGHT_TRACE"))
                 LOG_INFO(Graphics, "Wgpu local-light selection: candidates={} selected={} night={:.3f}",
                          snap.lightCandidates, selected, snap.nightEffect);
         }
@@ -5837,7 +6529,7 @@ void EngineWgpu::NextFrame()
         // sides cannot disagree about whether the path exists.
         //
         // WGR_SHADOW_LEGACY_GATE=1 restores the old gate (and the old `_smCamPos` handling with it).
-        const bool gpuDrivenShadowCasters = _gpuDriven && (!_gpuInstances.empty() || _geometryPageFixtureActive);
+        const bool gpuDrivenShadowCasters = _gpuDriven && (!_gpuInstances.empty() || !_earthWorldgenInstances.empty() || _geometryPageFixtureActive);
         // GRASS is a third independent caster set, and the Rust side already knew that: its own
         // gate is `casters.is_empty() && !gpu_shadows && !grass.casts_shadows()` (gfx3d/mod.rs:4404).
         // Mirroring only the gpu_shadows term left a frame with no CPU casters and an empty
@@ -5924,7 +6616,7 @@ void EngineWgpu::NextFrame()
         // One-shot companion to the TreeAdv material trace.  The HDR sky-lit
         // path bypasses generic per-material lighting, so its frame inputs must
         // be measured independently when diagnosing a night-bright tree.
-        if (std::getenv("WGR_TREEADV_LIGHT_TRACE") && GScene && GScene->MainLight() &&
+        if (POSEIDON_GETENV_ONCE("WGR_TREEADV_LIGHT_TRACE") && GScene && GScene->MainLight() &&
             GScene->MainLight()->NightEffect() > 0.9f)
         {
             static bool loggedTreeAdvNightFrame = false;
@@ -5960,7 +6652,39 @@ void EngineWgpu::NextFrame()
             // sun_ambient.rgb = flat ambient fill (still used by water + the legacy path). On the
             // sky-lit path .w carries the skyAmbient knob, scaling the DIRECTIONAL SH sky-irradiance
             // ambient the lit-mesh/terrain shaders now use in place of the flat rgb.
-            cameras[i].sun_ambient = {ambLin[0], ambLin[1], ambLin[2], skyLit > 0.5f ? _sky.skyAmbient : 0.0f};
+            // WGR_SKY_AMBIENT=<scale> overrides the sky-irradiance scale for one process (A/B only).
+            static const float skyAmbientOverride = []
+            {
+                const char* v = std::getenv("WGR_SKY_AMBIENT");
+                const float parsed = v ? std::strtof(v, nullptr) : -1.0f;
+                return std::isfinite(parsed) ? parsed : -1.0f;
+            }();
+            float skyAmbientScale = skyAmbientOverride >= 0.0f ? skyAmbientOverride : _sky.skyAmbient;
+            // Arma 3 worlds: Arma 3 lights shade relatively stronger at a low sun. Its
+            // DayLightingBrightAlmost table (the same on Stratis, Altis and Tanoa) gives ambient
+            // 1 EV over the sun at 8 and 16 deg and equal at noon, i.e. 2x its noon ratio. Ours is
+            // one scale at every height, which left a 7 deg Stratis valley near black (ground
+            // median 38 against Arma 3's 71 even after exposure; 43 with this). 1x at 3 deg and
+            // below and from 45 deg up, so dawn, night and midday are unchanged.
+            // WGR_ARMA3_LOW_SUN_AMBIENT=0 turns it off.
+            static const bool arma3LowSunAmbient = []
+            {
+                const char* v = std::getenv("WGR_ARMA3_LOW_SUN_AMBIENT");
+                return !(v != nullptr && v[0] == '0');
+            }();
+            if (arma3LowSunAmbient && skyAmbientOverride < 0.0f && Poseidon::Arma1Compat::Generation() >= 3)
+            {
+                const float elevation = std::asin(std::clamp(-sunDir.Y(), -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+                float boostEv = 0.0f; // log2 of the factor, piecewise linear over Arma 3's table rows
+                if (elevation > 3.0f && elevation < 8.0f)
+                    boostEv = (elevation - 3.0f) / 5.0f;
+                else if (elevation >= 8.0f && elevation <= 16.0f)
+                    boostEv = 1.0f;
+                else if (elevation > 16.0f && elevation < 45.0f)
+                    boostEv = 1.0f - (elevation - 16.0f) / 29.0f;
+                skyAmbientScale *= std::exp2(boostEv);
+            }
+            cameras[i].sun_ambient = {ambLin[0], ambLin[1], ambLin[2], skyLit > 0.5f ? skyAmbientScale : 0.0f};
             // .w = the sun-only daylight factor (see `daylight` above).
             cameras[i].sun_dir_world = {sunDir.X(), sunDir.Y(), sunDir.Z(), daylight};
             if (shadowActive)
@@ -5968,7 +6692,8 @@ void EngineWgpu::NextFrame()
                 WgrCameraShadow& sb = cameras[i].shadow;
                 for (int c = 0; c < _smCascades.count && c < 4; c++)
                 {
-                    std::memcpy(sb.cascade_vp[c].m, _smCascades.camRelVP[c].m.data(), sizeof(sb.cascade_vp[c].m));
+                    // _smSampleVP: this frame's matrix, or a kept layer's own (UpdateShadowCascadeCache).
+                    std::memcpy(sb.cascade_vp[c].m, _smSampleVP[c].m.data(), sizeof(sb.cascade_vp[c].m));
                 }
                 sb.splits = {_smCascades.splitViewDist[0], _smCascades.splitViewDist[1], _smCascades.splitViewDist[2],
                              _smCascades.splitViewDist[3]};
@@ -6210,8 +6935,19 @@ void EngineWgpu::NextFrame()
             }
             for (int c = 0; c < _smCascades.count && c < 4; c++)
             {
-                std::memcpy(frame.shadow.light_vp[c].m, _smCascades.camRelVP[c].m.data(),
-                            sizeof(frame.shadow.light_vp[c].m));
+                // _smSampleVP, not camRelVP: for a kept cascade it is the layer's own carried
+                // matrix, so if the renderer must redraw that layer after all (its target was
+                // reallocated) it draws exactly what the lit pass samples.
+                std::memcpy(frame.shadow.light_vp[c].m, _smSampleVP[c].m.data(), sizeof(frame.shadow.light_vp[c].m));
+            }
+            // Far-cascade reuse: the layers this frame keeps are not drawn; the ones it renders
+            // become what the cache describes. Committed HERE, where the pass is actually sent.
+            if (sunShadowActive)
+            {
+                frame.shadow.cascade_keep_mask = _smKeepMask;
+                for (int c = 0; c < 4; c++)
+                    if (_smRefreshMask & (1u << c))
+                        _smCache[c] = _smCachePending[c];
             }
             // Casters are camera-relative to the camera captured in AddShadowCaster (NOT
             // _currentCamera, which may have advanced to a HUD/weapon camera by now); the
@@ -6426,7 +7162,7 @@ void EngineWgpu::NextFrame()
                 LOG_INFO(Graphics, "Wgpu model residency: {} models re-registering after a texture eviction",
                          stale);
         }
-        if (std::getenv("WGR_RESIDENCY_TRACE") &&
+        if (POSEIDON_GETENV_ONCE("WGR_RESIDENCY_TRACE") &&
             (++_residencyTraceFrame == 30 || (_residencyTraceFrame % 120) == 0))
         {
             GpuMemoryStatsOut stats{};
@@ -6479,6 +7215,8 @@ void EngineWgpu::NextFrame()
     _batches.clear();
     _draws3d.clear();
     _cmds.clear();
+    _blendStash.clear();
+    _blendCapture = false;
     _palette.clear();
     _cameras.clear();
     _shadowCasters.clear();
@@ -7129,6 +7867,54 @@ void EngineWgpu::SetFarProxyInstances(const FarProxyInstance* data, size_t count
                           WgrSlice<WgrFarInstance>{reinterpret_cast<const WgrFarInstance*>(data), U32(count)});
 }
 
+// PERF-FAR-PROXY-ASYNC (2026-10-20): the far-proxy set (~1M instances, ~32 MB on Everon) is
+// rebuilt as more far models become known -- nine times in the first 80 s of a Durras flight.
+// SetFarProxyInstances waits for the render thread to go idle and uploads in the caller; this
+// hands the vector to the render thread's next resource drain instead, so the main thread does
+// not wait. Same upload, same order relative to the frame's other resource operations.
+void EngineWgpu::SetFarProxyInstancesOwned(std::vector<FarProxyInstance>&& instances)
+{
+    static const bool queued = [] {
+        const char* v = std::getenv("WGR_FAR_PROXY_QUEUED");
+        return !(v && v[0] == '0');
+    }();
+    if (!queued || !_renderer || !FarSettings().enabled || instances.empty())
+    {
+        SetFarProxyInstances(instances.data(), instances.size());
+        return;
+    }
+    auto owned = std::make_shared<std::vector<FarProxyInstance>>(std::move(instances));
+    QueueRendererCallback([owned](WgrRenderer* r) {
+        wgr_far_set_instances(r, WgrSlice<WgrFarInstance>{reinterpret_cast<const WgrFarInstance*>(owned->data()),
+                                                          static_cast<uint32_t>(owned->size())});
+    });
+}
+
+// RFG-162: rivers as water (river/mod.rs). WGR_RIVERS=0 at load keeps the opaque ribbons.
+bool EngineWgpu::SupportsRiverSurfaces() const
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv("WGR_RIVERS");
+        return !(env != nullptr && env[0] == '0');
+    }();
+    return on && _renderer != nullptr && _riverSurfaces;
+}
+
+void EngineWgpu::SetRiverSurfaces(const float* vertices, size_t floatCount, const uint32_t* indices,
+                                  size_t indexCount, const float* look, size_t lookCount)
+{
+    WaitRenderIdle(); // exclusive renderer handle below (REN-THR-012)
+    if (!_renderer)
+        return;
+    const size_t usable = vertices != nullptr ? floatCount / 8 * 8 : 0;
+    const uint32_t triangles = wgr_river_set_mesh(
+        _renderer, WgrSlice<float>{usable ? vertices : nullptr, U32(usable)},
+        WgrSlice<uint32_t>{usable && indices ? indices : nullptr, U32(usable ? indexCount : 0)},
+        WgrSlice<float>{look, U32(look ? lookCount : 0)});
+    LOG_INFO(Graphics, "Wgpu rivers: {} vertices, {} triangles drawn as water (RFG-162)", usable / 8, triangles);
+}
+
 void EngineWgpu::PushSceneCamera()
 {
     CameraEntry entry{};
@@ -7153,7 +7939,9 @@ void EngineWgpu::PushSceneCamera()
         // and with this GPU's D32F depth it is the precision-optimal form — which also
         // eases distant z-fighting. Forward: z_view=cNear -> ndc.z=0, z_view=inf ->
         // ndc.z=1; the shader's reverse_z() then flips near->1, far->0. (_33=c, _43=d.)
-        const float cNear = static_cast<float>(camera->ClipNear());
+        const float cNear = _terrain && _terrain->IsEarthStreaming()
+            ? std::max(static_cast<float>(camera->ClipNear()), std::clamp(camera->Position().Y()*0.00001f,0.0f,1000.0f))
+            : static_cast<float>(camera->ClipNear());
         entry.proj._33 = 1.0f;
         entry.proj._43 = -cNear;
 
@@ -7272,9 +8060,17 @@ void EngineWgpu::PushSceneCamera()
             _pendingSet.farDistance = farTier.distance;
             _pendingSet.farPixelLimit = farTier.pixelLimit;
             _pendingSet.farEnabled = farTier.enabled ? 1u : 0u;
+            // FAR-002: on a native world the proxies start at the far window's reach (2 = the
+            // pure-distance rule from farNearCutoff).
+            if (_nativeFarProxyStart >= 0.0f && farTier.enabled)
+            {
+                _pendingSet.farNearCutoff = _nativeFarProxyStart;
+                _pendingSet.farEnabled = 2u;
+            }
             _pendingSet.farParamsDirty = true;
         }
     }
+    UpdateCanopyMap();
 
     _cameras.push_back(entry);
     _currentCamera = U32(_cameras.size() - 1);
@@ -7313,6 +8109,207 @@ void EngineWgpu::SubmitTerrain(std::span<const WgrTerrainNode> nodes)
     cmd.kind = WGR_CMD_DRAW_TERRAIN;
     cmd.arg = U32(_terrainBatches.size() - 1);
     _cmds.push_back(cmd);
+}
+
+WgrTexture EngineWgpu::EarthSandDetail()
+{
+    if (!_earthSandDetail && _renderer)
+    {
+        const std::vector<uint8_t> detail = BuildTidewaterDetail();
+        _earthSandDetail = wgr_texture_create(_renderer, TidewaterDetailSize, TidewaterDetailSize, WGR_TEXTURE_RGBA8, 1,
+                                              WGR_TEXTURE_GEN_MIPS, detail.data(), uint32_t(detail.size()));
+    }
+    return _earthSandDetail;
+}
+
+void EngineWgpu::SubmitEarthNodes(WgrMesh grid, uint32_t indexCount, const std::vector<EarthNodeDraw>& nodes)
+{
+    // the ground's material, lights and imagery set-up (globe: the tile pyramid's atlas applies), once for each kind
+    std::optional<WgrDraw3D> templates[2];
+    for (const auto& node : nodes)
+    {
+        auto& base = templates[node.groundDetail ? 1 : 0];
+        if (!base)
+        {
+            const size_t before = _draws3d.size();
+            SubmitEarthHorizon(grid, indexCount, _earthTileAtlas, 3, node.groundDetail, false,
+                               std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), true);
+            if (_draws3d.size() != before + 1)
+                return;
+            base = _draws3d.back();
+            _draws3d.pop_back();
+            _cmds.pop_back();
+        }
+        WgrDraw3D& d = _draws3d.emplace_back(*base);
+        _cmds.push_back(WgrCmd{WGR_CMD_DRAW_3D, U32(_draws3d.size() - 1)});
+        d.conform0 = {node.conform[0], node.conform[1], node.conform[2], node.conform[3]};
+        d.conform1 = {node.conform[4], node.conform[5], node.conform[6], node.conform[7]};
+        d.conform2 = {node.conform[8], node.conform[9], node.conform[10], node.conform[11]};
+        if (_earthTileAtlas && _earthTileLookup)
+            d.mat_reflect0 = {node.ref19[0], node.ref19[1], 1.0f, 0.0f}; // mercator offsets from the node's own corner
+    }
+}
+
+void EngineWgpu::SubmitEarthHorizon(WgrMesh mesh, uint32_t indexCount, WgrTexture texture, uint32_t sampler, bool groundDetail, bool nearAtlas,
+                                    double sourceLatitude, double sourceLongitude, bool globe)
+{
+    if (!_renderer || !mesh || !indexCount) return;
+    EnsureCamera();
+    const auto& camera = _cameras[_currentCamera];
+    WgrDraw3D d{};
+    d.mesh = mesh;
+    d.index_count = indexCount;
+    d.camera = _currentCamera;
+    d.palette_slot = WGR_NO_PALETTE;
+    d.depth = WGR_DEPTH_TEST_WRITE;
+    d.blend = WGR_BLEND_OPAQUE;
+    d.flags = WGR_DRAW3D_DOUBLE_SIDED | WGR_DRAW3D_EARTH_SURFACE;
+    d.texture_id = texture;
+    d.sampler = sampler;
+    // Only an uploaded clamped near atlas uses the concentrated chart. NASA
+    // fallback and the far/globe atlases retain their existing linear UVs.
+    d.mat_specular.w = nearAtlas && texture && sampler == 3 ? 1.0f : 0.0f;
+    // .xyz: the astronomical sun's travel direction (shader3d earth surface, from altitude). The frame's
+    // main light swings to the MOON when the sun is down at the origin, and the globe seen from space was
+    // lit from the moon: the face toward a camera near the moon fully lit (owner, 2026-10-24, "the dark
+    // side of the earth is not really dark").
+    {
+        const auto& snapSun = render::frame::GPresentationSnapshot();
+        Vector3 sun = snapSun.hasMainLight ? snapSun.sunDirection : VZero;
+        if (sun.SquareSize() > 1e-6f)
+            sun.Normalize();
+        d.mat_specular.x = sun.X();
+        d.mat_specular.y = sun.Y();
+        d.mat_specular.z = sun.Z();
+    }
+    // The ground only (the streamed patches and the globe): buildings, roads and forests keep their own textures.
+    // With the pyramid the default (2026-10-24) every Earth draw took the atlas, and the buildings' texture
+    // coordinates read it as places on the globe -- mostly sea: blue-green roofs (owner).
+    if (_earthTileAtlas && _earthTileLookup && (groundDetail || globe))
+    {
+        // The tile pyramid: the atlas in place of the window atlas, the lookup table in the specular-map slot
+        // (reflect1 packs it; the Earth branch returns before any reflection code), and in reflect0 the
+        // origin's zoom-19 tile the mesh's mercator UVs are relative to (TerrainWgpu::BuildEarthMeshes),
+        // with the UV mode: 1 = mercator offsets (streamed ground), 2 = equirectangular (the globe mesh).
+        const auto origin = EarthStreaming::Locations().Get();
+        const bool foreign = std::isfinite(sourceLatitude) && std::isfinite(sourceLongitude);
+        const double lat = std::clamp(foreign ? sourceLatitude : origin.latitude, -85.0511287798066, 85.0511287798066);
+        const double lon = Earth::WrapLongitude(foreign ? sourceLongitude : origin.longitude);
+        constexpr double Scale = double(1 << 19);
+        const double mx = (lon + 180.0) / 360.0;
+        const double my = (1.0 - std::asinh(std::tan(lat * Earth::Pi / 180.0)) / Earth::Pi) * 0.5;
+        d.texture_id = _earthTileAtlas;
+        d.sampler = 3;
+        d.mat_specular.w = 0.0f; // the mesh UVs are mercator, not the near atlas chart
+        d.mat_reflect0 = {float(std::floor(mx * Scale)), float(std::floor(my * Scale)), groundDetail ? 1.0f : 2.0f, 0.0f};
+        d.mat_reflect1 = {1.0f, 0.0f, 0.0f, 0.0f};
+        d.reflect_specular_texture_id = _earthTileLookup;
+    }
+    d.world.m[0] = d.world.m[5] = d.world.m[10] = d.world.m[15] = 1.0f;
+    d.world.m[12] = -camera.pos[0];
+    d.world.m[13] = -camera.pos[1];
+    d.world.m[14] = -camera.pos[2];
+    const auto& light = render::frame::GPresentationSnapshot();
+    const Color ambient = light.hasMainLight ? light.sunAmbient : HWhite;
+    const Color diffuse = light.hasMainLight ? light.sunDiffuse : HWhite;
+    // Generic ground colour until geographic imagery/landcover is implemented.
+    // Receives the normal frame's sun, sky, atmosphere and depth; no post pass.
+    const float r = texture ? 1.0f : .35f, g = texture ? 1.0f : .32f, b = texture ? 1.0f : .26f;
+    d.mat_sun_ambient = {ambient.R()*r,ambient.G()*g,ambient.B()*b,0};
+    // .w: the sun above the atmosphere on the sky-lit scale (the radiance the frame's sun_diffuse
+    // is this times the air's transmittance at the camera). From altitude the shader lights each
+    // point of the globe with it through that point's own air (shader3d earth_sun_transmittance).
+    d.mat_sun_diffuse = {diffuse.R()*r,diffuse.G()*g,diffuse.B()*b,_sky.sunIntensity*_sky.exposure};
+    if (groundDetail)
+    {
+        const auto origin = EarthStreaming::Locations().Get();
+        const auto split = EarthGroundDetail::SplitOrigin(origin.latitude, origin.longitude);
+        // Earth's early material route does not consume local-light modulation.
+        // Reuse these lanes as an explicitly marked high/low ECEF origin, keeping
+        // world-metre grain stable through camera movement and geographic rebases.
+        d.mat_light_diffuse = {split.high[0],split.high[1],split.high[2],0};
+        d.mat_light_ambient = {split.low[0],split.low[1],split.low[2],1};
+        // the beaches' Tidewater sand (shader3d earth_tw_sand) reads its noise from this, in the Stage1 slot
+        d.normal_texture_id = EarthSandDetail();
+    }
+    else
+    {
+        // The globe and other undetailed Earth draws: the Earth's centre and the origin's up in world
+        // coordinates (shader3d earth surface). In the Earth frame these are (6400, -R, 6400) and
+        // (0, 1, 0); in the moon frame the globe is drawn through the frame transform below.
+        d.mat_light_diffuse = {6400.0f, -6378137.0f, 6400.0f, 0};
+        d.mat_light_ambient = {0, 1, 0, 0};
+    }
+    const bool foreignFrame = std::isfinite(sourceLatitude) && std::isfinite(sourceLongitude);
+    if (EarthStreaming::MoonFrameActive() || foreignFrame)
+    {
+        // The mesh is in an Earth origin's tangent frame that is not the world's: near the moon the world
+        // is the moon frame (EarthMoonFrame.hpp), and through a free-flight rebase the previous origin's
+        // imagery stays on screen until the new one has its own. Place it through its tangent frame ->
+        // ECEF -> the world's frame.
+        const auto origin = EarthStreaming::Locations().Get();
+        const auto earth = foreignFrame ? EarthStreaming::EarthBasis(sourceLatitude, sourceLongitude)
+                                        : EarthStreaming::EarthBasis(origin.latitude, origin.longitude);
+        EarthStreaming::Basis world;
+        if (EarthStreaming::WorldBasis(origin.latitude, origin.longitude, world))
+        {
+            const EarthStreaming::D3 cols[3] = {EarthStreaming::DirToWorld(world, earth.E), EarthStreaming::DirToWorld(world, earth.U),
+                                                EarthStreaming::DirToWorld(world, earth.N)};
+            // World = R * (p - (A, 0, A)) + T, T = the Earth origin's anchor point in the moon frame.
+            const auto T = EarthStreaming::ToWorld(world, earth.O);
+            const double cam[3] = {camera.pos[0], camera.pos[1], camera.pos[2]};
+            for (int c = 0; c < 3; ++c)
+            {
+                d.world.m[c * 4 + 0] = float(cols[c].x);
+                d.world.m[c * 4 + 1] = float(cols[c].y);
+                d.world.m[c * 4 + 2] = float(cols[c].z);
+                d.world.m[c * 4 + 3] = 0.0f;
+            }
+            const EarthStreaming::D3 shift = cols[0] * -double(Earth::Anchor) + cols[2] * -double(Earth::Anchor);
+            d.world.m[12] = float(T.x + shift.x - cam[0]);
+            d.world.m[13] = float(T.y + shift.y - cam[1]);
+            d.world.m[14] = float(T.z + shift.z - cam[2]);
+            d.world.m[15] = 1.0f;
+            if (!groundDetail)
+            {
+                const auto centre = EarthStreaming::ToWorld(world, {0.0, 0.0, 0.0});
+                d.mat_light_diffuse = {float(centre.x), float(centre.y), float(centre.z), 0};
+                d.mat_light_ambient = {float(cols[1].x), float(cols[1].y), float(cols[1].z), 0};
+            }
+        }
+    }
+    _draws3d.push_back(d);
+    _cmds.push_back(WgrCmd{WGR_CMD_DRAW_3D,U32(_draws3d.size()-1)});
+}
+
+void EngineWgpu::SubmitDynamicMesh(WgrMesh mesh, uint32_t indexCount, const float world[16], WgrTexture texture, uint32_t sampler,
+                                   float alphaRef)
+{
+    if (!_renderer || !mesh || !indexCount) return;
+    EnsureCamera();
+    const auto& camera = _cameras[_currentCamera];
+    WgrDraw3D d{};
+    d.mesh = mesh;
+    d.index_count = indexCount;
+    d.camera = _currentCamera;
+    d.palette_slot = WGR_NO_PALETTE;
+    d.depth = WGR_DEPTH_TEST_WRITE;
+    d.blend = WGR_BLEND_OPAQUE;
+    d.flags = WGR_DRAW3D_DOUBLE_SIDED;
+    d.texture_id = texture;
+    d.sampler = sampler;
+    d.alpha_ref = alphaRef; // > 0: the alpha-tested cutout pipeline (leaf cards)
+    for (int i = 0; i < 16; ++i) d.world.m[i] = world[i];
+    d.world.m[12] -= camera.pos[0];
+    d.world.m[13] -= camera.pos[1];
+    d.world.m[14] -= camera.pos[2];
+    const auto& light = render::frame::GPresentationSnapshot();
+    const Color ambient = light.hasMainLight ? light.sunAmbient : HWhite;
+    const Color diffuse = light.hasMainLight ? light.sunDiffuse : HWhite;
+    d.mat_sun_ambient = {ambient.R(), ambient.G(), ambient.B(), 0};
+    d.mat_sun_diffuse = {diffuse.R(), diffuse.G(), diffuse.B(), 0};
+    _draws3d.push_back(d);
+    _cmds.push_back(WgrCmd{WGR_CMD_DRAW_3D, U32(_draws3d.size() - 1)});
 }
 
 IWaterRenderer* EngineWgpu::GetWaterRenderer()
@@ -8142,7 +9139,10 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
     // section numbers alone repeat across unrelated visible and shadow LODs.
     const ShapeSection& debugSection = sMesh.GetSection(beg);
     const char* debugMaterialPath = debugSection.surfMat ? debugSection.surfMat->GetName().Data() : nullptr;
-    if (_materialDebugRvmatMatch == "__trace__")
+    // Normal play has no selector; the string compares below cost a strlen each per section.
+    // Every one of them is false for an empty selector (ContainsNoCase too).
+    const bool debugSelectorSet = !_materialDebugRvmatMatch.empty();
+    if (debugSelectorSet && _materialDebugRvmatMatch == "__trace__")
     {
         const auto shapeId = reinterpret_cast<uintptr_t>(&sMesh);
         const std::string traceKey = std::to_string(shapeId) + ":" + std::to_string(beg) + ":" +
@@ -8161,9 +9161,11 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
                      indexCount, sMesh.NSections(), sMesh.Min().X(), sMesh.Min().Y(), sMesh.Min().Z(),
                      sMesh.Max().X(), sMesh.Max().Y(), sMesh.Max().Z());
     }
-    const bool unassignedMaterialTarget = _materialDebugRvmatMatch == "__unassigned__" && !debugSection.surfMat;
-    const bool materialDebugTarget = unassignedMaterialTarget || _materialDebugRvmatMatch == "*" ||
-                                     ContainsNoCase(debugMaterialPath, _materialDebugRvmatMatch);
+    const bool unassignedMaterialTarget =
+        debugSelectorSet && _materialDebugRvmatMatch == "__unassigned__" && !debugSection.surfMat;
+    const bool materialDebugTarget =
+        debugSelectorSet && (unassignedMaterialTarget || _materialDebugRvmatMatch == "*" ||
+                             ContainsNoCase(debugMaterialPath, _materialDebugRvmatMatch));
     // `__trace__` is an OBSERVER, not a selector: it must not change what is drawn.
     //
     // It used to, and that silently invalidated every appearance judgement made in a
@@ -8172,7 +9174,7 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
     // for the whole CPU direct path -- every section drawn there came out untextured.
     // "It renders flat white under __trace__" was therefore a property of the flag, not
     // of the geometry. Treat the trace sentinel as no selector at all.
-    const bool diagnosticSelector = !_materialDebugRvmatMatch.empty() && _materialDebugRvmatMatch != "__trace__";
+    const bool diagnosticSelector = debugSelectorSet && _materialDebugRvmatMatch != "__trace__";
     // Without a diagnostic selector, authored section RVMATs are production
     // bindings. Unknown families and procedural stages remain intentionally
     // unbound after translation; there is no suffix-based fallback here.
@@ -8537,7 +9539,7 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
                             bindSlot->baseLoadName = RStringB(base->texture.raw.c_str());
                         }
                         bindSlot->isCalmWater = Asset::Material::IsCalmWater(translated);
-                        bindSlot->reflective = translated.shaderFamily == "CalmWater";
+                        bindSlot->reflective = Asset::Material::IsCalmWater(translated); // RFG-134: and MatRiver
                         const auto* normalSlot = translated.Find(Asset::Material::MaterialSlot::NormalMap);
                         bindSlot->hasNormal =
                             normalSlot && !normalSlot->texture.isProcedural && !normalSlot->texture.path.empty();
@@ -8596,7 +9598,18 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
         {
             if (const char* texName = faceTex->Name(); texName && *texName)
             {
-                const uint64_t handle = LegacyEnhancementNormal(texName);
+                const auto* wgpuFace = static_cast<const TextureWgpu*>(faceTex);
+                uint64_t handle = 0;
+                if (wgpuFace->legacyNormalKnown.load(std::memory_order_acquire))
+                {
+                    handle = wgpuFace->legacyNormalMemo.load(std::memory_order_relaxed);
+                }
+                else
+                {
+                    handle = LegacyEnhancementNormal(texName);
+                    wgpuFace->legacyNormalMemo.store(handle, std::memory_order_relaxed);
+                    wgpuFace->legacyNormalKnown.store(true, std::memory_order_release);
+                }
                 if (handle != 0 && !_materialDebug.disableNormalMap)
                     d.normal_texture_id = handle;
             }
@@ -8780,10 +9793,27 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
         alphaClass == Poseidon::AlphaStats::Blend && GpuSectionMaterialUsesLeafCards(debugSection.surfMat);
     // An OpacityMap material that authors `BlendMode AlphaBlend` (wire mesh,
     // glass) blends; testing it would keep what the author meant translucent.
-    const bool materialBlends = GpuEmatBlends(debugSection.surfMat);
+    // RFG-123: plus the constant-alpha `enfk|` pane, which names no OpacityMap (window_glass:
+    // AlphaMul 0.243, AlphaTest 0.01 -- the AlphaTest made it "leaf cards", forced opaque below).
+    const bool constantAlphaGlass =
+        AuthoredGlassBlendEnabled() && texture &&
+        texture->NameMemo(TextureWgpu::SlotEnfusionConstantAlpha, &render::IsEnfusionConstantAlphaTexture);
+    const bool materialBlends = GpuEmatBlends(debugSection.surfMat) || constantAlphaGlass;
+    const bool authoredGlass =
+        AuthoredGlassBlendEnabled() && tex != 0 && texture &&
+        (constantAlphaGlass ||
+         (materialBlends && texture->NameMemo(TextureWgpu::SlotEnfusionCoverage, &render::IsEnfusionCoverageTexture)));
     const bool materialCutout =
         materialUsesLeafCards && !materialBlends && GpuSectionMaterialIsCutout(debugSection.surfMat, texture);
-    if (GpuTextureIsBarkOrTrunk(texture))
+    if (authoredGlass)
+    {
+        // RFG-123: the material's BlendMode AlphaBlend is the authority. The `enfa|` class is
+        // Cutout by rule (RFG-055, for leaves) and the `enfk|` spec is not IsAlpha, so neither
+        // the spec nor the class can say this; the CPU blend revisit (SectionIsBlend) draws it.
+        blend = render::BlendMode::AlphaBlend;
+        alphaRef = 0.0f;
+    }
+    else if (GpuTextureIsBarkOrTrunk(texture))
     {
         // The common legacy section descriptor itself can carry a stale alpha
         // reference even for TreeAdvTrunk.  Texture role is authoritative for
@@ -8801,10 +9831,11 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
         blend = render::BlendMode::Opaque;
         alphaRef = 0.0f;
     }
-    else if (tex != 0 && (alphaClass == Poseidon::AlphaStats::Cutout || materialCutout ||
-                          (texture && (render::IsLegacyPlantCutoutTexture(texture->Name()) ||
-                                       (render::IsEnfusionCoverageTexture(texture->Name()) &&
-                                        texture->HasAlphaHoles() && !materialBlends)))))
+    else if (tex != 0 &&
+             (alphaClass == Poseidon::AlphaStats::Cutout || materialCutout ||
+              (texture && (texture->NameMemo(TextureWgpu::SlotLegacyPlantCutout, &render::IsLegacyPlantCutoutTexture) ||
+                           (texture->NameMemo(TextureWgpu::SlotEnfusionCoverage, &render::IsEnfusionCoverageTexture) &&
+                            texture->HasAlphaHoles() && !materialBlends)))))
     {
         // A cutout classification means the source has binary transparent texels, irrespective
         // of whether the P3D section remembered to set IsAlpha.  Some legacy sections are
@@ -8929,8 +9960,8 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
     //    wgpu; the level-scaled offset resolves them without over-biasing roads.
     // d was zero-initialised; preserve the normal-channel bit from material binding.
     // The LLDR's authored translucent screen is a display, not an open hole.
-    if (texture && texture->Name() &&
-        std::strstr(texture->Name(), "lldr_monitor.paa") != nullptr)
+    if (texture && texture->NameMemo(TextureWgpu::SlotLldrMonitor, [](const char* name)
+                                     { return name && std::strstr(name, "lldr_monitor.paa") != nullptr; }))
     {
         d.flags |= WGR_DRAW3D_MONITOR;
     }
@@ -9007,6 +10038,19 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
             glassSheen = Poseidon::LegacyGlassAlphaIsGlazing(desc.surface == render::SurfaceMode::OnSurface,
                                                             st.pctClear, st.pctPartial, st.aMean);
         }
+    }
+    // RFG-164: native Enfusion window glass (an authored-glass pane whose .emat is glass) takes
+    // the same sky-mirror treatment: reflective + glass. Head-on against a dark room the pane was
+    // a black hole (owner comparison with Reforger, where the panes mirror the sky and the yard).
+    // WGR_ENFUSION_GLASS_SHEEN=0 restores the plain translucent pane.
+    if (!glassSheen && authoredGlass && GpuEmatIsGlass(debugSection.surfMat))
+    {
+        static const bool enfusionSheen = []
+        {
+            const char* v = std::getenv("WGR_ENFUSION_GLASS_SHEEN");
+            return !(v && std::strcmp(v, "0") == 0);
+        }();
+        glassSheen = enfusionSheen;
     }
     // DZ-003, resolved above (see reflectiveMaterial).
     if (reflectiveMaterial || glassSheen)
@@ -9174,6 +10218,58 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
     d.mat_specular = {specCol.R() * specEn, specCol.G() * specEn, specCol.B() * specEn, specPow};
     const Color& localSpec = _curMaterial.specular;
     d.mat_local_specular = {localSpec.R(), localSpec.G(), localSpec.B(), 0.0f};
+    // REFLECT-001 phase B: surface class lanes. A no-op unless WGR_REFLECT / WGR_REFLECT_DEBUG.
+    //
+    // D.1: the material the class and the SMDI are read from is the first section of this draw
+    // whose RVMAT names a specular map, not blindly section `beg`. A draw spans [beg, end) and
+    // Arma 3 starts some bodies on an emissive light section (C_SUV_01_F begins on
+    // car_headlight_emit.rvmat): read from `beg`, the whole red body had no SMDI and kept the
+    // paint's clear coat on its tyres and dirt (smdi6-2c18216, 2026-10-23).
+    const ShapeSection* reflSection = &sMesh.GetSection(beg);
+    uint64_t reflSpecular = 0;
+    if (ReflectLanesEnabled())
+    {
+        // Per material, once: does its RVMAT name a SpecularDetail map? Keyed by the material
+        // object and its serial, so the walk costs a pointer hash per section per frame instead
+        // of a string build and lookup (21 Peugeots, hundreds of sections each, every frame).
+        thread_local std::unordered_map<const TexMaterial*, std::pair<uint64_t, bool>> hasSpecular;
+        for (int i = beg; i < end && i < beg + 64; ++i)
+        {
+            const ShapeSection& sec = sMesh.GetSection(i);
+            const TexMaterial* mat = sec.surfMat.GetRef();
+            if (!mat)
+                continue;
+            auto known = hasSpecular.find(mat);
+            if (known == hasSpecular.end() || known->second.first != mat->Serial())
+            {
+                bool has = false;
+                const char* name = mat->GetName().Data();
+                if (name && *name)
+                {
+                    auto cached = _materialBindings.find(name);
+                    if (cached == _materialBindings.end())
+                    {
+                        ResolveMaterialBaseColour(sec);
+                        cached = _materialBindings.find(name);
+                    }
+                    has = cached != _materialBindings.end() &&
+                          cached->second.Find(Asset::Material::MaterialSlot::SpecularDetail) != nullptr;
+                }
+                known = hasSpecular.insert_or_assign(mat, std::make_pair(uint64_t(mat->Serial()), has)).first;
+            }
+            if (!known->second.second)
+                continue;
+            if (const uint64_t id = ResolveMaterialSpecularMap(sec))
+            {
+                reflSection = &sec;
+                reflSpecular = id;
+                break;
+            }
+        }
+    }
+    FillReflectLanes(d, static_cast<const Object*>(GetDrawObject()), sMesh.GetSection(beg).properties.GetTexture(),
+                     reflSection->surfMat.GetRef());
+    d.reflect_specular_texture_id = d.mat_reflect1.x > 0.5f ? reflSpecular : 0;
     if (const auto* person = dyn_cast<const Person>(static_cast<const Object*>(GetDrawObject())))
     {
         const auto* ownerShape = person->GetShape();
@@ -9193,15 +10289,25 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
         // mesh identity as well as positive stock clothing texture admission.
         if (primaryMesh)
         {
+            // The texture half of the admission is memoised on the texture (asked per section of
+            // every soldier, per frame); the result is AdmitUniformCloth's.
+            const std::string_view ownerModel = static_cast<const char*>(ownerShape->GetName());
+            const auto admit = [&ownerModel](const Texture* candidate)
+            {
+                if (!candidate)
+                    return render::AdmitUniformCloth(ownerModel, "");
+                const auto* t = static_cast<const TextureWgpu*>(candidate);
+                return render::AdmitUniformClothByTexture(
+                    ownerModel, t->NameMemo(TextureWgpu::SlotClothWestAtlas, &render::UniformClothWestAtlasTexture),
+                    t->NameMemo(TextureWgpu::SlotClothEastAtlas, &render::UniformClothEastAtlasTexture),
+                    t->NameMemo(TextureWgpu::SlotClothPlain, &render::UniformClothPlainTexture));
+            };
             const Texture* texture = sMesh.GetSection(beg).properties.GetTexture();
-            const auto cloth = render::AdmitUniformCloth(static_cast<const char*>(ownerShape->GetName()),
-                                                        texture ? texture->Name() : "");
+            const auto cloth = admit(texture);
             // A combined draw must contain ONLY the same admitted material.
             for (int section = beg + 1; section < end; ++section)
             {
-                const Texture* next = sMesh.GetSection(section).properties.GetTexture();
-                if (render::AdmitUniformCloth(static_cast<const char*>(ownerShape->GetName()),
-                                             next ? next->Name() : "") != cloth)
+                if (admit(sMesh.GetSection(section).properties.GetTexture()) != cloth)
                     sameCloth = false;
             }
             if (sameCloth && uniformWetEnabled)
@@ -9257,6 +10363,23 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
             }
         }
     }
+    // Mud caked on a vehicle (Weather/MudCoat.hpp): the ambient/diffuse/sun-diffuse
+    // alpha lanes are never read by the shaders, so they carry the coat, the plane
+    // mud is measured from and the vehicle's up axis. shader3d.wgsl vehicle_mud_cover decodes them (negative = mud).
+    {
+        static const bool vehicleMudEnabled = [] {
+            const char* value = std::getenv("WGR_VEHICLE_MUD");
+            return !(value && value[0] == '0');
+        }();
+        float mudEncoded = 0.0f, mudPlaneD = 0.0f, mudUp = 0.0f;
+        const Object* mudOwner = static_cast<const Object*>(GetDrawObject());
+        if (vehicleMudEnabled && mudOwner && mudOwner->GetMudCoat(mudEncoded, mudPlaneD, mudUp))
+        {
+            d.mat_light_ambient.w = mudEncoded;
+            d.mat_light_diffuse.w = mudPlaneD;
+            d.mat_sun_diffuse.w = mudUp; // only .rgb of sun_diffuse is read by the shader
+        }
+    }
     // The real zasleh animation controls whether these sections draw at all.
     // Require every combined section to be an audited stock sheet with the
     // authored animated/no-shadow/ordered-blend flags. No actor-wide material
@@ -9285,6 +10408,9 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
             // Negative reserved scalar cannot enter the positive cloth encoding.
             // shader3d overrides lighting only for this explicit admission.
             d.mat_local_specular.w = -1.0f;
+            // A flash is emitted light: it adds to what is behind it and never
+            // darkens it (alpha-over drew dark fringes round the soft edges).
+            if (d.blend == WGR_BLEND_ALPHA) d.blend = WGR_BLEND_ADDITIVE;
         }
         static const bool trace = [] {
             const char* value = std::getenv("POSEIDON_MUZZLE_FLASH_TRACE");
@@ -9295,7 +10421,7 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
             static std::unordered_set<std::string> traced;
             const Texture* source = sMesh.GetSection(beg).properties.GetTexture();
             if (traced.insert(source->Name()).second)
-                LOG_INFO(Graphics, "MUZZLE_FLASH_MATERIAL texture={} width={} height={} enabled={} admitted=true animated=true noShadow=true orderedAlpha=true blend=true encoded={:.1f} radiancePeak=1.25 timing=existing-zasleh",
+                LOG_INFO(Graphics, "MUZZLE_FLASH_MATERIAL texture={} width={} height={} enabled={} admitted=true animated=true noShadow=true orderedAlpha=true blend=true encoded={:.1f} radianceEdge=1.5 radianceCore=16.0 blend=additive sheet=procedural timing=existing-zasleh",
                          source->Name(), source->AWidth(0), source->AHeight(0), enabled,
                          d.mat_local_specular.w);
         }
@@ -9409,7 +10535,104 @@ void EngineWgpu::DrawSectionTL(const Shape& sMesh, int beg, int end)
     {
         _draws3dPendingMesh.push_back(PendingMeshRef{U32(_draws3d.size() - 1), buf->slot});
     }
-    _cmds.push_back(WgrCmd{WGR_CMD_DRAW_3D, U32(_draws3d.size() - 1)});
+    (_blendCapture ? _blendStash : _cmds).push_back(WgrCmd{WGR_CMD_DRAW_3D, U32(_draws3d.size() - 1)});
+}
+
+void EngineWgpu::BlendRecordReplay(uint32_t beg, uint32_t end)
+{
+    if (beg <= end && end <= _blendStash.size())
+    {
+        _cmds.insert(_cmds.end(), _blendStash.begin() + beg, _blendStash.begin() + end);
+    }
+}
+
+// The verification half of the lever: is the capture [beg, end) the same draws that the real
+// second draw of the object just appended to the stream after `mark`? Byte-equal records,
+// except the two per-frame table indices, whose CONTENTS are compared instead: a second draw
+// opens its own palette slot (a copy of the same bones) and may name a re-pushed camera.
+bool EngineWgpu::BlendRecordMatches(uint32_t beg, uint32_t end, uint32_t mark) const
+{
+    // Says why, the first few times: a verification that only counts cannot be acted on.
+    static int logged = 0;
+    const auto fail = [](const char* why, size_t detail)
+    {
+        if (logged++ < 12)
+            LOG_WARN(Graphics, "BLEND_RECORD mismatch detail: {} ({})", why, detail);
+        return false;
+    };
+    if (beg > end || end > _blendStash.size() || mark > _cmds.size() || end - beg != _cmds.size() - mark)
+    {
+        return fail("draw count", _cmds.size() - mark);
+    }
+    for (uint32_t k = 0; k < end - beg; k++)
+    {
+        const WgrCmd& a = _blendStash[beg + k];
+        const WgrCmd& b = _cmds[mark + k];
+        if (a.kind != b.kind || (a.kind != WGR_CMD_DRAW_3D && a.arg != b.arg))
+        {
+            return fail("command kind", b.kind);
+        }
+        if (a.kind != WGR_CMD_DRAW_3D)
+        {
+            continue;
+        }
+        if (a.arg >= _draws3d.size() || b.arg >= _draws3d.size())
+        {
+            return fail("draw index", b.arg);
+        }
+        WgrDraw3D da = _draws3d[a.arg];
+        WgrDraw3D db = _draws3d[b.arg];
+        if ((da.palette_slot == WGR_NO_PALETTE) != (db.palette_slot == WGR_NO_PALETTE))
+        {
+            return fail("palette presence", db.palette_slot);
+        }
+        if (da.palette_slot != WGR_NO_PALETTE)
+        {
+            const size_t pa = size_t(da.palette_slot) * WGR_PALETTE_SIZE;
+            const size_t pb = size_t(db.palette_slot) * WGR_PALETTE_SIZE;
+            if (pa + WGR_PALETTE_SIZE > _palette.size() || pb + WGR_PALETTE_SIZE > _palette.size() ||
+                std::memcmp(&_palette[pa], &_palette[pb], WGR_PALETTE_SIZE * sizeof(WgrMat4)) != 0)
+            {
+                return fail("palette contents", db.palette_slot);
+            }
+        }
+        if (da.camera != db.camera)
+        {
+            if (da.camera >= _cameras.size() || db.camera >= _cameras.size() ||
+                std::memcmp(&_cameras[da.camera], &_cameras[db.camera], sizeof(CameraEntry)) != 0)
+            {
+                return fail("camera contents", db.camera);
+            }
+        }
+        // A mesh created this frame records handle 0 plus a pending patch (REN-THR-011); the
+        // second draw can already read the real handle. Compare what publishing will carry.
+        const auto resolvedMesh = [this](uint32_t index, uint64_t mesh)
+        {
+            if (mesh != 0)
+                return mesh;
+            for (const PendingMeshRef& ref : _draws3dPendingMesh)
+                if (ref.index == index && ref.slot)
+                    return uint64_t(ref.slot->renderer);
+            return mesh;
+        };
+        if (resolvedMesh(a.arg, da.mesh) != resolvedMesh(b.arg, db.mesh))
+        {
+            return fail("mesh", 0);
+        }
+        da.mesh = db.mesh = 0;
+        da.palette_slot = db.palette_slot = 0;
+        da.camera = db.camera = 0;
+        if (std::memcmp(&da, &db, sizeof(WgrDraw3D)) != 0)
+        {
+            const auto* ba = reinterpret_cast<const unsigned char*>(&da);
+            const auto* bb = reinterpret_cast<const unsigned char*>(&db);
+            size_t first = 0;
+            while (first < sizeof(WgrDraw3D) && ba[first] == bb[first])
+                first++;
+            return fail("record bytes, first differing offset", first);
+        }
+    }
+    return true;
 }
 
 // --- GPU-driven retained scene (docs/gpu-culling-and-depth-plan.md Stage 3b) ---
@@ -9503,36 +10726,33 @@ bool GpuSectionMaterialUsesLeafCardsUncached(const Ref<TexMaterial>& surfMat)
 // apart.  The texture's authored role can: every A3 bark map lives in _bark or
 // carries a bark/trunk name.  Keep it opaque while the actual polyplane cards
 // retain the TreeAdv alpha test.
-bool GpuTextureIsBarkOrTrunkUncached(const TextureWgpu* texture)
+static bool BarkOrTrunkName(const char* path)
 {
-    const char* path = texture ? texture->Name() : nullptr;
     return path && (ContainsNoCase(path, "\\_bark\\") || ContainsNoCase(path, "bark_") ||
                     ContainsNoCase(path, "_bark") || ContainsNoCase(path, "\\trunk") ||
                     ContainsNoCase(path, "_trunk"));
 }
 
-// PERF-015: five substring scans of a full texture path, per section, per frame. Same
-// address-keyed / path-validated scheme as MaterialClassSlot, for the same reason.
+bool GpuTextureIsBarkOrTrunkUncached(const TextureWgpu* texture)
+{
+    return BarkOrTrunkName(texture ? texture->Name() : nullptr);
+}
+
+// PERF-015: five substring scans of a full texture path, per section, per frame. Memoised on
+// the texture (its name never changes); it was an address-keyed map with a path compare per
+// call, which cost about as much as the scans on a firefight's soldiers.
 bool GpuTextureIsBarkOrTrunk(const TextureWgpu* texture)
 {
     const char* path = texture ? texture->Name() : nullptr;
     if (!SectionClassCacheEnabled() || !path || !*path)
         return GpuTextureIsBarkOrTrunkUncached(texture);
-    struct TextureClass
-    {
-        std::string path;
-        bool        barkOrTrunk = false;
-    };
-    thread_local std::unordered_map<const void*, TextureClass> cache;
-    TextureClass& slot = cache[static_cast<const void*>(texture)];
     Pass1Submit::gSecClassCalls.fetch_add(1, std::memory_order_relaxed);
-    if (slot.path.empty() || slot.path != path)
-    {
-        Pass1Submit::gSecClassMisses.fetch_add(1, std::memory_order_relaxed);
-        slot.path = path;
-        slot.barkOrTrunk = GpuTextureIsBarkOrTrunkUncached(texture);
-    }
-    return slot.barkOrTrunk;
+    return texture->NameMemo(TextureWgpu::SlotBarkOrTrunk,
+                             [](const char* name)
+                             {
+                                 Pass1Submit::gSecClassMisses.fetch_add(1, std::memory_order_relaxed);
+                                 return BarkOrTrunkName(name);
+                             });
 }
 
 bool GpuSectionMaterialIsCutout(const Ref<TexMaterial>& surfMat, TextureWgpu* texture)
@@ -9583,7 +10803,7 @@ bool GpuEmatIsGlass(const Ref<TexMaterial>& surfMat)
     return !family.empty() && Asset::Material::EmatMaterial::NameMatches(family, "MatPBRBasicGlass");
 }
 
-bool GpuEmatBlends(const Ref<TexMaterial>& surfMat)
+static bool GpuEmatBlendsByPath(const Ref<TexMaterial>& surfMat)
 {
     if (surfMat.IsNull())
         return false;
@@ -9652,7 +10872,7 @@ bool GpuEmatIsOpaqueSolid(const Ref<TexMaterial>& surfMat)
 
 // Whether a section's `.emat` names `Cull none` (wire mesh, glass panes).
 // Same cached shape as the two answers above.
-bool GpuEmatCullNone(const Ref<TexMaterial>& surfMat)
+static bool GpuEmatCullNoneByPath(const Ref<TexMaterial>& surfMat)
 {
     if (surfMat.IsNull())
         return false;
@@ -9685,6 +10905,21 @@ bool GpuEmatCullNone(const Ref<TexMaterial>& surfMat)
     return cullNone;
 }
 
+// Per section per frame, so memoised on the material (TexMaterial::Memo); the path-keyed
+// caches above still answer the first time, so nothing is read from disk differently.
+bool GpuEmatBlends(const Ref<TexMaterial>& surfMat)
+{
+    if (surfMat.IsNull())
+        return false;
+    return surfMat->Memo(TexMaterial::MemoGpuEmatBlends, [&] { return int(GpuEmatBlendsByPath(surfMat)); }) != 0;
+}
+
+bool GpuEmatCullNone(const Ref<TexMaterial>& surfMat)
+{
+    if (surfMat.IsNull())
+        return false;
+    return surfMat->Memo(TexMaterial::MemoGpuEmatCullNone, [&] { return int(GpuEmatCullNoneByPath(surfMat)); }) != 0;
+}
 
 // RFG-074: name the classifier's refusals, once per (reason, texture). Every one of
 // these was a bare `return false`, and the church's ten opaque wall sections went
@@ -9726,7 +10961,8 @@ static void TraceEmatBlendDecision(const ShapeSection& sec, TextureWgpu* texture
 }
 
 bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::mesh::MeshSection>& secs, int i,
-                        WgrModelSection& secOut, WgrModelMaterial& matOut, bool preparedPilot=false)
+                        WgrModelSection& secOut, WgrModelMaterial& matOut, bool preparedPilot=false,
+                        bool earthRoadCoverage=false)
 {
     if (i >= secs.Size())
     {
@@ -9743,7 +10979,11 @@ bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::m
     const render::RenderPassDescriptor desc = render::BuildRenderPassDescriptor(split, ctx);
     // The same ownership question Shape::Draw's skip and RegisterGpuModel ask (ClipShape.hpp).
     // Answering it differently here is how a section ends up drawn by nobody.
-    if (!SectionGpuOwned(sec))
+    auto* texture = static_cast<TextureWgpu*>(sec.properties.GetTexture());
+    const bool earthRoadSection = EarthRoadCoverage::Section(earthRoadCoverage,
+        desc.blend == render::BlendMode::AlphaBlend, desc.surface == render::SurfaceMode::OnSurface,
+        texture != nullptr, (spec & (IsHidden | IsHiddenProxy)) != 0);
+    if (!SectionGpuOwned(sec) && !earthRoadSection)
     {
         TraceClassifyReject(sec, "SectionGpuOwned false");
 
@@ -9763,7 +11003,6 @@ bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::m
     secOut.index_count = U32(indexCount);
     uint64_t tex = 0;
     Poseidon::AlphaStats::Kind alphaClass = Poseidon::AlphaStats::Opaque;
-    auto* texture = static_cast<TextureWgpu*>(sec.properties.GetTexture());
     if (texture)
     {
         tex = texture->EnsureUploaded();
@@ -9811,9 +11050,10 @@ bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::m
     // that fooled SectionIsBlend would push half a canopy's LODs out of the retained set.
     // Treat them as the alpha-tested cards they are, on BOTH paths, or the two disagree and a
     // section is drawn twice or not at all (see IsGpuOwnedSection).
-    const bool legacyPlantCutout = texture && (render::IsLegacyPlantCutoutTexture(texture->Name()) ||
-                                               (render::IsEnfusionCoverageTexture(texture->Name()) &&
-                                                texture->HasAlphaHoles() && !GpuEmatBlends(sec.surfMat)));
+    const bool legacyPlantCutout =
+        texture && (texture->NameMemo(TextureWgpu::SlotLegacyPlantCutout, &render::IsLegacyPlantCutoutTexture) ||
+                    (texture->NameMemo(TextureWgpu::SlotEnfusionCoverage, &render::IsEnfusionCoverageTexture) &&
+                     texture->HasAlphaHoles() && !GpuEmatBlends(sec.surfMat)));
     const bool materialCutout =
         alphaClass == Poseidon::AlphaStats::Blend && !GpuEmatBlends(sec.surfMat) &&
         GpuSectionMaterialIsCutout(sec.surfMat, texture);
@@ -9861,7 +11101,7 @@ bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::m
                                          !texture->HasAlphaHoles() && MaterialIsFullyOpaque(m) &&
                                          GpuEmatIsOpaqueSolid(sec.surfMat);
     if (alphaClass == Poseidon::AlphaStats::Blend && !bark && !materialCutout && !legacyPlantCutout &&
-        !blendOpaqueRoute && !enfusionOpaqueRoughness)
+        !blendOpaqueRoute && !enfusionOpaqueRoughness && !earthRoadSection)
     {
         TraceClassifyReject(sec, "blend/opaque route");
         TraceEmatBlendDecision(sec, texture, m, false);
@@ -9886,6 +11126,13 @@ bool ClassifyGpuSection(const Shape& s, uint64_t mesh, const AutoArray<render::m
                           desc.blend == render::BlendMode::AlphaBlend))
     {
         alphaRef = std::max(alphaRef, 0.5f);
+    }
+    if (earthRoadSection)
+    {
+        // Surface-road alpha is coverage only for this independent Earth owner.
+        // Reuse the tested cutout/MSAA A2C path, never an opaque glass shortcut.
+        if (!EarthRoadCoverage::CanShade(earthRoadSection, tex != 0, MaterialIsFullyOpaque(m))) return false;
+        alphaRef = EarthRoadCoverage::AlphaReference;
     }
     // Cull-none cutouts (wire mesh) stay CPU-drawn: the material is authored
     // double-sided and the retained path culls backfaces. Vegetation is
@@ -9971,7 +11218,9 @@ WgrInstance BuildGpuInstance(const Object& obj, uint32_t model, const ConformPla
     if (ForestAtlasSnowOwner(obj, cp.mode))
     {
         inst.conform2.w = ForestSnowSurface::OwnerProof;
-        if (std::getenv("WGR_TREE_SNOW_TRACE"))
+        // Read once: this runs per instance (and getenv locks and walks the environment).
+        static const bool treeSnowTrace = std::getenv("WGR_TREE_SNOW_TRACE") != nullptr;
+        if (treeSnowTrace)
         {
             static std::unordered_set<const LODShapeWithShadow*> seen;
             if (seen.size() < 16 && seen.insert(obj.GetShape()).second)
@@ -12906,6 +14155,79 @@ float EngineWgpu::ResolveMaterialNormalPower(const ShapeSection& section)
     return cached->second.normalPower;
 }
 
+uint32_t EngineWgpu::ResolveMaterialFarNormals(const ShapeSection& section)
+{
+    // WGR_FOLIAGE_FAR_NORMALS=0 leaves the far billboards on their authored normals (the A/B).
+    static const bool enabled = []
+    {
+        const char* v = std::getenv("WGR_FOLIAGE_FAR_NORMALS");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled || !section.surfMat)
+        return 0;
+    const char* materialPath = section.surfMat->GetName().Data();
+    if (!materialPath || !*materialPath)
+        return 0;
+    const auto cached = _materialBindings.find(materialPath);
+    if (cached == _materialBindings.end() || !cached->second.treeCrown)
+        return 0; // ResolveMaterialBaseColour fills the cache first
+    const auto& translated = cached->second;
+    // RFG-185 layout: bits 0-12 FarLODDistanceOffset (dm), bit 13 = a crown, bit 15 =
+    // NormalsToCamera, bits 16-25 FarLODHeightOffset (dm, signed 10-bit), bits 26-31
+    // SSSBackScattering x 63.
+    const uint32_t distance = static_cast<uint32_t>(
+        std::clamp(std::lround(translated.farLodDistanceOffset * 10.0f), 0L, 0x1FFFL));
+    const int32_t height = static_cast<int32_t>(
+        std::clamp(std::lround(translated.farLodHeightOffset * 10.0f), -512L, 511L));
+    const uint32_t sss = static_cast<uint32_t>(
+        std::clamp(std::lround(translated.sssBackScattering * 63.0f), 0L, 63L));
+    return distance | 0x2000u | (translated.normalsToCamera ? 0x8000u : 0u) |
+           ((static_cast<uint32_t>(height) & 0x3FFu) << 16) | (sss << 26);
+}
+
+// The mean colour of a vegetation colorize map (`WorldColorizeMap`), as packed RGB8 (r in the low
+// byte), from its smallest mip at or above 4x4. Cached per path; 0 when unreadable.
+uint32_t EngineWgpu::ResolveColorizeMean(const std::string& path)
+{
+    static std::unordered_map<std::string, uint32_t> cache;
+    const auto found = cache.find(path);
+    if (found != cache.end())
+        return found->second;
+    uint32_t packed = 0;
+    std::vector<uint8_t> bytes;
+    const auto& mount = Poseidon::Asset::Formats::Enfusion::EnfusionMount::Instance();
+    if (mount.IsOpen() && mount.Read(path, bytes) && IsEddsBuffer(bytes.data(), bytes.size()))
+    {
+        const EddsImage image = ReadEddsBuffer(bytes.data(), bytes.size());
+        size_t level = 0;
+        for (size_t i = 0; i < image.mipmaps.size(); ++i)
+            if (image.mipmaps[i].width >= 4 && image.mipmaps[i].height >= 4)
+                level = i;
+        if (image.valid() && level < image.mipmaps.size())
+        {
+            const auto& mip = image.mipmaps[level];
+            std::vector<uint8_t> rgba(static_cast<size_t>(mip.width) * mip.height * 4);
+            if (ConvertPixels(mip.data.data(), rgba.data(), mip.width, mip.height, image.format, PixelFormat::RGBA8888))
+            {
+                if (image.format == PixelFormat::ARGB8888)
+                    for (size_t i = 0; i + 2 < rgba.size(); i += 4)
+                        std::swap(rgba[i], rgba[i + 2]);
+                double sum[3] = {0.0, 0.0, 0.0};
+                const size_t n = static_cast<size_t>(mip.width) * mip.height;
+                for (size_t i = 0; i < n; ++i)
+                    for (int c = 0; c < 3; ++c)
+                        sum[c] += rgba[i * 4 + c];
+                packed = static_cast<uint32_t>(sum[0] / n) | (static_cast<uint32_t>(sum[1] / n) << 8) |
+                         (static_cast<uint32_t>(sum[2] / n) << 16);
+                LOG_INFO(Graphics, "Wgpu foliage colorize: '{}' mean sRGB {}/{}/{}", path, packed & 0xFF,
+                         (packed >> 8) & 0xFF, (packed >> 16) & 0xFF);
+            }
+        }
+    }
+    cache.emplace(path, packed);
+    return packed;
+}
+
 // Crown self-occlusion volume, packed for the section record. Zero lanes when
 // the material names no volume, so every legacy section and every silent .emat
 // renders exactly as before.
@@ -12913,13 +14235,13 @@ void EngineWgpu::ResolveMaterialCrownAo(const ShapeSection& section, float aoP0[
 {
     aoP0[0] = aoP0[1] = aoP0[2] = aoP0[3] = 0.0f;
     aoP1[0] = aoP1[1] = aoP1[2] = aoP1[3] = 0.0f;
+    // On by default since 2026-10-11 (Reforger reference: the crowns' dark interior). Off with
+    // WGR_FOLIAGE_CROWN_AO=0.
     static const bool enabled = []
     {
         const char* v = std::getenv("WGR_FOLIAGE_CROWN_AO");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
-    if (!enabled)
-        return;
     if (!section.surfMat)
         return;
     const char* materialPath = section.surfMat->GetName().Data();
@@ -12929,13 +14251,59 @@ void EngineWgpu::ResolveMaterialCrownAo(const ShapeSection& section, float aoP0[
     if (cached == _materialBindings.end())
         return; // ResolveMaterialBaseColour fills the cache first
     const auto& translated = cached->second;
-    if (translated.crownAoIntensity <= 0.0f || translated.crownAoWidth <= 0.0f)
+    // Colorization rides lanes z/w of the second vector, independent of the AO volume (the far
+    // MLOD crowns author colorization with GeometryAOIntensity 0). z = lerp, w = the bits of an
+    // RGBA8 word: rgb the map's mean colour (sRGB) x brightness/0.5, a the ramp distance in
+    // metres (0..255). See gpu_driven.wgsl, native_colorize.
+    static const bool colorizeOn = []
+    {
+        const char* v = std::getenv("WGR_FOLIAGE_COLORIZE");
+        return !(v && v[0] == '0');
+    }();
+    if (colorizeOn && translated.colorizeLerp > 0.0f && !translated.colorizeMap.empty())
+    {
+        const uint32_t mean = ResolveColorizeMean(translated.colorizeMap);
+        if (mean != 0)
+        {
+            const float gain = translated.colorizeBrightness / 0.5f;
+            auto channel = [&](int shift)
+            {
+                const float v = static_cast<float>((mean >> shift) & 0xFFu) * gain;
+                return static_cast<uint32_t>(std::clamp(v, 0.0f, 255.0f));
+            };
+            const uint32_t distance =
+                static_cast<uint32_t>(std::clamp(translated.colorizeLerpDistance, 0.0f, 255.0f));
+            const uint32_t word = channel(0) | (channel(8) << 8) | (channel(16) << 16) | (distance << 24);
+            // RFG-183: z = lerp + 2 * round(255 * LerpAtCamera). The lerp is in [0, 1], so
+            // floor(z / 2) recovers the at-camera byte and z - 2k the lerp (no ABI word left).
+            const float atCamera = std::round(std::clamp(translated.colorizeLerpAtCamera, 0.0f, 1.0f) * 255.0f);
+            aoP1[2] = translated.colorizeLerp + 2.0f * atCamera;
+            std::memcpy(&aoP1[3], &word, sizeof(word));
+        }
+    }
+    // RFG-144: lane x of the second vector carries FadeFaces (the cylinder height it used to hold
+    // was never read by the shader -- the fitted falloff is radial-only). WGR_FOLIAGE_FADE_FACES=0
+    // turns the fade off.
+    static const bool fadeFaces = []
+    {
+        const char* v = std::getenv("WGR_FOLIAGE_FADE_FACES");
+        return !(v && v[0] == '0');
+    }();
+    if (fadeFaces)
+        aoP1[0] = translated.fadeFaces;
+    // RFG-180: -1 = "authored off", which the shader's baked-occlusion path honours (0 there
+    // still means "no intensity named", full baked occlusion, as RFG-106 fitted it).
+    if (enabled && translated.crownAoOff)
+    {
+        aoP0[3] = -1.0f;
+        return;
+    }
+    if (!enabled || translated.crownAoIntensity <= 0.0f || translated.crownAoWidth <= 0.0f)
         return;
     aoP0[0] = translated.crownAoCenter[0];
     aoP0[1] = translated.crownAoCenter[1];
     aoP0[2] = translated.crownAoCenter[2];
     aoP0[3] = translated.crownAoIntensity;
-    aoP1[0] = translated.crownAoHeight;
     aoP1[1] = translated.crownAoWidth;
 }
 
@@ -13055,7 +14423,7 @@ bool EngineWgpu::MaterialIsReflective(const ShapeSection& section)
         else
         {
             const auto uncached = _materialBindings.find(materialPath);
-            if (uncached == _materialBindings.end() || uncached->second.shaderFamily != "CalmWater")
+            if (uncached == _materialBindings.end() || !Asset::Material::IsCalmWater(uncached->second))
                 return false;
         }
     }
@@ -13068,7 +14436,7 @@ bool EngineWgpu::MaterialIsReflective(const ShapeSection& section)
         // The `.emat` substitution deliberately keeps the rvmat's own family string rather
         // than inventing one (EmatMaterialAdapter::TranslateEmat), so this test reads the
         // same on a water_bliss surface and on a bare water one.
-        if (cached->second.shaderFamily != "CalmWater")
+        if (!Asset::Material::IsCalmWater(cached->second))
             return false;
     }
     static std::unordered_set<std::string> logged;
@@ -13161,6 +14529,19 @@ bool EngineWgpu::ResolveMaterialLayers(const ShapeSection& section, WgrModelMate
     {
         auto* face = static_cast<TextureWgpu*>(section.properties.GetTexture());
         skip("section has no surfMat", face && face->GetName().Data() ? face->GetName().Data() : "(no face texture)");
+        // RFG-203: an `enft|r,g,b|tile` face with no material. By default (layerTintInShader) that
+        // texture draws THROUGH its untinted tile and leaves the multiply to layer_colour[0] -- which
+        // only a resolved material ever filled, so every such section lost its tint outright
+        // (Everon: "layers SKIPPED (section has no surfMat) for enft|0.2120,0.1570,0.1390|...wood...").
+        // The tint is in the name; take it from there.
+        float rgb[3];
+        const char* inner = nullptr;
+        if (face && face->GetName().Data() && Poseidon::Dev::GResidencyLevers().layerTintInShader &&
+            Poseidon::Enfusion::SplitLayerTintName(face->GetName().Data(), rgb, &inner))
+        {
+            for (int c = 0; c < 3; ++c)
+                material.layer_colour[0][c] = rgb[c];
+        }
         return false;
     }
     const char* materialPath = section.surfMat->GetName().Data();
@@ -13265,6 +14646,18 @@ bool EngineWgpu::ResolveMaterialLayers(const ShapeSection& section, WgrModelMate
                 material.layer_colour[i][c] = entry->tint[c];
             if (firstSeen && i == 0)
                 ++GMultiLayerCensus.composedTinted;
+        }
+        // RFG-199: the material's own `Color` x `Diffuse` (the adapter folds both into
+        // `diffuse`) multiply every layer. Only Color_N reached this path, so Everon's window
+        // frames (pale wood tile, Color_1 0.286, Diffuse 0.223 -> dark brown in Reforger) drew
+        // as the bare tile. The direct path's per-draw tint already carried it; this is the
+        // retained one. POSEIDON_EMAT_DIFFUSE=0 makes `diffuse` plain Color again.
+        if (Asset::Material::IsEmatPath(materialPath))
+        {
+            const auto& global = cached->second.diffuse;
+            for (size_t i = 0; i < 4; ++i)
+                for (int c = 0; c < 3; ++c)
+                    material.layer_colour[i][c] *= global[c];
         }
     }
 
@@ -14230,7 +15623,7 @@ render::RegistrationCost EngineWgpu::QueryRegistrationCost(const LODShapeWithSha
         });
 }
 
-uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
+uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape, bool earthRoadCoverage)
 {
     if (auto found = _gpuModels.find(shape); found != _gpuModels.end())
     {
@@ -14300,7 +15693,8 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
                 _parkRefillActivationImages += activationRefills;
                 _parkRefillActivationFailures += refillFailed ? 1 : 0;
                 _parkRefillLeaseChangedStale += leaseChanged ? 1 : 0;
-                if ((activationRefills || refillFailed || leaseChanged) && std::getenv("WGR_MODEL_RESIDENCY_TRACE"))
+                static const bool residencyTrace = std::getenv("WGR_MODEL_RESIDENCY_TRACE") != nullptr;
+                if ((activationRefills || refillFailed || leaseChanged) && residencyTrace)
                     LOG_INFO(Graphics,
                              "Wgpu parked refill activation: model={} images={} reused={} failed={} leaseChanged={} "
                              "totals deferredChecks={} activationImages={} activationFailures={} leaseChangedStale={}",
@@ -14313,14 +15707,16 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
                 UnparkGpuModel(shape);
                 if (render::GObjectAdmitProfile.active)
                     ++render::GObjectAdmitProfile.parkHits;
-                if (std::getenv("WGR_MODEL_RESIDENCY_TRACE"))
+                static const bool unparkTrace = std::getenv("WGR_MODEL_RESIDENCY_TRACE") != nullptr;
+                if (unparkTrace)
                     LOG_INFO(Graphics, "Wgpu model residency unpark: model={} parked={}", shape->Name(),
                              _gpuModelParked.size());
                 return found->second;
             }
             if (render::GObjectAdmitProfile.active)
                 ++render::GObjectAdmitProfile.parkStale;
-            if (std::getenv("WGR_MODEL_RESIDENCY_TRACE"))
+            static const bool staleTrace = std::getenv("WGR_MODEL_RESIDENCY_TRACE") != nullptr;
+            if (staleTrace)
                 LOG_INFO(Graphics, "Wgpu model residency unpark STALE: model={} -- textures moved, rebuilding",
                          shape->Name());
             DestroyGpuModel(shape); // erases every map entry; registration proceeds below
@@ -14384,6 +15780,7 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
     } birthObservationReport{birthObserver.get()};
     std::vector<TextureWgpu*> modelTextures;
     std::vector<uint64_t> modelMeshes;
+    std::vector<LodLevelMesh> levelMeshes; // LOD-STREAM bookkeeping, kept on registration
     if (_wbank)
         _wbank->BeginModelTextureCapture(modelTextures);
     struct TextureCaptureScope
@@ -14584,10 +15981,18 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
             // Chernarus+ measured 77% of visible objects as CPU-drawn vegetation with the bail on
             // (WLD-026 follow-up); Stratis measured land:obj 42.7 -> 0.185 ms without it.
             // WGR_TREEADV_RETAINED=0 restores the bail, whole-model, exactly as before.
+            //
+            // 2026-10-24: ON by default (owner's choice, on the captures). The GPU cull now takes
+            // the per-frame LOD width from the presentation snapshot, and the triangle blow-up
+            // above is gone: East Wind A_m01 (Stratis, 1280x720) 64 -> 80 fps, land:obj 8.2 ->
+            // 0.3 ms, GPU 15.4 -> 11.7 ms; DayZ Chernarus+ parked GPU 14.0/14.4 -> 12.2/17.1 ms
+            // (noisy, no penalty); Arma 2 Chernarus has no such sections and is unchanged. The
+            // trees also self-shadow (darker crowns and trunks), which the owner preferred to the
+            // flat per-draw look.
             static const bool treeAdvRetained = []
             {
                 const char* v = std::getenv("WGR_TREEADV_RETAINED");
-                return v && v[0] != '0';
+                return !(v && v[0] == '0');
             }();
             if (auto* texture = static_cast<TextureWgpu*>(shSec.properties.GetTexture());
                 texture && texture->GetAlphaClass() == Poseidon::AlphaStats::Blend &&
@@ -14625,7 +16030,11 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
             // Full -- which suppresses the CPU draw wholesale, so the complement that was
             // supposed to repaint it never runs. That is how A1's hotel lost 10,496 triangles
             // of glass and blinds. See ClipShape.hpp for the full contract.
-            if (SectionGpuOwned(shSec))
+            const auto roadDesc = render::BuildRenderPassDescriptor(render::SplitLegacy(shSec.properties.Special()));
+            const bool earthRoadSection = EarthRoadCoverage::Section(earthRoadCoverage,
+                roadDesc.blend == render::BlendMode::AlphaBlend, roadDesc.surface == render::SurfaceMode::OnSurface,
+                shSec.properties.GetTexture() != nullptr, false);
+            if (SectionGpuOwned(shSec) || earthRoadSection)
             {
                 levelHasOwned = true;
             }
@@ -14728,7 +16137,9 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
             rejectWhy = AdmitReject::IndexOverflow;
             break;
         }
-        if (std::getenv("WGR_INSTANCE_TRACE"))
+        // Read once: RegisterGpuModel runs per model (and getenv locks and walks the environment).
+        static const bool instanceTrace = std::getenv("WGR_INSTANCE_TRACE") != nullptr;
+        if (instanceTrace)
         {
             LOG_INFO(Graphics, "GpuModel lod name={} lod={} res={} vertices={} indices={} sections={} radius={}",
                      shape->Name(), level, shape->Resolution(level), nv, ni, s->NSections(), shape->BoundingSphere());
@@ -14761,6 +16172,18 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
         }
         _gpuMeshes.insert(mesh);
         modelMeshes.push_back(mesh);
+        {
+            // LOD-STREAM: a level can be evicted and rebuilt later only if this exact build
+            // reproduces it -- BuildVertices from the level as it stands, no forest crown patch,
+            // no conform original positions, no church snow proof.
+            LodLevelMesh lm;
+            lm.src = s;
+            lm.mesh = mesh;
+            lm.level = level;
+            lm.streamable = !isForest && !levelConform && shape->GetMapType() != MapChurch;
+            lm.bytes = uint64_t(nv) * sizeof(SVertex) + uint64_t(ni) * sizeof(uint32_t);
+            levelMeshes.push_back(lm);
+        }
         // RFG-088: this level's retained mesh holds exactly the bytes CreateVertexBuffer
         // would build for it, unless it was conformed (BuildOrigVertices) or crown-patched.
         if (!isForest && !(levelConform && s->OriginalPosValid()))
@@ -14801,7 +16224,7 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
             }();
             const bool preparedPilot=preparedSectionEnabled&&shape->Name()&&
                 std::strcmp(shape->Name(),R"(dz\structures\residential\tenements\tenement_small.p3d)")==0;
-            if (!ClassifyGpuSection(*s, mesh, secs, i, sec, mat,preparedPilot))
+            if (!ClassifyGpuSection(*s, mesh, secs, i, sec, mat,preparedPilot,earthRoadCoverage))
             {
                 // RFG-074: for the traced shape, say which sections the classifier
                 // REJECTED and what they carried -- these never reach the layer path.
@@ -15075,6 +16498,7 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
             // Authored normal intensity rides the same record; the 1.0 default keeps
             // every material that names none exactly where it was.
             mat.normal_power = ResolveMaterialNormalPower(s->GetSection(i));
+            mat.far_normals = ResolveMaterialFarNormals(s->GetSection(i));
             // Crown self-occlusion volume; zero lanes when unnamed (no-op).
             {
                 float aoP0[4], aoP1[4];
@@ -15183,10 +16607,14 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
                         found->second.ematPbr && found->second.ematPbr->bcrAlphaIsRoughness[0])
                     {
                         sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_PREVIEW;
+                        const auto scales = Asset::Material::NativePbrBasicScales(found->second);
+                        mat.native_pbr_scales = {scales[0], scales[1], 0.0f, 0.0f};
                         static bool reportedPreview = false;
                         if (!reportedPreview)
                         {
-                            LOG_INFO(Graphics, "Wgpu Reforger PBR preview: first eligible opaque section material={}", path);
+                            LOG_INFO(Graphics,
+                                     "Wgpu Reforger PBR preview: first eligible opaque section material={} roughnessScale={} metalnessScale={}",
+                                     path, scales[0], scales[1]);
                             reportedPreview = true;
                         }
                     }
@@ -15236,11 +16664,320 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
                     {
                         mat.specular_texture_id = baseNmo;
                         sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_PREVIEW | WGR_MODEL_SECTION_NORMAL_RG;
+                        static const bool maskScalePreview = []
+                        {
+                            const char* value = std::getenv("WGR_REFORGER_MASK_SCALE_PREVIEW");
+                            return value && value[0] == '1' && value[1] == '\0';
+                        }();
+                        if (maskScalePreview)
+                        {
+                            // Multi owns these otherwise unused Basic scale lanes only
+                            // under this separate opt-in. w selects the RGB-mask contract.
+                            const auto scales = Asset::Material::NativePbrMultiMaskScales(found->second);
+                            mat.native_pbr_scales = {scales[0], scales[1], scales[2], 1.0f};
+                            static std::unordered_set<std::string> reportedMaskScales;
+                            if ((scales[0] != 1.0f || scales[1] != 1.0f || scales[2] != 1.0f) &&
+                                reportedMaskScales.size() < 32 &&
+                                reportedMaskScales.insert(path).second)
+                                LOG_INFO(Graphics, "Wgpu Reforger mask-scale preview: material={} RGB={}/{}/{}",
+                                         path, scales[0], scales[1], scales[2]);
+                        }
+                        static const bool orderedPreview = []
+                        {
+                            const char* value = std::getenv("WGR_REFORGER_LAYER_ORDER_PREVIEW");
+                            return value && value[0] == '1' && value[1] == '\0';
+                        }();
+                        static const std::string orderedMaterial = []
+                        {
+                            const char* value = std::getenv("WGR_REFORGER_LAYER_ORDER_MATERIAL");
+                            return std::string(value ? value : "");
+                        }();
+                        const std::string_view materialName(path);
+                        const bool orderedTarget = orderedMaterial.empty() ||
+                            (materialName.size() >= orderedMaterial.size() &&
+                             Asset::Material::EmatMaterial::NameMatches(
+                                 materialName.substr(materialName.size() - orderedMaterial.size()), orderedMaterial));
+                        if (orderedPreview && orderedTarget && found->second.ematPbr->standardMaskBlend)
+                        {
+                            const Slot masks[] = {Slot::LayerMask1, Slot::LayerMask2, Slot::LayerMask3};
+                            const Slot colours[] = {Slot::LayerColour1, Slot::LayerColour2, Slot::LayerColour3};
+                            const auto* globalMask = found->second.Find(Slot::Mask);
+                            bool masksComplete = globalMask && !globalMask->texture.isProcedural &&
+                                !globalMask->texture.path.empty() &&
+                                (globalMask->uvSource != "tex1" || s->HasUV1());
+                            if (masksComplete)
+                            {
+                                Ref<Texture> texture = _wbank->Load(globalMask->texture.path.canonical().c_str());
+                                auto* native = static_cast<TextureWgpu*>(texture.GetRef());
+                                masksComplete = native && native->HasNativeLinearMask(false) &&
+                                    native->GpuHandle() == mat.mask_texture_id;
+                            }
+                            for (size_t layer = 0; layer < 3; ++layer)
+                            {
+                                const auto& params = found->second.ematPbr->layerMaskParams[layer];
+                                mat.layer_mask_params[layer] = {params[0], params[1], params[2], params[3]};
+                                if (mat.layer_texture_id[layer] == 0)
+                                {
+                                    masksComplete = masksComplete && found->second.Find(colours[layer]) == nullptr;
+                                    continue;
+                                }
+                                const auto* entry = found->second.Find(masks[layer]);
+                                if (!entry) continue; // authored absence is the white detail fallback
+                                if (entry->texture.isProcedural || entry->texture.path.empty())
+                                {
+                                    masksComplete = false;
+                                    continue;
+                                }
+                                Ref<Texture> texture = _wbank->Load(entry->texture.path.canonical().c_str());
+                                auto* native = static_cast<TextureWgpu*>(texture.GetRef());
+                                mat.layer_mask_texture_id[layer] = native && native->HasNativeLinearMask(true)
+                                    ? native->EnsureUploaded() : 0;
+                                masksComplete = masksComplete && mat.layer_mask_texture_id[layer] != 0;
+                            }
+                            if (masksComplete)
+                            {
+                                const auto scales = Asset::Material::NativePbrMultiMaskScales(found->second);
+                                mat.native_pbr_scales = {scales[0], scales[1], scales[2], 2.0f};
+                                static std::unordered_set<std::string> reportedOrdered;
+                                if (reportedOrdered.size() < 32 && reportedOrdered.insert(path).second)
+                                    LOG_INFO(Graphics, "Wgpu Reforger ordered-layer preview: material={} detailMasks={}/{}/{}",
+                                             path, mat.layer_mask_texture_id[0] != 0,
+                                             mat.layer_mask_texture_id[1] != 0, mat.layer_mask_texture_id[2] != 0);
+                            }
+                            else
+                            {
+                                static std::unordered_set<std::string> reportedSkipped;
+                                if (reportedSkipped.size() < 32 && reportedSkipped.insert(path).second)
+                                    LOG_INFO(Graphics, "Wgpu Reforger ordered-layer preview skipped: material={} mask bindings/UV unavailable",
+                                             path);
+                            }
+                        }
+                        else if (orderedPreview && orderedTarget)
+                        {
+                            static std::unordered_set<std::string> reportedUnsupported;
+                            if (reportedUnsupported.size() < 32 && reportedUnsupported.insert(path).second)
+                                LOG_INFO(Graphics, "Wgpu Reforger ordered-layer preview skipped: material={} unsupported source mask contract",
+                                         path);
+                        }
+                        static const bool normalPreview = []
+                        {
+                            const char* value = std::getenv("WGR_REFORGER_NORMAL_PREVIEW");
+                            return value && value[0] == '1' && value[1] == '\0';
+                        }();
+                        static const std::string normalMaterial = []
+                        {
+                            const char* value = std::getenv("WGR_REFORGER_NORMAL_MATERIAL");
+                            return std::string(value ? value : "");
+                        }();
+                        const bool normalTarget = normalMaterial.empty() ||
+                            (materialName.size() >= normalMaterial.size() &&
+                             Asset::Material::EmatMaterial::NameMatches(
+                                 materialName.substr(materialName.size() - normalMaterial.size()), normalMaterial));
+                        if (normalPreview && normalTarget)
+                        {
+                            const auto& parameters = found->second.ematPbr->normals;
+                            const bool sourceSupported = parameters.supported;
+                            bool bindingsComplete = sourceSupported && mat.native_pbr_scales.w == 2.0f && mat.normal_texture_id != 0 &&
+                                (sec.flags & WGR_MODEL_SECTION_GLOBALNMO_UV1) == 0u &&
+                                checkedNmo(Slot::NormalMap) == mat.normal_texture_id;
+                            for (size_t layer = 0; layer < 3; ++layer)
+                                bindingsComplete = bindingsComplete && mat.layer_texture_id[layer] != 0 &&
+                                    mat.layer_normal_texture_id[layer] != 0;
+                            if (bindingsComplete)
+                            {
+                                const auto& uv = parameters.globalUv;
+                                mat.global_normal_uv = {uv[0], uv[1], uv[2], uv[3]};
+                                const auto& detail = parameters.detailStrength;
+                                // Preserve authored source facts separately from this
+                                // preview's small positive detail-intensity floor.
+                                mat.detail_normal_strength = {detail[0].value + 0.001f, detail[1].value + 0.001f,
+                                                              detail[2].value + 0.001f, detail[3].value + 0.001f};
+                                mat.normal_power = parameters.globalPower;
+                                sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_NORMALS;
+                                static const bool tangentPreview = [] {
+                                    const char* value = std::getenv("WGR_REFORGER_TANGENT_PREVIEW");
+                                    return value && std::strcmp(value, "1") == 0;
+                                }();
+                                const bool authoredBasis = tangentPreview &&
+                                    render::mesh::HasAuthoredSectionTangentFrame(*s, i);
+                                if (authoredBasis) sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_TANGENTS;
+                                static std::unordered_set<std::string> reportedTangents;
+                                if (tangentPreview && reportedTangents.size() < 32 && reportedTangents.insert(path).second)
+                                    LOG_INFO(Graphics, "Wgpu authored UV0 tangent preview: material={} admission={} producer=4", path, authoredBasis);
+                            }
+                            static std::unordered_set<std::string> reportedNormals;
+                            if (reportedNormals.size() < 32 && reportedNormals.insert(path).second)
+                                LOG_INFO(Graphics, "Wgpu native PBR normal preview: material={} admission={} sourceSupported={} ordered={} globalUV={}/{} globalPower={}",
+                                         path, bindingsComplete, sourceSupported, mat.native_pbr_scales.w == 2.0f, parameters.globalUv[0],
+                                         parameters.globalUv[1], parameters.globalPower);
+                        }
+                        static const bool aoPreview = [] {
+                            const char* value = std::getenv("WGR_REFORGER_AO_PREVIEW");
+                            return value && std::strcmp(value, "1") == 0;
+                        }();
+                        static const std::string aoMaterial = [] {
+                            const char* value = std::getenv("WGR_REFORGER_AO_MATERIAL");
+                            return std::string(value ? value : "");
+                        }();
+                        const bool aoTarget = aoMaterial.empty() ||
+                            (materialName.size() >= aoMaterial.size() &&
+                             Asset::Material::EmatMaterial::NameMatches(
+                                 materialName.substr(materialName.size() - aoMaterial.size()), aoMaterial));
+                        if (aoPreview && aoTarget)
+                        {
+                            const auto& ao = found->second.ematPbr->layerAo;
+                            bool admitted = ao.supported && mat.native_pbr_scales.w == 2.0f;
+                            for (size_t layer = 0; layer < 3; ++layer)
+                                admitted = admitted && mat.layer_texture_id[layer] != 0 &&
+                                    mat.layer_normal_texture_id[layer] != 0;
+                            if (admitted)
+                            {
+                                for (size_t layer = 0; layer < 4; ++layer)
+                                    mat.layer_colour[layer][3] = ao.scale[layer];
+                                sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_LAYER_AO;
+                            }
+                            static std::unordered_set<std::string> reportedAo;
+                            if (reportedAo.size() < 32 && reportedAo.insert(path).second)
+                                LOG_INFO(Graphics, "Wgpu native PBR layer AO preview: material={} admission={} scales={}/{}/{}/{}",
+                                         path, admitted, ao.scale[0], ao.scale[1], ao.scale[2], ao.scale[3]);
+                        }
                         static bool reportedMultiPreview = false;
                         if (!reportedMultiPreview)
                         {
                             LOG_INFO(Graphics, "Wgpu Reforger PBR preview: first eligible layered section material={}", path);
                             reportedMultiPreview = true;
+                        }
+                    }
+                }
+            }
+            static const bool nativeSrgbPreview = []
+            {
+                const char* value = std::getenv("WGR_REFORGER_SRGB_PREVIEW");
+                return value && value[0] == '1' && value[1] == '\0';
+            }();
+            static const std::string nativeSrgbMaterial = []
+            {
+                const char* value = std::getenv("WGR_REFORGER_SRGB_MATERIAL");
+                return std::string(value ? value : "");
+            }();
+            if (nativeSrgbPreview && (sec.flags & WGR_MODEL_SECTION_NATIVE_PBR_PREVIEW) != 0u)
+            {
+                const auto& sourceSection = s->GetSection(i);
+                const char* path = sourceSection.surfMat && sourceSection.surfMat->GetName().Data()
+                    ? sourceSection.surfMat->GetName().Data() : nullptr;
+                const auto found = path ? _materialBindings.find(path) : _materialBindings.end();
+                const std::string_view name(path ? path : "");
+                const bool target = nativeSrgbMaterial.empty() ||
+                    (name.size() >= nativeSrgbMaterial.size() &&
+                     Asset::Material::EmatMaterial::NameMatches(
+                         name.substr(name.size() - nativeSrgbMaterial.size()), nativeSrgbMaterial));
+                bool complete = target && found != _materialBindings.end();
+                if (complete)
+                {
+                    using Slot = Asset::Material::MaterialSlot;
+                    const Slot roles[] = {Slot::BaseColour, Slot::LayerColour1, Slot::LayerColour2, Slot::LayerColour3};
+                    const uint64_t handles[] = {mat.texture_id, mat.layer_texture_id[0],
+                                                mat.layer_texture_id[1], mat.layer_texture_id[2]};
+                    for (size_t layer = 0; layer < 4; ++layer)
+                    {
+                        if (layer != 0 && handles[layer] == 0) continue;
+                        const auto* entry = found->second.Find(roles[layer]);
+                        if (!entry || entry->texture.isProcedural || entry->texture.path.empty())
+                        {
+                            complete = false;
+                            break;
+                        }
+                        Ref<Texture> texture = _wbank->Load(entry->texture.path.canonical().c_str());
+                        auto* native = static_cast<TextureWgpu*>(texture.GetRef());
+                        if (!native || !native->HasNativeSrgbBcr() || native->GpuHandle() != handles[layer])
+                        {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if (complete) sec.flags |= WGR_MODEL_SECTION_NATIVE_PBR_SRGB;
+                static std::unordered_set<std::string> reportedSrgb;
+                if (path && target && reportedSrgb.size() < 32 && reportedSrgb.insert(path).second)
+                    LOG_INFO(Graphics, "Wgpu native PBR sRGB preview: material={} sourceAdmission={}", path, complete);
+            }
+            static const bool globalOverlayPreview = [] {
+                const char* value = std::getenv("WGR_REFORGER_GLOBAL_OVERLAY_PREVIEW");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            static const std::string globalOverlayMaterial = [] {
+                const char* value = std::getenv("WGR_REFORGER_GLOBAL_OVERLAY_MATERIAL");
+                return std::string(value && *value ? value : "Pub_Village_E_01_L_Ext.emat");
+            }();
+            if (globalOverlayPreview && nativeSrgbPreview)
+            {
+                const auto& sourceSection = s->GetSection(i);
+                const char* path = sourceSection.surfMat ? sourceSection.surfMat->GetName().Data() : nullptr;
+                const std::string name(path ? path : "");
+                const bool target = name.size() >= globalOverlayMaterial.size() &&
+                    Asset::Material::EmatMaterial::NameMatches(
+                        name.substr(name.size() - globalOverlayMaterial.size()), globalOverlayMaterial);
+                if (target)
+                {
+                    const auto found = _materialBindings.find(path);
+                    const bool sourceSupported = found != _materialBindings.end() && found->second.ematPbr &&
+                        found->second.ematPbr->globalOverlay.supported;
+                    bool admitted = sourceSupported && s->HasUV1() &&
+                        (sec.flags & WGR_MODEL_SECTION_NATIVE_PBR_SRGB) != 0u &&
+                        mat.native_pbr_scales.w == 2.0f;
+                    if (admitted)
+                    {
+                        const auto& overlay = found->second.ematPbr->globalOverlay;
+                        // Load through the existing model capture: the source handle
+                        // remains leased by model snapshots, including deferred uploads.
+                        Ref<Texture> texture = _wbank->Load(overlay.texture.path.canonical().c_str());
+                        auto* native = static_cast<TextureWgpu*>(texture.GetRef());
+                        const uint64_t handle = native && native->HasNativeLinearMask(false) ? native->EnsureUploaded() : 0;
+                        admitted = handle != 0;
+                        if (admitted)
+                        {
+                            mat.global_overlay_texture_id = handle;
+                            mat.global_overlay_black = overlay.blackPower;
+                            mat.global_overlay_white = overlay.whitePower;
+                        }
+                    }
+                    static std::unordered_set<std::string> reportedOverlay;
+                    if (reportedOverlay.size() < 32 && reportedOverlay.insert(path).second)
+                        LOG_INFO(Graphics, "Wgpu native global overlay preview: material={} sourceSupported={} uv1={} sourceAdmission={}",
+                                 path, sourceSupported, s->HasUV1(), admitted);
+                }
+            }
+            // RFG-118: Enfusion's GlobalMCRMap in production. 2,031 Reforger materials carry one --
+            // every granite rock, most building shells -- and none of it was drawn: a rock showed
+            // only its 20x-tiled grey detail layers, flat at any distance ("the rocks are still
+            // untextured"). Overlay (or Multiply) of the object's own baked colour onto the
+            // composed layers, in the same encoded space the layers are mixed in (gpu_driven.wgsl
+            // global_mcr_apply). WGR_REFORGER_GLOBAL_MCR=0 turns it off.
+            static const bool globalMcrOn = [] {
+                const char* value = std::getenv("WGR_REFORGER_GLOBAL_MCR");
+                return !(value && value[0] == '0');
+            }();
+            if (globalMcrOn && mat.global_overlay_texture_id == 0)
+            {
+                const auto& sourceSection = s->GetSection(i);
+                const char* path = sourceSection.surfMat ? sourceSection.surfMat->GetName().Data() : nullptr;
+                const auto found = path ? _materialBindings.find(path) : _materialBindings.end();
+                if (found != _materialBindings.end() && found->second.globalMcr.present)
+                {
+                    const auto& mcr = found->second.globalMcr;
+                    // A mask on the second set is only meaningful when the shape carries one;
+                    // MeshBuild copies uv0 into uv1 otherwise, which would smear the bake.
+                    if (!mcr.uv1 || s->HasUV1())
+                    {
+                        Ref<Texture> texture = _wbank->Load(mcr.texture.path.canonical().c_str());
+                        auto* native = static_cast<TextureWgpu*>(texture.GetRef());
+                        const uint64_t handle = native ? native->EnsureUploaded() : 0;
+                        if (handle != 0)
+                        {
+                            mat.global_overlay_texture_id = handle;
+                            mat.global_overlay_black = mcr.blackPower;
+                            mat.global_overlay_white = mcr.whitePower;
+                            mat.global_overlay_mode = 1u | (mcr.multiply ? 2u : 0u) | (mcr.uv1 ? 4u : 0u);
                         }
                     }
                 }
@@ -15349,7 +17086,8 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
                     face && face->SourceName() ? face->SourceName() : "", sec.variant == 1 && mat.alpha_ref > 0,
                     originalAlbedo, ordinary) : ForestSnowSurface::Atlas::None;
                 sec.flags |= ForestSnowSurface::Encode(atlas);
-                if (atlas != ForestSnowSurface::Atlas::None && std::getenv("WGR_TREE_SNOW_TRACE"))
+                static const bool snowAtlasTrace = std::getenv("WGR_TREE_SNOW_TRACE") != nullptr;
+                if (atlas != ForestSnowSurface::Atlas::None && snowAtlasTrace)
                     LOG_INFO(Graphics, "FOREST_SNOW_ATLAS model={} lod={} resolution={} texture={} category={} alphaRef={} scope=audited-uv-crowns-map-only",
                         shape->Name(), level, shape->Resolution(level), face->SourceName(), uint32_t(atlas), mat.alpha_ref);
             }
@@ -15369,6 +17107,8 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
         if (count > 0)
         {
             lods.push_back(WgrModelLod{shape->Resolution(level), base, count, 0});
+            if (!levelMeshes.empty() && levelMeshes.back().level == level)
+                levelMeshes.back().lodIndex = int(lods.size()) - 1;
         }
     }
 
@@ -15397,6 +17137,7 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
         op.name = static_cast<const char*>(shape->Name());
         model = op.model;
         _resourceOps.push_back(std::move(op));
+        _gpuModelLodMeshes[shape] = std::move(levelMeshes);
     }
     // The census's shape-level verdict. `eligible` with nothing to draw is its OWN reason and
     // the one most likely to be the answer on imported content: every bail above is narrow and
@@ -15443,7 +17184,12 @@ uint32_t EngineWgpu::RegisterGpuModel(LODShapeWithShadow* shape)
     // MAT-051 diagnostic (temporary): WGR_COVERAGE_TRACE=1 prints each shape's
     // classification with its complement inputs, so a glass-owning vehicle
     // stamped Full names itself instead of silently losing its canopy.
-    if (const char* trace = std::getenv("WGR_COVERAGE_TRACE"); trace && *trace == '1')
+    static const bool coverageTrace = []
+    {
+        const char* trace = std::getenv("WGR_COVERAGE_TRACE");
+        return trace && *trace == '1';
+    }();
+    if (coverageTrace)
     {
         LOG_WARN(Graphics, "GpuModel coverage: {} -> {} (hasProxies={} hasComplement={} lods={} sections={})",
                  shape->Name(), (hasProxies || hasComplement) ? "Partial" : "Full", hasProxies ? 1 : 0,
@@ -15751,6 +17497,9 @@ void EngineWgpu::MarkRetainedModelLiveness()
     // Far instances have no Object entry; retain their shared material liveness.
     for (const auto& [shape, count] : _farGpuModelRefs)
         markShape(shape);
+    // Earth assets have their own IDs/lifecycle but share material residency.
+    for (const auto& [shape, count] : _earthWorldgenModelRefs)
+        markShape(shape);
 
     const size_t end = std::min(buckets, _livenessCursor + perFrame);
     for (; _livenessCursor < end; ++_livenessCursor)
@@ -15905,6 +17654,7 @@ uint32_t EngineWgpu::InvalidateStaleGpuModels()
 
 uint32_t EngineWgpu::DestroyGpuModelMeshes(const LODShapeWithShadow* shape)
 {
+    _gpuModelLodMeshes.erase(shape); // LOD-STREAM: its level meshes die with it
     // All callers destroy this registration; retire its lighting allocation too.
     // FIFO ordering covers registrations that have not reached the render thread yet.
     if (const auto it = _gpuModels.find(shape); _renderer && it != _gpuModels.end() && it->second != WGR_INVALID_MODEL)
@@ -15991,7 +17741,7 @@ void EngineWgpu::OnShapeDestroyed(const LODShape* shape)
     const auto* key = static_cast<const LODShapeWithShadow*>(shape);
     if (_gpuModels.count(key) == 0)
         return; // the common case: a shape this renderer never registered
-    if (std::getenv("WGR_MODEL_RESIDENCY_TRACE"))
+    if (POSEIDON_GETENV_ONCE("WGR_MODEL_RESIDENCY_TRACE"))
     {
         const auto refs = _gpuModelRefs.find(key);
         LOG_INFO(Graphics, "Wgpu model residency shape died: parked={} live-refs={}",
@@ -16358,6 +18108,7 @@ void EngineWgpu::SceneObjectCreated(Object* obj)
         }
     }
     _gpuInstances[obj] = GpuInstance{model, slot, shape, obj->Transform().Position(), cp.mode, cov};
+    CanopyNote(reinterpret_cast<uint64_t>(obj), shape, obj->Transform());
     static const bool coldWorldSource = ModelCompressedSourceBirth::ReadScope::Enabled();
     if (coldWorldSource)
         ObserveRetailWorldPlacement(obj, inst, slot);
@@ -16392,7 +18143,252 @@ bool EngineWgpu::SceneFarObjectCreated(uint32_t id, LODShapeWithShadow* shape, c
     RetainGpuModel(shape);
     ++_farGpuModelRefs[shape];
     _farGpuInstances.emplace(id, FarGpuInstance{slot, shape});
+    CanopyNote((1ull << 63) | id, shape, transform);
     return true;
+}
+
+void EngineWgpu::CanopyNote(uint64_t key, const LODShapeWithShadow* shape, const Matrix4& transform)
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("WGR_CANOPY_AO");
+        return !(v && v[0] == '0');
+    }();
+    if (!enabled || !shape)
+        return;
+    const MapType type = shape->GetMapType();
+    const bool canopy = type == MapTree || type == MapSmallTree || type == MapBush || type == MapForestBorder ||
+                        type == MapForestTriangle || type == MapForestSquare;
+    if (!canopy)
+        return;
+    const Vector3 lo = shape->Min();
+    const Vector3 hi = shape->Max();
+    const float scale = transform.Scale();
+    const Vector3 position = transform.Position();
+    CanopyEntry entry;
+    // The bounding box's centre in world space (the box is in the model's own frame).
+    const Vector3 centre = transform.FastTransform((lo + hi) * 0.5f);
+    entry.x = centre.X();
+    entry.z = centre.Z();
+    entry.top = position.Y() + hi.Y() * scale;
+    entry.radius = 0.5f * std::max(hi.X() - lo.X(), hi.Z() - lo.Z()) * scale;
+    if (!(entry.radius > 0.1f) || !(entry.top > position.Y() + 0.5f))
+        return;
+    _canopy[key] = entry;
+    _canopyDirty = true;
+}
+
+void EngineWgpu::CanopyForget(uint64_t key)
+{
+    if (_canopy.erase(key))
+        _canopyDirty = true;
+}
+
+// Rasterise the canopy table into a world grid over the terrain span: per cell the highest canopy
+// top and the coverage (a crown covers the cells its disc reaches, graded over one cell at the rim).
+// Rebuilt at most every 1.5 s while the table changes, which is what streaming does all the time.
+// The canopy grid itself: `top` (highest crown over each cell, dilated into empty neighbours)
+// and `cover` (crown coverage). Pure -- reads only its arguments -- so it runs off the main thread.
+static void BuildCanopyGrid(const std::vector<EngineWgpu::CanopyEntry>& entries, uint32_t n, float cell,
+                            std::vector<float>& outTop, std::vector<float>& outCover)
+{
+    std::vector<float> top(static_cast<size_t>(n) * n, -60000.0f);
+    std::vector<float> cover(static_cast<size_t>(n) * n, 0.0f);
+    for (const auto& e : entries)
+    {
+        const float reach = e.radius + cell * 0.5f;
+        const int x0 = std::max(0, static_cast<int>(std::floor((e.x - reach) / cell)));
+        const int x1 = std::min(static_cast<int>(n) - 1, static_cast<int>(std::floor((e.x + reach) / cell)));
+        const int z0 = std::max(0, static_cast<int>(std::floor((e.z - reach) / cell)));
+        const int z1 = std::min(static_cast<int>(n) - 1, static_cast<int>(std::floor((e.z + reach) / cell)));
+        for (int z = z0; z <= z1; ++z)
+            for (int x = x0; x <= x1; ++x)
+            {
+                const float cx = (static_cast<float>(x) + 0.5f) * cell - e.x;
+                const float cz = (static_cast<float>(z) + 0.5f) * cell - e.z;
+                const float d = std::sqrt(cx * cx + cz * cz);
+                // graded over one cell at the crown's rim; a crown smaller than a cell still
+                // covers the cell its centre falls in, in proportion to its area
+                float w = std::clamp((e.radius - d) / cell + 0.5f, 0.0f, 1.0f);
+                if (d < cell * 0.71f)
+                    w = std::max(w, std::min(1.0f, 3.14159f * e.radius * e.radius / (cell * cell)));
+                if (w <= 0.0f)
+                    continue;
+                const size_t i = static_cast<size_t>(z) * n + static_cast<size_t>(x);
+                cover[i] = 1.0f - (1.0f - cover[i]) * (1.0f - w);
+                top[i] = std::max(top[i], e.top);
+            }
+    }
+    // Empty cells take the highest top within two cells so the shader's bilinear tap never mixes a
+    // real canopy height with the "none" sentinel; coverage alone fades the edge out. Two, not one:
+    // the sky-light term reads coverage blurred over two cells (terrain/mod.rs compose), and a
+    // sentinel inside that reach cut it off along a straight cell edge -- dark squares on the ground
+    // around Stratis tree clumps at a low sun.
+    std::vector<float> dilated = top;
+    for (uint32_t z = 0; z < n; ++z)
+        for (uint32_t x = 0; x < n; ++x)
+        {
+            const size_t i = static_cast<size_t>(z) * n + x;
+            if (cover[i] > 0.0f)
+                continue;
+            float best = -60000.0f;
+            for (int dz = -2; dz <= 2; ++dz)
+                for (int dx = -2; dx <= 2; ++dx)
+                {
+                    const int sx = static_cast<int>(x) + dx, sz = static_cast<int>(z) + dz;
+                    if (sx < 0 || sz < 0 || sx >= static_cast<int>(n) || sz >= static_cast<int>(n))
+                        continue;
+                    const size_t j = static_cast<size_t>(sz) * n + static_cast<size_t>(sx);
+                    if (cover[j] > 0.0f)
+                        best = std::max(best, top[j]);
+                }
+            dilated[i] = best;
+        }
+    outTop = std::move(dilated);
+    outCover = std::move(cover);
+}
+
+struct EngineWgpu::CanopyGrid
+{
+    uint32_t n = 0;
+    std::vector<float> top, cover;
+};
+
+struct EngineWgpu::CanopyJob
+{
+    std::vector<CanopyEntry> entries;
+    uint32_t n = 0;
+    float cell = 0.0f;
+    std::vector<float> top, cover;
+    uint64_t hash = 0;
+    // PERF-CANOPY-CPU-BAND: in, the grid last handed over; out, a copy of this one (the next
+    // job's `prev`) and the band of rows that differ from `prev` (band false = no usable prev).
+    std::shared_ptr<const CanopyGrid> prev, snapshot;
+    bool band = false;
+    uint32_t z0 = 0, z1 = 0;
+    std::atomic<bool> done{false};
+    std::thread worker;
+    ~CanopyJob()
+    {
+        if (worker.joinable())
+            worker.join();
+    }
+};
+
+void EngineWgpu::UpdateCanopyMap()
+{
+    // PERF (2026-10-14): the build ran right here, on the main thread -- a 2048x2048 grid for a
+    // 12.8 km world, three 16 MB arrays allocated and zeroed, every canopy object splatted and
+    // every cell dilated -- 60-150 ms, sometimes 400 ms, and on a native world it was due every
+    // 1.5 s for as long as the far tier kept adding and removing instances. It now runs on its own
+    // thread from a snapshot of the entries; this collects the finished grid on a later call
+    // (the same arithmetic, ~0.1 s later than it used to appear, against a 1.5 s throttle). A
+    // grid identical to the one last handed over is not handed over again, so churn that changes
+    // nothing no longer re-uploads 32 MB either.
+    if (_canopyJob && _canopyJob->done.load(std::memory_order_acquire))
+    {
+        CanopyJob& job = *_canopyJob;
+        if (job.n != 0 && (job.n != _canopyPublishedN || job.hash != _canopyPublishedHash))
+        {
+            // PERF-CANOPY-CPU-BAND: a band still waiting from an earlier publish (two grids before
+            // one frame took them) widens to cover both; an unknown band stays unknown.
+            const bool waiting = _pendingSet.canopyDirty;
+            const bool band = job.band && (!waiting || _pendingSet.canopyBand) && job.z0 <= job.z1;
+            _pendingSet.canopyZ0 = band && waiting ? std::min(job.z0, _pendingSet.canopyZ0) : job.z0;
+            _pendingSet.canopyZ1 = band && waiting ? std::max(job.z1, _pendingSet.canopyZ1) : job.z1;
+            _pendingSet.canopyBand = band;
+            _canopyLast = job.snapshot;
+            _pendingSet.canopyN = job.n;
+            _pendingSet.canopyTop = std::move(job.top);
+            _pendingSet.canopyCover = std::move(job.cover);
+            _pendingSet.canopyDirty = true;
+            _canopyPublishedN = job.n;
+            _canopyPublishedHash = job.hash;
+        }
+        static size_t reported = 0;
+        if (job.entries.size() / 20000 != reported)
+        {
+            reported = job.entries.size() / 20000;
+            LOG_INFO(Graphics, "Wgpu canopy map: {} canopy objects -> {}x{} at {:.2f} m", job.entries.size(), job.n,
+                     job.n, job.cell);
+        }
+        _canopyJob.reset(); // joins the finished worker
+    }
+    if (_canopyJob || !_canopyDirty || !GLandscape || !_renderer)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - _canopyBuilt < std::chrono::milliseconds(1500))
+        return;
+    _canopyBuilt = now;
+    _canopyDirty = false;
+    const float extent = static_cast<float>(GLandscape->GetTerrainRange()) * GLandscape->GetTerrainGrid();
+    if (!(extent > 0.0f))
+        return;
+    auto job = std::make_shared<CanopyJob>();
+    job->n = static_cast<uint32_t>(std::clamp(std::ceil(extent / 6.25f), 64.0f, 2048.0f));
+    job->cell = extent / static_cast<float>(job->n);
+    job->prev = _canopyLast;
+    job->entries.reserve(_canopy.size());
+    for (const auto& [key, e] : _canopy)
+        job->entries.push_back(e);
+    CanopyJob* raw = job.get();
+    try
+    {
+        job->worker = std::thread(
+            [raw]
+            {
+                Foundation::SetCurrentThreadName("wgr-canopy");
+                BuildCanopyGrid(raw->entries, raw->n, raw->cell, raw->top, raw->cover);
+                // FNV-1a over the bytes of both grids: "is this the grid we already handed over".
+                uint64_t h = 1469598103934665603ull;
+                for (const std::vector<float>* grid : {&raw->top, &raw->cover})
+                {
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(grid->data());
+                    for (size_t i = 0, count = grid->size() * sizeof(float); i < count; ++i)
+                        h = (h ^ bytes[i]) * 1099511628211ull;
+                }
+                raw->hash = h;
+                // PERF-CANOPY-CPU-BAND: the rows that differ from the grid handed over before, found
+                // here rather than by the renderer on the render thread (2.5-4.4 ms of every 1.5 s
+                // update while trees stream in). Byte comparison, so a band never misses a change.
+                auto snapshot = std::make_shared<CanopyGrid>();
+                snapshot->n = raw->n;
+                snapshot->top = raw->top;
+                snapshot->cover = raw->cover;
+                if (raw->prev && raw->prev->n == raw->n && raw->prev->top.size() == raw->top.size() &&
+                    raw->prev->cover.size() == raw->cover.size())
+                {
+                    const size_t row = raw->n;
+                    const auto rowDiffers = [&](uint32_t z)
+                    {
+                        const size_t at = size_t(z) * row;
+                        return std::memcmp(&raw->top[at], &raw->prev->top[at], row * sizeof(float)) != 0 ||
+                               std::memcmp(&raw->cover[at], &raw->prev->cover[at], row * sizeof(float)) != 0;
+                    };
+                    uint32_t z0 = 0, z1 = raw->n;
+                    while (z0 < raw->n && !rowDiffers(z0))
+                        ++z0;
+                    while (z1 > z0 && !rowDiffers(z1 - 1))
+                        --z1;
+                    if (z0 < z1)
+                    {
+                        raw->band = true;
+                        raw->z0 = z0;
+                        raw->z1 = z1 - 1;
+                    }
+                }
+                raw->snapshot = std::move(snapshot);
+                raw->done.store(true, std::memory_order_release);
+            });
+    }
+    catch (...)
+    {
+        // No thread: build here, as before.
+        BuildCanopyGrid(raw->entries, raw->n, raw->cell, raw->top, raw->cover);
+        raw->hash = 0;
+        raw->done.store(true, std::memory_order_release);
+        _canopyPublishedHash = ~0ull; // never matches 0, so this grid is always handed over
+    }
+    _canopyJob = std::move(job);
 }
 
 void EngineWgpu::SceneFarObjectRemoved(uint32_t id)
@@ -16401,6 +18397,7 @@ void EngineWgpu::SceneFarObjectRemoved(uint32_t id)
     if (found == _farGpuInstances.end())
         return;
     const auto* shape = found->second.shape.GetRef();
+    CanopyForget((1ull << 63) | id);
     EnqueueInstanceRemove(found->second.slot);
     ++_ops.instanceRemove;
     if (--_farGpuModelRefs[shape] == 0)
@@ -16409,10 +18406,143 @@ void EngineWgpu::SceneFarObjectRemoved(uint32_t id)
     _farGpuInstances.erase(found);
 }
 
+// PERF-FAR-BC3-PREP (2026-10-22). A far model that can animate (doors, crane parts, stoves) is
+// registered at its first far create, and its `enfa|` composite face textures were BC3-encoded
+// there, on the main thread: one texture create of 101.7 ms (StoveTiled_01_column) at Durras.
+// The encode needs only the source's pixels, so the main thread copies one source per call and a
+// below-normal worker encodes the copy with the same encoder (PrepareCompositeBc3); when all of a
+// model's are in, each chain goes to its source if the texture is still not uploaded, and the
+// upload's TakeCompositeBc3 takes it. The model's far placements wait meanwhile.
+// WGR_FAR_BC3_PREP=0 = encode at registration, as before.
+bool EngineWgpu::PrepareGpuModelTexturesAsync(LODShapeWithShadow* shape)
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("WGR_FAR_BC3_PREP");
+        return !(v && v[0] == '0');
+    }();
+    if (!enabled || !shape || !_gpuDriven || !_renderer || _gpuModels.count(shape))
+        return true;
+    auto found = _bc3PrepJobs.find(shape);
+    if (found == _bc3PrepJobs.end())
+    {
+        auto job = std::make_unique<Bc3PrepJob>();
+        job->shape = shape;
+        std::unordered_set<const Texture*> seen;
+        for (int level = 0; level < shape->NLevels(); ++level)
+        {
+            if (!shape->IsNormalLevel(level))
+                continue;
+            const Shape* s = shape->LevelOpaque(level);
+            if (!s)
+                continue;
+            for (int i = 0; i < s->NSections(); ++i)
+            {
+                Texture* face = s->GetSection(i).properties.GetTexture();
+                if (!face || !seen.insert(face).second)
+                    continue;
+                if (TextureSourceDDS* source = static_cast<TextureWgpu*>(face)->CompositeBc3PrepSource())
+                {
+                    Bc3PrepItem item;
+                    item.texture = face;
+                    item.source = source;
+                    job->items.push_back(std::move(item));
+                }
+            }
+        }
+        if (job->items.empty())
+            return true;
+        found = _bc3PrepJobs.emplace(shape, std::move(job)).first;
+    }
+    Bc3PrepJob& job = *found->second;
+    if (job.started < job.items.size())
+    {
+        // One copy per call: a 2048^2 composite is ~21 MB of levels to copy.
+        Bc3PrepItem& item = job.items[job.started++];
+        if (static_cast<TextureWgpu*>(item.texture.GetRef())->CompositeBc3PrepSource() == item.source)
+        {
+            item.copy = item.source->CloneForBc3();
+            TextureSourceDDS* copy = item.copy.get();
+            item.encoded = std::async(std::launch::async, [copy] {
+                Foundation::poSetMyPriority(-1);
+                return copy->PrepareCompositeBc3(copy->CompositeBc3Reservation());
+            });
+        }
+        return false;
+    }
+    for (Bc3PrepItem& item : job.items)
+        if (item.encoded.valid() && item.encoded.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            return false;
+    for (Bc3PrepItem& item : job.items)
+    {
+        if (!item.encoded.valid() || !item.encoded.get())
+            continue;
+        auto* texture = static_cast<TextureWgpu*>(item.texture.GetRef());
+        if (texture->CompositeBc3PrepSource() == item.source && item.copy->HasPreparedBc3())
+            item.source->SetPreparedBc3(item.copy->TakePreparedBc3());
+    }
+    _bc3PrepJobs.erase(found);
+    return true;
+}
+
 void EngineWgpu::ClearFarObjects()
 {
+    for (auto& [shape, job] : _bc3PrepJobs)
+        for (Bc3PrepItem& item : job->items)
+            if (item.encoded.valid())
+                item.encoded.wait(); // the worker holds the copy
+    _bc3PrepJobs.clear();
     while (!_farGpuInstances.empty())
         SceneFarObjectRemoved(_farGpuInstances.begin()->first);
+    // The landscape is going away (Landscape::ClearNativeFarResidency): the near clutter's
+    // instances and cached plant models belong to it as much as the far tier does.
+    ClearClutterObjects();
+}
+
+// RFG-153: near clutter -- Reforger's own plant .xob models within a few tens of metres of the
+// camera, where the grass system's impostor cards read as flat photographs. GPU-driven like the
+// far tier, but WITHOUT WGR_INSTANCE_FAR_AUTHORED (which pins the coarsest LOD): the cull walks
+// the model's coverage ladder as for any object, so a plant at the camera draws its LOD0.
+bool EngineWgpu::SceneClutterObjectCreated(uint32_t id, LODShapeWithShadow* shape, const Matrix4& transform)
+{
+    if (!_gpuDriven || !_renderer || !shape)
+        return false;
+    if (_clutterGpuInstances.count(id))
+        return true;
+    const uint32_t model = RegisterGpuModel(shape);
+    if (model == WGR_INVALID_MODEL || _gpuConformShapes.count(shape))
+        return false;
+    WgrInstance inst = BuildGpuProxyInstance(transform, model);
+    inst.flags = 0;
+    const uint32_t slot = EnqueueInstanceAdd(inst);
+    ++_ops.instanceAdd;
+    RetainGpuModel(shape);
+    _clutterGpuInstances.emplace(id, FarGpuInstance{slot, shape});
+    return true;
+}
+
+void EngineWgpu::UpdateNativeClutter(const Vector3& camera)
+{
+    if (_terrain && GLandscape)
+        _terrain->UpdateNativeClutterMeshes(*GLandscape, camera);
+}
+
+void EngineWgpu::SceneClutterObjectRemoved(uint32_t id)
+{
+    const auto found = _clutterGpuInstances.find(id);
+    if (found == _clutterGpuInstances.end())
+        return;
+    EnqueueInstanceRemove(found->second.slot);
+    ++_ops.instanceRemove;
+    ReleaseGpuModel(found->second.shape.GetRef());
+    _clutterGpuInstances.erase(found);
+}
+
+void EngineWgpu::ClearClutterObjects()
+{
+    if (_terrain)
+        _terrain->ResetNativeClutterMeshes(true);
+    while (!_clutterGpuInstances.empty())
+        SceneClutterObjectRemoved(_clutterGpuInstances.begin()->first);
 }
 
 // REN-TEMP-001H: pointer -> stable 16-bit draw-object id, allocated on first sight.
@@ -16433,6 +18563,15 @@ void EngineWgpu::SetTemporalTuning(const TemporalSettings& t)
     // > 0 is the renderer's "auto" sentinel (real biases are <= 0).
     w.mip_bias = t.mipBiasAuto ? 1.0f : std::clamp(t.mipBias, -4.0f, 0.0f);
     w.reactive_sky = std::clamp(t.reactiveSky, 0.0f, 1.0f);
+    // WGR_REACTIVE_SKY (also read by the renderer's own default) must survive this push, or an
+    // A/B of the sky/cloud history control silently measures the panel value.
+    static const float reactiveSkyEnv = []
+    {
+        const char* v = std::getenv("WGR_REACTIVE_SKY");
+        return v && *v ? static_cast<float>(std::atof(v)) : -1.0f;
+    }();
+    if (reactiveSkyEnv >= 0.0f)
+        w.reactive_sky = std::clamp(reactiveSkyEnv, 0.0f, 1.0f);
     w.reactive_water = std::clamp(t.reactiveWater, 0.0f, 1.0f);
     w.flags = (t.dlssAutoExposure ? 1u : 0u) | (t.jitterYFlip ? 2u : 0u) |
               (t.mvRenderSpace ? 4u : 0u) | (t.mvFlip ? 8u : 0u) | (t.fsrOn ? 16u : 0u) |
@@ -16507,6 +18646,9 @@ void EngineWgpu::SetMsaaSamples(int samples)
     WgrTemporalInfo w{};
     wgr_get_temporal_info(_renderer, &w);
     const int active = static_cast<int>(w.msaa_samples) <= 1 ? 0 : static_cast<int>(w.msaa_samples);
+    // with the DLSS route up the renderer boots without MSAA whatever is asked (lib.rs)
+    if (w.dlss_route && active == 0)
+        return;
     if (active != samples)
         LOG_INFO(Graphics, "Wgpu: MSAA {} requested (active {}); takes effect on the next launch",
                  samples, active);
@@ -16565,6 +18707,7 @@ void EngineWgpu::SceneObjectRemoved(Object* obj)
     _ops.instanceRemove++;
     EnqueueInstanceRemove(it->second.slot);
     const LODShapeWithShadow* shape = it->second.shape;
+    CanopyForget(reinterpret_cast<uint64_t>(obj));
     _gpuInstances.erase(it);
     ReleaseGpuModel(shape);
     obj->SetGpuCoverage(static_cast<int>(GpuDrawCoverage::None)); // back to the CPU path
@@ -17282,6 +19425,124 @@ void EngineWgpu::SetShadowCascades(const shadow::CascadeSet& cascades, int resol
         _smCamPos[1] = cam.pos[1];
         _smCamPos[2] = cam.pos[2];
     }
+    UpdateShadowCascadeCache();
+}
+
+// FAR-CASCADE REUSE (PERF 2026-10-14).
+//
+// All four sun cascades were culled, cleared and redrawn every frame. At Reforger's Durras pose
+// (DLSS Quality, 1286x724 internal) cascades 2 and 3 cost 3.7 ms of a 25.8 ms GPU frame, and
+// none of it scales with resolution: it is the whole forest drawn twice more, from the sun.
+// Most frames, those two layers would come out (nearly) identical to the previous frame's.
+//
+// So cascades 2 and 3 take turns: each frame re-renders at most one of them, and the other KEEPS
+// the depth it already holds -- sampled with the matrix it was rendered with, carried to this
+// frame's camera origin. The cascades are camera-relative and world-snapped, so that is exact:
+// vp_old * T(cam_now - cam_old) maps a point relative to the new camera into the old layer.
+//
+// A layer is only kept when it still covers this frame's receivers, which is checked exactly:
+// every corner of the tier's receiver volume (its frustum slice), and the same corners moved
+// zPad towards the sun (where their casters are), must land inside the old box with a 2-texel
+// PCF margin. The cascade fit (quantized radius, texel-snapped box) leaves a few percent of
+// slack, so a still or slowly moving camera keeps; a fast turn, a teleport, a resolution or
+// split change, or a sun that moved more than ~0.1 degree simply re-renders. What remains is
+// staleness: a moving object's far shadow, or a swaying crown 40+ m away, lags by one frame.
+//
+// WGR_SHADOW_CASCADE_CACHE=0 renders every cascade every frame, exactly as before.
+// PERF-SHADOW-FAR-PERIOD: whose turn it is to re-render. Cascade 2 keeps the every-other-frame
+// turn; the farthest cascade (3) now re-renders one frame in WGR_SHADOW_FAR_PERIOD (default 4,
+// 2 = the old alternation), on a frame cascade 2 sits out, so no frame renders both. Cascade 3
+// covers ~100-400 m, where a shadow texel is ~0.5 m: what can change there between refreshes
+// is a moving object's distant shadow, lagging at most three frames. A turn only ever skips a
+// re-render the coverage test has already allowed; a fast turn or a jump still re-renders.
+static bool CascadeRefreshTurn(int cascade, uint64_t tick)
+{
+    static const uint64_t farPeriod = []
+    {
+        const char* v = std::getenv("WGR_SHADOW_FAR_PERIOD");
+        const int n = v && *v ? std::atoi(v) : 4;
+        return static_cast<uint64_t>(n == 2 || n == 4 || n == 8 ? n : 4);
+    }();
+    if (cascade == 3 && farPeriod > 2)
+        return (tick % farPeriod) == 1; // an odd tick: cascade 2 renders on even ones
+    return ((tick + static_cast<uint64_t>(cascade)) & 1u) == 0; // every other frame
+}
+
+void EngineWgpu::UpdateShadowCascadeCache()
+{
+    static const bool enabled = []
+    {
+        const char* v = std::getenv("WGR_SHADOW_CASCADE_CACHE");
+        return !(v && v[0] == '0');
+    }();
+    constexpr int kFirstReusedCascade = 2;
+    _smKeepMask = 0;
+    _smRefreshMask = 0;
+    const int count = std::clamp(_smCascades.count, 0, 4);
+    for (int c = 0; c < 4; c++)
+        _smSampleVP[c] = _smCascades.camRelVP[c];
+    if (!_smCascadesValid || count <= 0)
+        return;
+    ++_smCacheTick;
+    // One line per 1,800 updates: how often the far cascades were reused, and how often a
+    // layer would have been reused but no longer covered the view (camera moved/turned).
+    if (_smCacheStats.considered >= 1800)
+    {
+        LOG_INFO(
+            Graphics,
+            "Wgpu shadow cascade reuse: {} of {} far-cascade updates kept ({} on their turn, {} no longer covered){}",
+            _smCacheStats.kept, _smCacheStats.considered,
+            _smCacheStats.considered - _smCacheStats.kept - _smCacheStats.uncovered, _smCacheStats.uncovered,
+            enabled ? "" : " -- WGR_SHADOW_CASCADE_CACHE=0");
+        _smCacheStats = {};
+    }
+    const float cosSunTolerance = 0.9999985f; // ~0.1 degree
+    for (int c = 0; c < count; c++)
+    {
+        ShadowCascadeCacheEntry fresh;
+        fresh.valid = true;
+        fresh.vp = _smCascades.camRelVP[c];
+        fresh.camPos[0] = _smCamPos[0];
+        fresh.camPos[1] = _smCamPos[1];
+        fresh.camPos[2] = _smCamPos[2];
+        fresh.sunDir = _smCascades.sunDir;
+        fresh.split = _smCascades.splitViewDist[c];
+        fresh.omniRadius = _smCascades.omniRadius[c];
+        fresh.count = count;
+        fresh.omniCount = _smCascades.omniCount;
+        fresh.resolution = _smCascadeRes;
+
+        const ShadowCascadeCacheEntry& old = _smCache[c];
+        bool keep = enabled && !ShadowLegacyGateEnabled() && c >= kFirstReusedCascade && old.valid &&
+                    old.count == fresh.count && old.omniCount == fresh.omniCount &&
+                    old.resolution == fresh.resolution && old.split == fresh.split &&
+                    old.omniRadius == fresh.omniRadius && shadow::Dot(old.sunDir, fresh.sunDir) >= cosSunTolerance &&
+                    !CascadeRefreshTurn(c, _smCacheTick);
+        shadow::Mat4 carried;
+        if (keep)
+        {
+            carried = shadow::CarryCascadeVP(old.vp, {old.camPos[0], old.camPos[1], old.camPos[2]},
+                                             {_smCamPos[0], _smCamPos[1], _smCamPos[2]});
+            keep = shadow::CascadeCoversReceivers(carried, _smCascades.receiverCorners[c], fresh.sunDir,
+                                                  _smCascades.zPad, fresh.resolution);
+            _smCacheStats.uncovered += keep ? 0u : 1u;
+        }
+        if (c >= kFirstReusedCascade)
+        {
+            ++_smCacheStats.considered;
+            _smCacheStats.kept += keep ? 1u : 0u;
+        }
+        if (keep)
+        {
+            _smKeepMask |= 1u << c;
+            _smSampleVP[c] = carried;
+        }
+        else
+        {
+            _smRefreshMask |= 1u << c;
+            _smCachePending[c] = fresh;
+        }
+    }
 }
 
 void EngineWgpu::AddShadowCaster(const Shape& sMesh, const Matrix4& modelToWorld)
@@ -17294,6 +19555,7 @@ void EngineWgpu::AddShadowCaster(const Shape& sMesh, const Matrix4& modelToWorld
     {
         return;
     }
+    sMesh.TouchVBuffer(); // CPU-VB-STREAM: a shadow-only caster keeps (or rebuilds) its buffer
     auto* buf = static_cast<VertexBufferWgpu*>(sMesh.GetVertexBuffer());
     if (!buf || buf->sections.Size() == 0)
     {
@@ -18102,6 +20364,50 @@ void EngineWgpu::LogObjectPerfRow()
     const float frame = pos(gpu[WGR_GPU_TIMER_FRAME_TOTAL]);
     LOG_INFO(Graphics, "Frame accounting: attributed={:.3f} of frame={:.3f} ms | residual={:.3f} ms ({:.1f}%)",
              outerSum, frame, frame - outerSum, frame > 0.0f ? (frame - outerSum) / frame * 100.0f : 0.0f);
+    // PERF-RFG-207: the attribution named, not just summed. A Durras frame swung 19 <-> 28 ms
+    // between runs of the same binary with every region printed below unchanged -- the extra
+    // 8 ms was attributed to an outer region these lines never name. The six largest, >= 0.3 ms.
+    {
+        int top[6] = {-1, -1, -1, -1, -1, -1};
+        for (int r = 0; r < kGpuRegionEnd; ++r)
+        {
+            if (r == kFrameGpuRegionTotal || GpuTimerContainedBy(r) != kNoGpuRegion || pos(gpu[r]) < 0.3f)
+                continue;
+            for (int k = 0; k < 6; ++k)
+            {
+                if (top[k] < 0 || pos(gpu[r]) > pos(gpu[top[k]]))
+                {
+                    for (int j = 5; j > k; --j)
+                        top[j] = top[j - 1];
+                    top[k] = r;
+                    break;
+                }
+            }
+        }
+        std::string line;
+        for (int k = 0; k < 6 && top[k] >= 0; ++k)
+            line += std::string(k ? " | " : "") + GetWaterGpuTimingName(top[k]) + "=" +
+                    std::to_string(gpu[top[k]]).substr(0, 5);
+        LOG_INFO(Graphics, "Frame top regions: {}", line);
+        // WGR_GPU_REGIONS_ALL=1: every region >= 0.05 ms, nested ones included (prefixed '>').
+        static const bool allRegions = []
+        {
+            const char* v = std::getenv("WGR_GPU_REGIONS_ALL");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (allRegions)
+        {
+            std::string all;
+            for (int r = 0; r < kGpuRegionEnd; ++r)
+            {
+                if (r == kFrameGpuRegionTotal || pos(gpu[r]) < 0.05f)
+                    continue;
+                all += std::string(all.empty() ? "" : " | ") + (GpuTimerContainedBy(r) != kNoGpuRegion ? ">" : "") +
+                       GetWaterGpuTimingName(r) + "=" + std::to_string(gpu[r]).substr(0, 5);
+            }
+            LOG_INFO(Graphics, "Frame all regions: {}", all);
+        }
+    }
 
     LOG_INFO(Graphics,
              "Objects GPU ms: cull_main={:.3f} cull_shadow={:.3f} cull_hiz={:.3f} cull_total={:.3f} | "
@@ -18780,10 +21086,66 @@ void EngineWgpu::UpdateAutoTonemap()
     // current values across the auto overwrite (else the Tonemap tab's bloom sliders
     // would be reset every frame in auto mode).
     const float bi = _tonemap.bloomIntensity, bt = _tonemap.bloomThreshold, bk = _tonemap.bloomKnee;
-    _tonemap = TonemapAtHour(render::frame::GPresentationSnapshot().timeOfDay * 24.0f);
+    _tonemap = TonemapAtHour(LookHour(render::frame::GPresentationSnapshot().timeOfDay * 24.0f));
     _tonemap.bloomIntensity = bi;
     _tonemap.bloomThreshold = bt;
     _tonemap.bloomKnee = bk;
+    // Whole world from space: the noon grade is tuned for ground scenes, where haze and sky share the
+    // frame; a fully sunlit globe on black space under it saturated, flattening the terminator into a
+    // hard line. Ease the exposure down between 30 and 100 km altitude.
+    if (EarthStreaming::Enabled())
+    {
+        const Vector3 cam = render::frame::GPresentationSnapshot().cameraPos;
+        const double ox = double(cam.X()) - 6400.0, oz = double(cam.Z()) - 6400.0, oy = double(cam.Y()) + 6378137.0;
+        // In the moon frame the local height is above the moon: there it is the space exposure.
+        const double altitude = EarthStreaming::MoonFrameActive() ? double(EarthCameraAltitude(cam))
+                                                                  : std::sqrt(ox * ox + oy * oy + oz * oz) - 6378137.0;
+        const float space = float(std::clamp((altitude - 30000.0) / 70000.0, 0.0, 1.0));
+        _tonemap.exposure *= 1.0f - 0.6f * space;
+        // Twilight: with the real atmosphere the sky 4 degrees after sunset is a few hundred times
+        // darker than at noon, and auto-exposure could only brighten 1.1x (it exists to stop glare),
+        // so dusk rendered black. Let it adapt like an eye through civil twilight, then let night be
+        // night: ceiling 1.1x above +5 deg, 10x at -6 deg, back to 4x by -15 deg (30x blew dawn clouds out).
+        const Vector3 toSun = -render::frame::GPresentationSnapshot().sunDirection;
+        const double r = altitude + 6378137.0;
+        const float sinE = r > 0.0 ? float((ox * toSun.X() + oy * toSun.Y() + oz * toSun.Z()) / r) : toSun.Y();
+        const float e = std::asin(std::clamp(sinE, -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+        float ceiling = 1.1f;
+        if (e < 5.0f)
+            ceiling = e > -6.0f ? 1.1f + (10.0f - 1.1f) * (5.0f - e) / 11.0f
+                                : 10.0f + (4.0f - 10.0f) * std::clamp((-6.0f - e) / 9.0f, 0.0f, 1.0f);
+        _exposure.maxScale = std::max(ceiling * (1.0f - space) + 1.1f * space, 1.1f);
+        // A fast clock (the Whole World "Day cycle" test runs 24 h per minute) moves the light far
+        // faster than eye-like adaptation follows: dusk went dark before sunset and dawn blew out on
+        // night exposure. While game time runs >20x real time, adapt in 0.15 s; restore after.
+        static double lastDay = -1.0;
+        static auto lastAt = std::chrono::steady_clock::now();
+        static float speed = 1.0f, savedTau = -1.0f;
+        static bool overridden = false;
+        const double day = render::frame::GPresentationSnapshot().timeOfDay;
+        const auto nowAt = std::chrono::steady_clock::now();
+        const double realDt = std::chrono::duration<double>(nowAt - lastAt).count();
+        if (lastDay >= 0.0 && realDt > 0.0 && realDt < 1.0)
+        {
+            double dDay = day - lastDay;
+            if (dDay < -0.5) dDay += 1.0; // past midnight
+            const float instant = float(std::clamp(dDay * 86400.0 / realDt, 0.0, 100000.0));
+            speed += (instant - speed) * 0.1f;
+        }
+        lastDay = day;
+        lastAt = nowAt;
+        if (speed > 20.0f && !overridden)
+        {
+            savedTau = _autoExposureTau;
+            _autoExposureTau = 0.15f;
+            overridden = true;
+        }
+        else if (speed < 5.0f && overridden)
+        {
+            _autoExposureTau = savedTau;
+            overridden = false;
+        }
+    }
     // The push happens in NextFrame after UpdateAutoSky (PushRenderParams).
 }
 
@@ -18853,16 +21215,18 @@ void EngineWgpu::UpdateSunGlareExposure()
     view.Normalize();
     sun.Normalize();
 
-    // Begins within ~14 degrees and peaks only in the central ~2 degrees. Sun below
-    // the horizon never triggers accommodation, even if the camera faces that way.
+    // Begins within ~25 degrees and peaks in the central ~3 degrees. Sun below the horizon
+    // never triggers accommodation, even if the camera faces that way. (Owner, 2026-10-19: "if i
+    // look into the sun it even gets brighter, but it should do the opposite" -- 7 % was too
+    // little to see; the clip-counting iris (exposure.wgsl, BOOM-006) closes the rest.)
     float focus = 0.0f;
     if (sun.Y() > 0.0f)
     {
         const float dot = std::clamp(view.DotProduct(sun), -1.0f, 1.0f);
-        const float t = std::clamp((dot - 0.970f) / (0.9994f - 0.970f), 0.0f, 1.0f);
+        const float t = std::clamp((dot - 0.906f) / (0.9986f - 0.906f), 0.0f, 1.0f);
         focus = t * t * (3.0f - 2.0f * t);
     }
-    const float target = 1.0f - 0.07f * focus;
+    const float target = 1.0f - 0.25f * focus;
 
     // Frame-rate-independent temporal response: darker over ~0.8 s, and recovers
     // more gradually (~1.8 s), avoiding an exposure pop while panning.
@@ -19488,6 +21852,20 @@ void EngineWgpu::SetGrassSettings(const GrassSettings& settings)
     params.blade_width_scale = std::clamp(settings.bladeWidth, 0.25f, 6.0f);
     params.saturation = std::clamp(settings.saturation, 0.0f, 2.0f);
     params.dry_patches = std::clamp(settings.dryPatches, 0.0f, 1.0f);
+    // RFG-198: the meadow look sliders (saturation 0.72, dry patches 0.08) are this renderer's OFP
+    // palette. A native world's blades take their colour from the PlantMat atlas and SatMapLerp,
+    // which author neither: at 0.72 Everon's green carpet read as straw (groundDown, G/R 1.00 vs
+    // Reforger's 1.18). WGR_NATIVE_GRASS_LOOK=0 keeps the sliders on native worlds too.
+    static const bool nativeGrassLook = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_GRASS_LOOK");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    if (nativeGrassLook && GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0)
+    {
+        params.saturation = 1.0f;
+        params.dry_patches = 0.0f;
+    }
     params.dry_patch_scale = std::clamp(settings.dryPatchScale, 0.002f, 0.3f);
     params.shape_variety = std::clamp(settings.shapeVariety, 0.0f, 1.0f);
     params.taper_jitter = std::clamp(settings.taperJitter, 0.0f, 1.0f);
@@ -19598,6 +21976,13 @@ void EngineWgpu::SetGrassSettings(const GrassSettings& settings)
     params.blade_root_shade = std::clamp(settings.bladeRootShade, 0.0f, 0.95f);
     params.weed_percent = std::clamp(settings.weedPercent, 0.0f, 1.0f);
     params.flower_percent = std::clamp(settings.flowerPercent, 0.0f, 1.0f - params.weed_percent);
+    // GRS-VAR: the procedural meadow's looks; a native world keeps its own PlantMat cover.
+    params.variety[0] = (settings.meadowVariety && !HasEnfusionSurfaces()) ? 1.0f : 0.0f;
+    params.variety[1] = std::clamp(settings.headBrightness, 0.0f, 2.0f);
+    params.variety[2] = std::clamp(settings.headShare, 0.0f, 1.0f);
+    params.variety[3] = std::clamp(settings.lookDrift, 0.005f, 1.0f);
+    for (size_t i = 0; i < 16; ++i)
+        params.look_weights[i] = std::clamp(settings.lookWeights[i], 0.0f, 100.0f);
     // Everon/Eden's legacy geography marks normal terrain as excluded. The
     // terrain renderer identifies it from the actual uploaded WRP, so grass
     // works without requiring the user to discover a diagnostic checkbox.
@@ -19794,13 +22179,28 @@ void EngineWgpu::UpdateAutoSky()
     // everything else (density heights, night colours/band, samples, planet/atmosphere
     // geometry, and the user toggles: sky lighting, ambient, aerial shadow, fog falloff,
     // enabled) stays exactly as the Sky tab left it. Kept in sync with LerpSky's field set.
-    const SkySettings k = SkyAtHour(render::frame::GPresentationSnapshot().timeOfDay * 24.0f);
+    const SkySettings k = SkyAtHour(LookHour(render::frame::GPresentationSnapshot().timeOfDay * 24.0f, true));
     _sky.exposure = k.exposure;
     _sky.sunIntensity = k.sunIntensity;
     _sky.sunAngularRadius = k.sunAngularRadius;
     _sky.rayleigh[0] = k.rayleigh[0];
     _sky.rayleigh[1] = k.rayleigh[1];
     _sky.rayleigh[2] = k.rayleigh[2];
+    // RFG-193: a native Reforger world keeps each key's green coefficient but takes Reforger's
+    // SPECTRUM, Atmosphere.emat RayleighScattering 0.198 / 0.407 / 0.991 (standard air). Our noon
+    // key runs 1 : 2.44 : 8.4 (blue 1.48x standard), which bleeds the blue out of the sunlight:
+    // white plaster read beige and every crown olive beside Reforger's neutral plaster and green
+    // leaves at matched poses. WGR_NATIVE_RAYLEIGH=0 keeps the presets' own ratio.
+    static const bool nativeRayleigh = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_RAYLEIGH");
+        return !(v && v[0] == '0');
+    }();
+    if (nativeRayleigh && GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0)
+    {
+        _sky.rayleigh[0] = k.rayleigh[1] * (0.198f / 0.407f);
+        _sky.rayleigh[2] = k.rayleigh[1] * (0.991f / 0.407f);
+    }
     _sky.mie = k.mie;
     _sky.mieG = k.mieG;
     _sky.ozone = k.ozone;
@@ -19902,11 +22302,86 @@ void EngineWgpu::PushRenderParams()
         _dof.apertureBlades,
     };
 
+    // RFG-150: on a native Enfusion world the iris follows Reforger. Fitted against 15 Workbench
+    // reference frames at one light (Morton, the tree pose and the owner's 13 problem poses, outdoor
+    // and interior), each rendered once at full compensation with the ceiling lifted and solved per
+    // frame for the scale that matches (Hable inverted per grid cell, median): least squares in
+    // log2 gives scale = 0.168 * avg^-0.55, 0.73 EV RMS over the 13 unclamped poses, against
+    // ~1.2 EV for the legacy meter (key/avg, capped at 1.1, which left every interior 1-2 EV
+    // dark) and 1.86 EV for key/avg uncapped (outdoor views 2-5x too bright: the tree pose).
+    // That is the shape Reforger's HDREffect declares -- "semi-automatic" (SemiAutomaticLVRange 2,
+    // an absolute base corrected by the meter, not a key/avg loop) -- metered through its own
+    // centre-weighted mask; trimming to VisiblePercentBlack/White 10..90 changes nothing measurable
+    // (2.58 vs 2.45 EV between two poses, offline). Interiors need up to ~4.4x, so the daytime
+    // ceiling is 8 -- by DAY only: HDR.emat gives night its own curve at half the exposure bias
+    // (SecondSceneLV -6, FilmicExposureBias2 10 vs 20), i.e. Reforger keeps nights dark rather
+    // than lifting them, so the ceiling eases back to the legacy one between sun +5 and -6 deg.
+    // WGR_NATIVE_EXPOSURE=0 restores the legacy meter; WGR_NATIVE_EXPOSURE_KEY / _COMPENSATION /
+    // _MAX tune it.
+    //
+    // RFG-196 re-centred the key to 0.084 (-1 EV): once the native sky is lifted to Lighting_Eden's
+    // indirect share (half the sun), every one of the 17 reference poses came out ~+1 EV bright
+    // at 0.168 (mean +0.99, the spread around it only 0.45). At 0.084: mean +0.09 EV, 0.46 EV RMS
+    // over all 17, sun matched (RFG-195) -- the old 0.73 EV was partly the too-dark shade.
+    static const float nativeExposureKey = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_EXPOSURE_KEY");
+        const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+        return f > 0.0f ? f : 0.084f;
+    }();
+    static const float nativeExposureCompensation = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_EXPOSURE_COMPENSATION");
+        const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+        return f > 0.0f ? f : 0.55f;
+    }();
+    static const float nativeExposureMax = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_EXPOSURE_MAX");
+        const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+        return f > 0.0f ? f : 8.0f;
+    }();
+    static const bool nativeExposureOn = []
+    {
+        const char* v = std::getenv("WGR_NATIVE_EXPOSURE");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    const bool nativeExposure =
+        nativeExposureOn && GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0;
+    float nativeCeiling = _exposure.maxScale;
+    // Arma 3 worlds: Arma 3 adapts the eye over the whole fall of its light (its DayLighting
+    // tables drop ~10 EV from noon to a sun 8 deg up, HDRNewPars apertures 1e-5..256), so a low
+    // sun still reads as golden light. Capped at 1.1 here, a Stratis pose at 16:51 (sun 7 deg)
+    // came out with ground median 11 against Arma 3's 71 and sky 85/119/158 against 211/232/252;
+    // allowed to adapt, the meter settles near 7 and the sky matches (174/213/244). 8 by day as on
+    // native worlds, easing to 4 between sun -6 and -15 deg so nights are not lifted further.
+    // WGR_ARMA3_EXPOSURE_MAX overrides the day ceiling; 0 keeps the stock ceiling.
+    static const float arma3ExposureMax = []
+    {
+        const char* v = std::getenv("WGR_ARMA3_EXPOSURE_MAX");
+        return v != nullptr ? std::strtof(v, nullptr) : 8.0f;
+    }();
+    if (arma3ExposureMax > 0.0f && Poseidon::Arma1Compat::Generation() >= 3 && !nativeExposure)
+    {
+        const float sunUp = -render::frame::GPresentationSnapshot().sunDirection.Y();
+        const float elevation = std::asin(std::clamp(sunUp, -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+        const float night = std::clamp((-6.0f - elevation) / 9.0f, 0.0f, 1.0f);
+        const float ceiling = arma3ExposureMax + (std::min(4.0f, arma3ExposureMax) - arma3ExposureMax) * night;
+        nativeCeiling = std::max(nativeCeiling, ceiling);
+    }
+    if (nativeExposure)
+    {
+        const float sunUp = -render::frame::GPresentationSnapshot().sunDirection.Y();
+        const float elevation = std::asin(std::clamp(sunUp, -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+        const float day = std::clamp((elevation + 6.0f) / 11.0f, 0.0f, 1.0f);
+        nativeCeiling = std::max(_exposure.maxScale,
+                                 _exposure.maxScale + (nativeExposureMax - _exposure.maxScale) * day);
+    }
     p.exposure = {
         _exposure.enabled ? 1.0f : 0.0f,
-        _exposure.key,
+        nativeExposure ? nativeExposureKey : _exposure.key,
         _exposure.minScale,
-        _exposure.maxScale,
+        nativeCeiling,
         // The framerate-INDEPENDENT ease derived from the time constant, which is now the
         // normal case (ExposureSettings::rateTau defaults to 0.4 s). UpdateAutoExposureRate
         // leaves this 0 when the effective tau is <= 0 -- i.e. only when the authored rateTau
@@ -19914,8 +22389,10 @@ void EngineWgpu::PushRenderParams()
         // the first frame in tau mode, where there is no measured dt yet.
         _autoExposureRate > 0.0f ? _autoExposureRate : _exposure.rate,
         _exposure.skyWeight,
-        0.0f,
-        0.0f,
+        nativeExposure ? nativeExposureCompensation : 1.0f,
+        // stock worlds: -(tonemap exposure), which the meter's highlight cap needs to know where
+        // a pixel lands on the curve (exposure.wgsl fs_lum_first); native: Reforger's mask
+        nativeExposure ? 1.0f : -std::max(p.tonemap.exposure, 1e-3f),
     };
 
     // Authored sky look (no celestial/runtime — that rides WgrSkyRuntime in PushSkyRuntime).
@@ -19930,7 +22407,18 @@ void EngineWgpu::PushRenderParams()
     p.sky.rayleigh = {_sky.rayleigh[0], _sky.rayleigh[1], _sky.rayleigh[2], _sky.rayleighHeight};
     p.sky.mie = {_sky.mie, _sky.mieG, _sky.mieHeight, _sky.turbidity};
     p.sky.ground_sun = {_sky.ground[0], _sky.ground[1], _sky.ground[2], _sky.sunIntensity};
-    p.sky.params = {_sky.sunAngularRadius, _sky.exposure, _sky.planetRadius, _sky.atmosphereHeight};
+    // RFG-200: a native world's sky dome is authored separately from the light it casts --
+    // Atmosphere.emat `SkyIntensityLV 8` beside Lighting_Eden's Direct/IndirectLightLV -- and
+    // Reforger's reads far paler and brighter than our physical one at the same sun: matched
+    // poses at the RFG-196 exposure, top sky rows 163/205/230 (Reforger) vs 109/131/164, i.e.
+    // ~2.5x in linear. Scaled HERE only (the dome, clouds, aerial light, sky SH, reflections);
+    // the ground's sun reads _sky.exposure separately, and the native SH lift (RFG-196) holds the
+    // sky's light at half the sun whatever the dome's radiance. WGR_NATIVE_SKY_SCALE overrides
+    // (1 = the physical sky).
+    const float nativeSkyScale = NativeSkyDomeScale();
+    const bool nativeSky = GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0;
+    p.sky.params = {_sky.sunAngularRadius, _sky.exposure * (nativeSky ? nativeSkyScale : 1.0f), _sky.planetRadius,
+                    _sky.atmosphereHeight};
     p.sky.control = {_sky.enabled ? 1.0f : 0.0f, static_cast<float>(_sky.viewSamples),
                      static_cast<float>(_sky.lightSamples), _sky.ozone};
     p.sky.night_zenith = {_sky.nightZenith[0], _sky.nightZenith[1], _sky.nightZenith[2], haze};
@@ -19963,13 +22451,58 @@ void EngineWgpu::PushRenderParams()
     // can already do this, but a --no-dev capture has no Sky tab, and the cloud deck occludes the
     // sun and moon discs per ray -- so with no way to force a clear sky from a command line, a
     // capture of anything celestial is a coin flip against the mission's overcast.
-    if (const char* cc = std::getenv("WGR_CLOUD_COVERAGE"))
+    if (const char* cc = POSEIDON_GETENV_ONCE("WGR_CLOUD_COVERAGE"))
     {
         const float v = std::strtof(cc, nullptr);
         _sky.cloudCoverage = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 
-    p.sky.cloud0 = {_sky.cloudCoverage, _sky.cloudDensity, _sky.cloudBottom, _sky.cloudTop};
+    float cloudBottom = _sky.cloudBottom, cloudTop = _sky.cloudTop;
+    // Whole world: the deck's heights are above sea level, tuned for islands near sea level, so in the
+    // Alps the mountains stood inside it. Lift the base to at least 1.5 km over the resident ground's
+    // mean and 300 m over its highest point, keeping the deck's thickness.
+    if (EarthStreaming::Enabled())
+    {
+        static uint64_t cachedGeneration = 0;
+        static float groundMean = 0.0f, groundMax = 0.0f;
+        if (const auto ground = EarthStreaming::Locations().Ground(); ground && ground->generation != cachedGeneration)
+        {
+            cachedGeneration = ground->generation;
+            double sum = 0.0;
+            float highest = -1.0e9f;
+            for (const float h : ground->heights)
+            {
+                sum += h;
+                highest = std::max(highest, h);
+            }
+            groundMean = ground->heights.empty() ? 0.0f : float(sum / double(ground->heights.size()));
+            groundMax = ground->heights.empty() ? 0.0f : highest;
+        }
+        // The resident patch is the ground around the camera at a size set by the camera's altitude band
+        // (1.6, 6.4, 25.6 km), so every new patch in a climb gave a different mean and maximum and moved
+        // the whole deck by hundreds of metres in one frame: clouds flickered with camera height. Ease
+        // the base toward the target instead (tau 20 s); the first patch of a place still sets it at once.
+        static float easedBase = 0.0f;
+        static bool easedValid = false;
+        static auto easedAt = std::chrono::steady_clock::now();
+        const float target = std::max({cloudBottom, groundMean + 1500.0f, groundMax + 300.0f});
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::clamp(std::chrono::duration<float>(now - easedAt).count(), 0.0f, 1.0f);
+        easedAt = now;
+        // A jump of more than 3 km is a teleport to another region, not a climb: set it at once.
+        if (!easedValid || cachedGeneration == 0 || std::abs(target - easedBase) > 3000.0f)
+            easedBase = target;
+        else
+            easedBase += (target - easedBase) * (1.0f - std::exp(-dt / 20.0f));
+        easedValid = cachedGeneration != 0;
+        const float base = easedBase;
+        cloudTop = base + std::max(cloudTop - cloudBottom, 200.0f);
+        cloudBottom = base;
+    }
+    // No cloud deck on the moon: the deck is a layer at the Earth's heights in world Y, which in the moon frame
+    // hangs over the moon's ground (its relief runs from -9 to +10.6 km about y = 0).
+    const bool moonFrame = EarthStreaming::Enabled() && EarthStreaming::MoonFrameActive();
+    p.sky.cloud0 = {moonFrame ? 0.0f : _sky.cloudCoverage, _sky.cloudDensity, cloudBottom, cloudTop};
     p.sky.cloud1 = {0.0f, 0.0f, shapeScale, detailScale};
     p.sky.cloud2 = {_sky.cloudHgG, _sky.cloudPowder, _sky.cloudAmbient, _sky.cloudMaxDist};
     p.sky.cloud3 = {weatherScale, _sky.cloudWeatherAmount, warpScale, _sky.cloudWarpAmount};
@@ -20002,7 +22535,7 @@ void EngineWgpu::PushRenderParams()
             // SHADOW TEXEL. Collected only while the volumetric system is selected, so
             // choosing Legacy costs a comparison.
             SmokeVolumetricParams& vol = GSmokeVolumetric();
-            if (vol.mode != SmokeSystemMode::Legacy)
+            if (SmokeFieldActive())
             {
                 static std::vector<SmokeSystem::ShadowBlob> volBlobs;
                 GSmokeSystem.CollectShadowBlobs(volBlobs, 2048, true);
@@ -20012,17 +22545,79 @@ void EngineWgpu::PushRenderParams()
                     _pendingSet.smokeVolumeBlobs[i].pos_radius = {volBlobs[i].x, volBlobs[i].y, volBlobs[i].z,
                                                                   volBlobs[i].radius};
                     _pendingSet.smokeVolumeBlobs[i].density = {volBlobs[i].density, volBlobs[i].heightAboveGround,
-                                                               0.0f, 0.0f};
+                                                               volBlobs[i].albedo, 0.0f};
                 }
             }
             else
             {
                 _pendingSet.smokeVolumeBlobs.clear();
             }
+            // MUD-001: the mud thrown since the last frame (wheels and boots in wet ground)
+            {
+                if (MudFountain() && MudSprayEnabled())
+                {
+                    if (const Camera* cam = GScene ? GScene->GetCamera() : nullptr)
+                    {
+                        const Vector3 ahead = cam->Position() + Vector3(cam->Direction().X(), 0, cam->Direction().Z()).Normalized() * 6.0f;
+                        const float ground = GLandscape ? GLandscape->SurfaceY(ahead.X(), ahead.Z()) : ahead.Y();
+                        MudSprayReport fountain;
+                        fountain.pos = Vector3(ahead.X(), ground + 0.1f, ahead.Z());
+                        fountain.vel = VUp * 4.5f;
+                        fountain.count = 14.0f;
+                        fountain.velSpread = 1.2f;
+                        fountain.size = 0.032f;
+                        fountain.posSpread = 0.08f;
+                        ReportMudSpray(fountain);
+                    }
+                }
+                static std::vector<MudSprayReport> sprays;
+                TakeMudSprays(sprays);
+                for (const MudSprayReport& s : sprays)
+                {
+                    if (_pendingSet.mudEmitters.size() >= 64)
+                        break;
+                    _pendingSet.mudEmitters.push_back(WgrMudEmitter{{s.pos.X(), s.pos.Y(), s.pos.Z(), s.count},
+                                                                    {s.vel.X(), s.vel.Y(), s.vel.Z(), s.velSpread},
+                                                                    {s.size, s.posSpread, 0.0f, 0.0f}});
+                }
+                if (!sprays.empty())
+                    _pendingSet.mudDirty = true;
+            }
+            // FIRE-001: the fires burning this frame (fireplaces, wrecks) for the volumetric fire
+            {
+                static std::vector<FireVolumeReport> fires;
+                const Camera* cam = GScene ? GScene->GetCamera() : nullptr;
+                CollectFireVolumes(fires, cam ? cam->Position() : VZero);
+                const Vector3 wind = GLandscape ? GLandscape->GetWind() : VZero;
+                _pendingSet.fireSources.resize(fires.size());
+                for (std::size_t i = 0; i < fires.size(); ++i)
+                {
+                    const FireVolumeReport& f = fires[i];
+                    float key;
+                    std::memcpy(&key, &f.key, sizeof key);
+                    WgrFireSource& w = _pendingSet.fireSources[i];
+                    w = WgrFireSource{{f.base.X(), f.base.Y(), f.base.Z(), f.radius},
+                                      {f.intensity, f.smoke, key, static_cast<float>(f.kind)},
+                                      {wind.X(), wind.Y(), wind.Z(), f.boxWidth}};
+                    std::memcpy(w.color, f.color, sizeof w.color);
+                    std::memcpy(w.floor, f.floor, sizeof w.floor);
+                    std::memcpy(w.ceiling, f.ceiling, sizeof w.ceiling);
+                }
+                _pendingSet.fireDirty = true;
+                // BOOM-005: the volumetric muzzle flashes alive this frame (sent every frame:
+                // the renderer forgets them once drawn)
+                render::CollectMuzzleFlashes(_pendingSet.muzzleFlashData, Object::RenderTimeMs(),
+                                             cam ? cam->Position().X() : 0.0f, cam ? cam->Position().Y() : 0.0f,
+                                             cam ? cam->Position().Z() : 0.0f, 8);
+            }
             // The sun the smoke is lit by is the one SMK-035 already shades the billboards
             // with, so the two systems cannot disagree about the time of day.
             WgrSmokeVolumeParams vp{};
-            vp.mode = static_cast<uint32_t>(vol.mode);
+            // the renderer's field knows Legacy (off) / Volumetric / Both. FIRE-002: under Fire Pro
+            // the field draws every 2001 puff in place of its billboard (Volumetric).
+            vp.mode = !SmokeFieldActive() ? 0u
+                      : vol.mode == SmokeSystemMode::FirePro ? static_cast<uint32_t>(SmokeSystemMode::Volumetric)
+                                                              : static_cast<uint32_t>(vol.mode);
             vp.cell_size = vol.cellSize;
             vp.march_steps = static_cast<uint32_t>(vol.marchSteps);
             vp.sun_steps = static_cast<uint32_t>(vol.sunSteps);
@@ -20062,8 +22657,14 @@ void EngineWgpu::PushRenderParams()
 
     // Long-distance terrain sun-shadow (wgpu-only); strength 0 = disabled. The renderer
     // diffs this sub-block so a per-frame push doesn't re-run the sweep.
+    // WGR_TERRAIN_SHADOW=0 turns it off for one process (A/B).
+    static const bool terrainShadowEnv = []
+    {
+        const char* v = std::getenv("WGR_TERRAIN_SHADOW");
+        return !(v != nullptr && v[0] == '0');
+    }();
     p.terrain_sun_shadow = {
-        _smTuning.terrainShadowEnabled ? _smTuning.terrainShadowStrength : 0.0f,
+        _smTuning.terrainShadowEnabled && terrainShadowEnv ? _smTuning.terrainShadowStrength : 0.0f,
         _smTuning.terrainShadowScale < 1 ? 1u : uint32_t(_smTuning.terrainShadowScale),
         _smTuning.terrainShadowSteps < 1 ? 1u : uint32_t(_smTuning.terrainShadowSteps),
         _smTuning.terrainShadowPenumbra,
@@ -20365,7 +22966,14 @@ void EngineWgpu::PushSkyRuntime()
         alpha = 1.0f - std::exp(-dt / kSkySmoothTau);
     }
     _skySmoothAt = skyNow;
-    if (!_skyInit || tSun.DotProduct(_skySunDir) < 0.5f)
+    // Whole world: a geographic origin rebase changes the frame the directions are in, not the sky;
+    // easing across it swung the sun and moon through the sky after every rebase. Snap instead.
+    static uint64_t skyEarthRevision = 0;
+    const uint64_t earthRevision = EarthStreaming::Enabled() ?
+        EarthStreaming::GetLocation().revision ^ (EarthStreaming::Celestial().Frame().revision << 40) : 0;
+    const bool earthRebased = earthRevision != skyEarthRevision;
+    skyEarthRevision = earthRevision;
+    if (!_skyInit || earthRebased || tSun.DotProduct(_skySunDir) < 0.5f)
     {
         _skySunDir = tSun;
         _skyMoonDir = tMoon;
@@ -20392,13 +23000,17 @@ void EngineWgpu::PushSkyRuntime()
     // Camera altitude ASL feeds the aerial/sky raymarch origin: with the old fixed 200 m
     // the march dived below the terrain when flying (fake density -> grey wash). Sea level
     // is y = 0 in OFP, so the camera's world Y is the altitude directly.
-    const float camAlt = skySnap.hasCamera ? static_cast<float>(skySnap.cameraPos.Y()) : 0.0f;
+    const float camAlt = skySnap.hasCamera ? EarthCameraAltitude(skySnap.cameraPos) : 0.0f;
     // fog far-range: the aerial pass dissolves the terrain edge into the full sky as it nears
     // the fog/view distance, hiding the horizon colour step. 0 when there's no scene.
     const float fogFar = skySnap.hasScene ? skySnap.fogMaxRange : 0.0f;
 
     WgrSkyRuntime rt{};
-    rt.sun_dir = {_skySunDir.X(), _skySunDir.Y(), _skySunDir.Z(), 0.0f};
+    // w (spare): whole-world origin latitude in radians, for the Earth-fixed planet cloud layer.
+    const auto earthOrigin = EarthStreaming::Enabled() ? EarthStreaming::GetLocation() : EarthStreaming::Location{};
+    const float earthLatitude = EarthStreaming::Enabled() ? float(earthOrigin.latitude * 3.14159265358979 / 180.0) : 0.0f;
+    const float earthLongitude = EarthStreaming::Enabled() ? float(earthOrigin.longitude * 3.14159265358979 / 180.0) : 0.0f;
+    rt.sun_dir = {_skySunDir.X(), _skySunDir.Y(), _skySunDir.Z(), earthLatitude};
     // MOON. Everything here comes straight from LightSun's ephemeris, UNSMOOTHED: the
     // illuminated fraction and the angular radius move on a monthly timescale and the
     // sub-solar direction moves ~0.04 deg per minute, so there is nothing to pop.
@@ -20451,7 +23063,9 @@ void EngineWgpu::PushSkyRuntime()
     // fixed time so the cloud shell holds at the same world offset as the test frame (the wind
     // formula is otherwise driven by Glob.time, which freezes in lockstep via the freezeTime bit).
     constexpr double kWindWrap = 100000.0; // m
-    const double cloudT = (WaterLook().freeze.freezeClouds || WaterLook().freeze.freezeTime)
+    // WGR_FREEZE_CLOUDS=1: the Water tab's "Freeze clouds" from the command line (captures, A/Bs).
+    static const bool freezeCloudsEnv = POSEIDON_GETENV_ONCE("WGR_FREEZE_CLOUDS") != nullptr;
+    const double cloudT = (freezeCloudsEnv || WaterLook().freeze.freezeClouds || WaterLook().freeze.freezeTime)
                               ? static_cast<double>(WaterLook().freeze.fixedTime)
                               : static_cast<double>(render::frame::GPresentationSnapshot().timeSeconds);
     // The deck's scroll velocity. Driven by the world's wind authority when
@@ -20490,11 +23104,39 @@ void EngineWgpu::PushSkyRuntime()
     _cloudOffsetClock = cloudT;
     _cloudOffsetX = std::fmod(_cloudOffsetX + windVelX * cloudDt, kWindWrap);
     _cloudOffsetZ = std::fmod(_cloudOffsetZ + windVelZ * cloudDt, kWindWrap);
-    const double windX = _cloudOffsetX;
-    const double windZ = _cloudOffsetZ;
+    double windX = _cloudOffsetX;
+    double windZ = _cloudOffsetZ;
+    // Earth free flight rebases the camera back to the anchor every 32 km; the deck is sampled at
+    // camera + offset, so without the accumulated rebase distance it jumped back with the camera and
+    // seemed to follow it. The wrap is the noise period, so subtracting keeps it seamless.
+    if (EarthStreaming::Enabled())
+    {
+        double travelX = 0, travelZ = 0;
+        EarthStreaming::Locations().Travel(travelX, travelZ);
+        windX = std::fmod(windX - travelX, kWindWrap);
+        windZ = std::fmod(windZ - travelZ, kWindWrap);
+    }
     rt.misc = {_skyNight, camAlt, static_cast<float>(windX), static_cast<float>(windZ)};
+    // Whole world: the Earth's and moon's centres and the Earth-fixed axes in world coordinates of the
+    // active frame, for the sky (sky.wgsl sky_origin / planet clouds / moon body). w = 1: valid.
+    rt.earth_centre = rt.moon_centre = rt.ecef_x = rt.ecef_z = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (EarthStreaming::Enabled())
+    {
+        const auto location = EarthStreaming::GetLocation();
+        EarthStreaming::Basis world;
+        if (EarthStreaming::WorldBasis(location.latitude, location.longitude, world))
+        {
+            const auto put = [](WgrVec4& v, EarthStreaming::D3 d) { v = {float(d.x), float(d.y), float(d.z), 1.0f}; };
+            put(rt.earth_centre, EarthStreaming::ToWorld(world, {0.0, 0.0, 0.0}));
+            put(rt.ecef_x, EarthStreaming::DirToWorld(world, {1.0, 0.0, 0.0}));
+            put(rt.ecef_z, EarthStreaming::DirToWorld(world, {0.0, 0.0, 1.0}));
+            EarthStreaming::D3 moon;
+            if (EarthStreaming::MoonCentreEcef(EarthStreaming::Celestial().Sky(), moon))
+                put(rt.moon_centre, EarthStreaming::ToWorld(world, moon));
+        }
+    }
     rt.layer_fog_weather = {skySnap.weatherFog, skySnap.hasLandscape ? 1.0f : 0.0f,
-                            skySnap.hasCamera ? 1.0f : 0.0f, 0.0f};
+                            skySnap.hasCamera ? 1.0f : 0.0f, earthLongitude}; // w: whole-world origin longitude
     // Cloud EVOLUTION offsets, on the same clock and the same wrap as the wind above (so they
     // freeze together under the Water tab's freeze switches). Wind translates the field; these
     // walk it through the noise volume's third axis, which is what makes clouds form and dissolve
@@ -20506,7 +23148,9 @@ void EngineWgpu::PushSkyRuntime()
     const double evoDetail = std::fmod(evo * 2.0 * cloudT, kWindWrap);
     const double evoWeather = std::fmod(evo * 0.5 * cloudT, kWindWrap);
     rt.cloud_evolve = {static_cast<float>(evoShape), static_cast<float>(evoDetail), static_cast<float>(evoWeather),
-                       0.0f};
+                       (_terrain && _terrain->IsEarthStreaming()) ? 1.0f : 0.0f};
+    // Reserved runtime lane: Earth presentation only. Rust consumes this marker before
+    // replacing cloud4.w with the ordinary cirrus puffiness; the public ABI is unchanged.
     _pendingSet.skyRuntime = rt; // REN-THR-013: queued
     _pendingSet.skyRuntimeDirty = true;
 }
@@ -20786,8 +23430,9 @@ void EngineWgpu::DrawDecalRotated(Vector3Par screen, float rhw, float sizeX, flo
     const WgrVertex2D v3 = corner(-sizeY, +sizeX, 0.0f, 1.0f);
     const WgrVertex2D quad[6] = {v0, v1, v2, v0, v2, v3};
 
-    const WgrDepthMode decalDepth = render::SelectDecalDepth(specFlags, false) == render::DecalDepth::None
-                                       ? WGR_DEPTH_NONE : WGR_DEPTH_TEST;
+    WgrDepthMode decalDepth = render::SelectDecalDepth(specFlags, false) == render::DecalDepth::None
+                                  ? WGR_DEPTH_NONE : WGR_DEPTH_TEST;
+    if (_decalDepthCutout && decalDepth == WGR_DEPTH_TEST) decalDepth = WGR_DEPTH_TEST_WRITE_CUTOUT;
     AppendTriangles(ResolveTexture(mip), BlendForSpec(specFlags), SamplerForSpec(specFlags), decalDepth, quad);
 }
 

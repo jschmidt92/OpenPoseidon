@@ -1,3 +1,7 @@
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
 #include <Poseidon/Network/NetworkImpl.hpp>
 #include <Poseidon/Network/NetworkImplServer.hpp>
 #include <Poseidon/Core/Application.hpp>
@@ -5,12 +9,14 @@
 #include <Poseidon/Core/Config/EngineConfig.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
 #include <Poseidon/Core/Version.hpp>
+#include <Poseidon/Graphics/Rendering/Lighting/Material.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
 #include <Poseidon/World/Detection/Detector.hpp>
 #include <Poseidon/World/Scene/ObjectClasses.hpp>
 #include <Poseidon/World/Scene/Fireplace.hpp>
 
 #include <Poseidon/Game/Commands/GameStateExt.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/UI/Settings/GameSettingsConfig.hpp>
 #include <Poseidon/UI/OptionsUI.hpp>
 
@@ -58,6 +64,7 @@
 
 using namespace Poseidon;
 void WhatUnits(RefArray<NetworkObject>& units, ChatChannel channel, NetworkObject* object);
+bool Arma2CampaignAutoActive(); // Game/Compat/Arma2CampaignAuto.cpp (OP_A2_CAMPAIGN)
 
 namespace Poseidon
 {
@@ -74,6 +81,7 @@ namespace Poseidon
 
 #include <Poseidon/Game/Commands/GameStateExtCommon.hpp>
 #include <Poseidon/Foundation/Enums/EnumNames.hpp>
+#include <Poseidon/Game/Commands/GameStateExtA3Rsc.hpp>
 
 namespace Poseidon
 {
@@ -196,7 +204,61 @@ const ParamEntry* FindIdentity(RString name)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgIdentities");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    return entry;
+    if (entry)
+    {
+        return entry;
+    }
+
+    // --arma1/--arma2: the game's own config (Arma 2 keeps its campaign characters --
+    // Cooper, Miles, Sykes, O'Hara, Rodriguez, Shaftoe, Armstrong -- in ca\missions' config)
+    return Poseidon::Arma1Compat::FindConfigClass("CfgIdentities", name);
+}
+
+// unit setSpeaker voice / unit setPitch pitch / unit setName name ([name, first, last] in Arma 3):
+// the identity's parts one at a time (Arma 3's campaigns set them so, a unit at a time)
+GameValue ObjSetSpeaker(const GameState*, GameValuePar oper1, GameValuePar oper2)
+{
+    VehicleWithBrain* person = dyn_cast<VehicleWithBrain>(GetObject(oper1));
+    if (!person || oper2.GetType() != GameString)
+        return NOTHING;
+    AIUnitInfo& info = person->GetInfo();
+    const RString speaker = oper2;
+    const bool known = (Pars >> "CfgVoice").FindEntry(speaker) != nullptr ||
+                       Poseidon::Arma1Compat::Arma2VoiceClass(speaker) != nullptr;
+    if (!known)
+        return NOTHING;
+    info._speaker = speaker;
+    if (person->Brain())
+        person->Brain()->SetSpeaker(info._speaker, info._pitch);
+    return NOTHING;
+}
+
+GameValue ObjSetPitch(const GameState*, GameValuePar oper1, GameValuePar oper2)
+{
+    VehicleWithBrain* person = dyn_cast<VehicleWithBrain>(GetObject(oper1));
+    if (!person || oper2.GetType() != GameScalar)
+        return NOTHING;
+    AIUnitInfo& info = person->GetInfo();
+    info._pitch = static_cast<float>(oper2);
+    if (person->Brain() && info._speaker.GetLength() > 0)
+        person->Brain()->SetSpeaker(info._speaker, info._pitch);
+    return NOTHING;
+}
+
+GameValue ObjSetName(const GameState*, GameValuePar oper1, GameValuePar oper2)
+{
+    VehicleWithBrain* person = dyn_cast<VehicleWithBrain>(GetObject(oper1));
+    if (!person)
+        return NOTHING;
+    if (oper2.GetType() == GameString)
+        person->GetInfo()._name = oper2;
+    else if (oper2.GetType() == GameArray)
+    {
+        const GameArrayType& a = oper2;
+        if (a.Size() > 0 && a[0].GetType() == GameString)
+            person->GetInfo()._name = a[0];
+    }
+    return NOTHING;
 }
 
 GameValue ObjSetIdentity(const GameState* state, GameValuePar oper1, GameValuePar oper2)
@@ -222,14 +284,29 @@ GameValue ObjSetIdentity(const GameState* state, GameValuePar oper1, GameValuePa
         info._name = DecodeLegacyTextToRString((*entry) >> "name", GLanguage);
         info._face = (*entry) >> "face";
         info._glasses = (*entry) >> "glasses";
-        info._speaker = (*entry) >> "speaker";
-        info._pitch = (*entry) >> "pitch";
+        // An Arma 2 identity names an Arma 2 voice ("Male01EN_A2") that CWA's CfgVoice does
+        // not have; SetSpeaker would put CWA's first voice in its place. The man keeps the
+        // voice he has instead.
+        const RString speaker = (*entry) >> "speaker";
+        const bool voiceKnown = (Pars >> "CfgVoice").FindEntry(speaker) != nullptr ||
+                                Poseidon::Arma1Compat::Arma2VoiceClass(speaker) != nullptr;
+        if (voiceKnown || !Poseidon::Arma1Compat::Active())
+        {
+            info._speaker = speaker;
+            info._pitch = (*entry) >> "pitch";
+        }
 
         person->SetFace(info._face);
         person->SetGlasses(info._glasses);
-        if (person->Brain())
+        if (person->Brain() && (voiceKnown || !Poseidon::Arma1Compat::Active()))
         {
             person->Brain()->SetSpeaker(info._speaker, info._pitch);
+        }
+        if (Poseidon::Arma1Compat::Active())
+        {
+            LOG_INFO(Script, "setIdentity '{}': name '{}', face '{}', glasses '{}', voice '{}'{}", (const char*)name,
+                     (const char*)info._name, (const char*)info._face, (const char*)info._glasses,
+                     (const char*)speaker, voiceKnown ? "" : " (no such voice, kept his own)");
         }
     }
 
@@ -406,6 +483,48 @@ GameValue ObjSetTexture(const GameState* state, GameValuePar oper1, GameValuePar
     return NOTHING;
 }
 
+// REFLECT-001 B2 -- Arma 3's `obj setObjectMaterial [index, "path.rvmat"]`: the material the
+// object's hidden selection `index` is drawn with. "" gives the model's own material back.
+// setObjectMaterialGlobal is the same here (no network broadcast in this engine yet).
+GameValue ObjSetMaterial(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    const GameArrayType& array = oper2;
+    if (array.Size() != 2)
+    {
+        state->SetError(EvalDim, array.Size(), 2);
+        return NOTHING;
+    }
+    if (array[0].GetType() != GameScalar)
+    {
+        state->TypeError(GameScalar, array[0].GetType());
+        return NOTHING;
+    }
+    if (array[1].GetType() != GameString)
+    {
+        state->TypeError(GameString, array[1].GetType());
+        return NOTHING;
+    }
+    EntityAI* veh = dyn_cast<EntityAI>(GetObject(oper1));
+    if (!veh)
+    {
+        return NOTHING;
+    }
+    const int index = toInt((float)array[0]);
+    RString name = array[1];
+    Ref<TexMaterial> material;
+    if (name.GetLength() > 0)
+    {
+        const char* path = name.Data();
+        if (*path == '\\')
+            path++;
+        RString lower = path;
+        lower.Lower();
+        material = GTexMaterialBank.New(lower.Data());
+    }
+    veh->SetObjectMaterial(index, material);
+    return NOTHING;
+}
+
 GameValue ObjGetNearestBuilding(const GameState* state, GameValuePar oper1)
 {
     Object* obj = GetObject(oper1);
@@ -551,6 +670,100 @@ GameValue nearestObject(const Vector3& pos, const RString& typeName, const float
     return GameValueExt(object);
 }
 } // namespace
+
+// Arma 1: position nearObjects radius | position nearObjects ["type", radius]
+// -> the objects in range (of that class or derived from it), nearest first
+bool A1TypeIsKindOf(const RString& type, const RString& base, bool className); // GameStateExt.cpp
+
+GameValue A1NearObjects(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    GameValue result = state->CreateGameValue(GameArray);
+    Vector3 pos;
+    if (oper1.GetType() == GameObject)
+    {
+        Object* center = GetObject(oper1);
+        if (!center)
+            return result;
+        pos = center->Position();
+    }
+    else if (!GetPos(state, pos, oper1))
+        return result;
+    // [type, radius], or Arma 3's [[types...], radius]: an object of any of the kinds
+    std::vector<RString> kinds;
+    float radius = 50;
+    if (oper2.GetType() == GameScalar)
+        radius = oper2;
+    else
+    {
+        const GameArrayType& a = oper2;
+        if (a.Size() != 2 || a[1].GetType() != GameScalar)
+            return result;
+        if (a[0].GetType() == GameString)
+            kinds.push_back(a[0]);
+        else if (a[0].GetType() == GameArray)
+        {
+            const GameArrayType& types = a[0];
+            for (int i = 0; i < types.Size(); i++)
+                if (types[i].GetType() == GameString)
+                    kinds.push_back(types[i]);
+            if (kinds.empty())
+                return result;
+        }
+        else
+            return result;
+        radius = a[1];
+        kinds.erase(std::remove_if(kinds.begin(), kinds.end(), [](const RString& k) { return k.GetLength() == 0; }),
+                    kinds.end());
+    }
+
+    // isKindOf as scripts see it (Arma 1/2/3 classes too), asked once per class
+    std::unordered_map<const EntityType*, bool> ofKind;
+    const auto wanted = [&](Object* obj)
+    {
+        if (kinds.empty())
+            return true;
+        const Entity* entity = dyn_cast<Entity>(obj);
+        const EntityType* type = entity ? entity->GetNonAIType() : nullptr;
+        if (!type)
+            return false;
+        auto it = ofKind.find(type);
+        if (it == ofKind.end())
+        {
+            bool any = false;
+            for (const RString& kind : kinds)
+                if ((any = A1TypeIsKindOf(type->GetName(), kind, false)))
+                    break;
+            it = ofKind.emplace(type, any).first;
+        }
+        return it->second;
+    };
+
+    std::vector<std::pair<float, Object*>> found;
+    int xMin, xMax, zMin, zMax;
+    ObjRadiusRectangle(xMin, xMax, zMin, zMax, pos, pos, radius);
+    for (int x = xMin; x <= xMax; x++)
+    {
+        for (int z = zMin; z <= zMax; z++)
+        {
+            const ObjectList& list = GLandscape->GetObjects(z, x);
+            for (int i = 0; i < list.Size(); i++)
+            {
+                Object* obj = list[i];
+                const float dist2 = obj->Position().Distance2(pos);
+                if (dist2 > Square(radius))
+                    continue;
+                if (!wanted(obj))
+                    continue;
+                found.emplace_back(dist2, obj);
+            }
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    GameArrayType& array = result;
+    for (const auto& f : found)
+        array.Add(GameValueExt(f.second));
+    return result;
+}
 
 GameValue GetNearestObjectByDistance(const GameState* state, GameValuePar oper1)
 {
@@ -1001,10 +1214,14 @@ GameValue PlayMusic(const GameState* state, GameValuePar oper1)
         }
 
         SoundPars sound;
-        if (Poseidon::FindMusic(voice, sound))
+        const ParamEntry* found = Poseidon::FindMusic(voice, sound);
+        if (found)
         {
             GSoundScene->StartMusicTrack(sound, pos);
         }
+        if (Poseidon::Arma1Compat::Active())
+            LOG_INFO(Audio, "playMusic ['{}', {}]: {}", (const char*)voice, (float)pos,
+                     found ? (const char*)sound.name : "not in any CfgMusic, nothing plays");
         return NOTHING;
     }
 
@@ -1017,10 +1234,14 @@ GameValue PlayMusic(const GameState* state, GameValuePar oper1)
     }
 
     SoundPars sound;
-    if (Poseidon::FindMusic(voice, sound))
+    const ParamEntry* found = Poseidon::FindMusic(voice, sound);
+    if (found)
     {
         GSoundScene->StartMusicTrack(sound);
     }
+    if (Poseidon::Arma1Compat::Active())
+        LOG_INFO(Audio, "playMusic '{}': {}", (const char*)voice,
+                 found ? (const char*)sound.name : "not in any CfgMusic, nothing plays");
     return NOTHING;
 }
 GameValue SetMusicVolume(const GameState* state, GameValuePar oper1, GameValuePar oper2)
@@ -1414,6 +1635,11 @@ GameValue ObjCameraEffect(const GameState* state, GameValuePar oper1, GameValueP
     return NOTHING;
 }
 
+namespace Poseidon
+{
+Object* NewNonAIVehicleQuiet(RString typeName, RString shapeName, bool fullCreate); // VehicleTypes.cpp
+}
+
 GameValue CamCreate(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     GameStringType effect = oper1;
@@ -1433,6 +1659,15 @@ GameValue CamCreate(const GameState* state, GameValuePar oper1, GameValuePar ope
     Vehicle* veh = NewNonAIVehicle(type, nullptr);
     if (!veh)
     {
+        // A typed non-AI object that is not a vehicle -- the weapon proxies, e.g. the SCUD's missile
+        // ("ProxyScud_Strela_Proxy", which the Earth ICBM flies): placed as scenery a script can move.
+        if (Object* obj = NewNonAIVehicleQuiet(type, "", true))
+        {
+            obj->SetType(Temporary); // setPos leaves map (Primary) objects where they are
+            obj->SetPosition(pos);
+            GLandscape->AddObject(obj);
+            return GameValueExt(obj);
+        }
         LOG_WARN(Script, "camCreate: NewNonAIVehicle('{}') returned null", (const char*)type);
         return OBJECT_NULL;
     }
@@ -1643,7 +1878,10 @@ GameValue ObjSwitchCamera(const GameState* state, GameValuePar oper1, GameValueP
 bool ParseEffect(const GameState* state, GameStringType& effect, GameStringType& str, float& speed, GameValuePar oper1)
 {
     const GameArrayType& array = oper1;
-    if (array.Size() < 2 || array.Size() > 3)
+    // Arma 2/3 add trailing fields (speed, showInMap, structured text / drawOverHUD) that
+    // have no counterpart here; the first three are what CWA reads
+    const bool armaTail = Poseidon::Arma1Compat::Active() && Poseidon::Arma1Compat::Generation() >= 2;
+    if (array.Size() < 2 || (array.Size() > 3 && !armaTail))
     {
         state->SetError(EvalDim, array.Size(), 2);
         return false;
@@ -1662,7 +1900,7 @@ bool ParseEffect(const GameState* state, GameStringType& effect, GameStringType&
     effect = array[0];
     str = array[1];
     speed = 1;
-    if (array.Size() == 3)
+    if (array.Size() >= 3)
     {
         if (array[2].GetType() != GameScalar)
         {
@@ -1702,14 +1940,18 @@ static TitEffectName TitEffectFromString(const GameStringType& str)
 
 GameValue GameTitleText(const GameState* state, GameValuePar oper1)
 {
+    Poseidon::Arma3Rsc::CloseLayer("title");
     TITLE_PREFIX
 
     GWorld->SetTitleEffect(CreateTitleEffect(name, effect, speed));
+    if (name == TitBlack || name == TitBlackOut || name == TitBlackFaded)
+        GWorld->NoteBlackEffect(GWorld->GetTitleEffect());
     return NOTHING;
 }
 
 GameValue GameTitleRsc(const GameState* state, GameValuePar oper1)
 {
+    Poseidon::Arma3Rsc::Open("title", oper1);
     TITLE_PREFIX
 
     const ParamEntry* cls = FindRscTitle(effect);
@@ -1728,15 +1970,19 @@ GameValue GameTitleObj(const GameState* state, GameValuePar oper1)
     return NOTHING;
 }
 
-GameValue CutText(const GameState* state, GameValuePar oper1)
+// The cut effect alone; cutText / cutRsc below also end or open an Arma 3 stand-in display
+// on the layer (GameStateExtA3Rsc.cpp), the layered forms on their own layer.
+GameValue CutTextEffect(const GameState* state, GameValuePar oper1)
 {
     TITLE_PREFIX
 
     GWorld->SetCutEffect(CreateTitleEffect(name, effect, speed));
+    if (name == TitBlack || name == TitBlackOut || name == TitBlackFaded)
+        GWorld->NoteBlackEffect(GWorld->GetCutEffect());
     return NOTHING;
 }
 
-GameValue CutRsc(const GameState* state, GameValuePar oper1)
+GameValue CutRscEffect(const GameState* state, GameValuePar oper1)
 {
     TITLE_PREFIX
 
@@ -1746,6 +1992,18 @@ GameValue CutRsc(const GameState* state, GameValuePar oper1)
         GWorld->SetCutEffect(CreateTitleEffectRsc(name, *cls));
     }
     return NOTHING;
+}
+
+GameValue CutText(const GameState* state, GameValuePar oper1)
+{
+    Poseidon::Arma3Rsc::CloseLayer("0");
+    return CutTextEffect(state, oper1);
+}
+
+GameValue CutRsc(const GameState* state, GameValuePar oper1)
+{
+    Poseidon::Arma3Rsc::Open("0", oper1);
+    return CutRscEffect(state, oper1);
 }
 
 GameValue CutObj(const GameState* state, GameValuePar oper1)
@@ -2325,6 +2583,16 @@ GameValue ShowHintC(const GameState* state, GameValuePar oper1)
 {
     if (AppConfig::Instance().IsSimulateMode())
         LOG_INFO(Mission, "[hintC] {}", (const char*)oper1.GetText());
+    // An unattended test (--arma1/--arma2-test-seconds) has nobody to press "Continue":
+    // the modal hint would stop the mission (and the test clock) for good, as it did in
+    // SP_WarWelcome. Show it as an ordinary hint instead.
+    if (AppConfig::Instance().GetArma1TestSeconds() > 0.0f || ::Arma2CampaignAutoActive())
+    {
+        LOG_INFO(Mission, "[hintC] shown without pausing (test mode): {}", (const char*)oper1.GetText());
+        if (GWorld->UI())
+            GWorld->UI()->ShowHint(oper1);
+        return NOTHING;
+    }
     Display* disp = Poseidon::CurrentDisplay();
     if (!disp || disp->IDD() != IDD_MISSION)
     {
@@ -2411,6 +2679,22 @@ GameValue ObjStop(const GameState* state, GameValuePar oper1, GameValuePar oper2
     return NOTHING;
 }
 
+// The AI bits a disableAI/enableAI name stands for. CWA knows TARGET, AUTOTARGET, MOVE and
+// ANIM; Arma 3 adds PATH (stand, but still turn and shoot -- here the same as MOVE) and ALL.
+// Arma 3's other features (AUTOCOMBAT, COVER, SUPPRESSION, FSM, ...) have no counterpart in
+// this AI and read as no bit at all, as before.
+static int DisabledAIBits(const char* name)
+{
+    if (!name)
+        return 0;
+    if (!_stricmp(name, "PATH"))
+        return AIUnit::DAMove;
+    if (!_stricmp(name, "ALL"))
+        return AIUnit::DATarget | AIUnit::DAMove | AIUnit::DAAutoTarget | AIUnit::DAAnim;
+    const int s = GetEnumValue<AIUnit::DisabledAI>(name);
+    return s == INT_MIN ? 0 : s;
+}
+
 GameValue ObjDisableAI(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     Object* obj = GetObject(oper1);
@@ -2429,14 +2713,23 @@ GameValue ObjDisableAI(const GameState* state, GameValuePar oper1, GameValuePar 
         return NOTHING;
     }
     GameStringType str = oper2;
-    const char* ss = str;
-    AIUnit::DisabledAI s = GetEnumValue<AIUnit::DisabledAI>(ss);
-    int dai = unit->GetAIDisabled();
-    if (s == INT_MIN)
+    unit->SetAIDisabled(unit->GetAIDisabled() | DisabledAIBits(str));
+    return NOTHING;
+}
+
+// enableAI (Arma 1 and later) undoes disableAI. It used to be ignored, so a unit an Arma 3
+// mission holds back with disableAI "MOVE" until the player arrives never moved again.
+GameValue ObjEnableAI(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    Object* obj = GetObject(oper1);
+    EntityAI* veh = obj ? dyn_cast<EntityAI>(obj) : nullptr;
+    AIUnit* unit = veh ? veh->CommanderUnit() : nullptr;
+    if (!unit)
     {
-        s = (AIUnit::DisabledAI)0;
+        return NOTHING;
     }
-    unit->SetAIDisabled(dai | s);
+    GameStringType str = oper2;
+    unit->SetAIDisabled(unit->GetAIDisabled() & ~DisabledAIBits(str));
     return NOTHING;
 }
 

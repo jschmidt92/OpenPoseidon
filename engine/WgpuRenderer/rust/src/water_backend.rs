@@ -127,6 +127,8 @@ pub struct WaterBackend {
     // TW-WATER W3: the CPU heightmap (the shore field is computed from it). Kept for replay: the
     // producer uploads it once per world load / terrain edit, not per frame.
     terrain_heights: Option<(std::sync::Arc<[f32]>, crate::ffi::WgrTerrainParams, u64)>,
+    // (OP) Whole World's far sea floor (set_far_floor): heights, samples a side, origin, cell, generation
+    far_floor: Option<(std::sync::Arc<[f32]>, u32, [f32; 2], f32, u64)>,
     requested: WaterBackendKind,
     refused_logged: Option<WaterBackendKind>,
     switches: u64,
@@ -171,6 +173,7 @@ impl WaterBackend {
             cascade_configs: [None; MAX_REPLAYED_CASCADES],
             interaction_params: None,
             terrain_heights: None,
+            far_floor: None,
             requested: WaterBackendKind::Tidewater,
             refused_logged: None,
             switches: 0,
@@ -281,6 +284,7 @@ impl WaterBackend {
         let t0 = std::time::Instant::now();
         // Drop first: at no point do both backends hold GPU memory.
         crate::water_tw::probe::clear_drawn_grid();
+        crate::water_tw::query::clear();
         self.active = Active::Empty;
         self.active = match want {
             WaterBackendKind::CurrentOp => {
@@ -398,6 +402,19 @@ impl WaterBackend {
             tw.set_terrain_heights(arc.clone(), params, generation);
         }
         self.terrain_heights = Some((arc, params, generation));
+    }
+
+    /// (OP) Whole World: the sea floor beyond the terrain heightmap's window (Tidewater only). Kept and applied
+    /// each frame ([`Self::apply_far_floor`]), so a rebuilt backend gets it too.
+    pub fn set_far_floor(&mut self, heights: &[f32], n: u32, origin: [f32; 2], cell: f32) {
+        let generation = self.far_floor.as_ref().map_or(0, |f| f.4) + 1;
+        self.far_floor = Some((std::sync::Arc::from(heights), n, origin, cell, generation));
+    }
+
+    pub fn apply_far_floor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let (Active::Tidewater(tw), Some((heights, n, origin, cell, generation))) = (&mut self.active, &self.far_floor) {
+            tw.set_far_floor(device, queue, heights, *n, *origin, *cell, *generation);
+        }
     }
 
     // ------------------------------------------------------------------ producer inputs
@@ -563,13 +580,14 @@ impl WaterBackend {
         source: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         destination: &wgpu::TextureView,
+        sky_sh: &wgpu::Buffer,
     ) {
         match &self.active {
             Active::CurrentOp(op) => {
                 let displacement = op.water.underwater_displacement_view();
                 op.underwater.render(device, encoder, source, depth, destination, &displacement);
             }
-            Active::Tidewater(tw) => tw.render_underwater(device, encoder, source, depth, destination),
+            Active::Tidewater(tw) => tw.render_underwater(device, encoder, source, depth, destination, sky_sh),
             Active::Empty => {}
         }
     }

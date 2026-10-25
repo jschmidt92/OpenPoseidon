@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <cmath>
+#include <cstdlib>
 #include <Poseidon/Foundation/Common/FltOpts.hpp>
 #include <Poseidon/Foundation/Math/MathDefs.hpp>
 #include <Poseidon/Foundation/Types/Pointers.hpp>
@@ -15,9 +16,12 @@
 #include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthFreeFlight.hpp>
 #include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/World/World.hpp>
+#include <Poseidon/World/Entities/Infantry/Person.hpp>
 #include <Poseidon/World/Scene/Scene.hpp>
+#include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
 #include <SDL3/SDL_scancode.h>
 #include <Poseidon/Graphics/Textures/TexturePreload.hpp>
 #include <Poseidon/Foundation/Framework/Log.hpp>
@@ -266,7 +270,19 @@ float CameraVehicle::CamEffectFOV() const
         Vector3 norm = _lastTgtPos - Position();
         Vector3 dir = norm.Normalized();
 
-        const_cast<CameraVehicle*>(this)->SetDirectionAndUp(dir, VUp);
+        // Earth free-flight levels against the physical radial up at the camera, not the frame's
+        // world-up (wrong away from the origin on a curved Earth) and not its own previous up:
+        // re-using its own up let every look-around while pitched, and every rebase, leave a little
+        // roll that nothing removed, so the horizon drifted tilted. Straight up/down keeps its own up.
+        Vector3 up = VUp;
+        if (GetManual() && _altitudeSpeedScaling && EarthStreaming::Enabled())
+        {
+            const auto radial = EarthStreaming::FlightUpNear({Position()[0], Position()[1], Position()[2]});
+            up = Vector3(float(radial.x), float(radial.y), float(radial.z));
+            if (std::abs(dir.DotProduct(up)) > 0.999f)
+                up = Orientation().DirectionUp();
+        }
+        const_cast<CameraVehicle*>(this)->SetDirectionAndUp(dir, up);
 
         float invDist = (_lastTgtPos - Position()).InvSize();
         float fov = invDist * 10;
@@ -274,6 +290,102 @@ float CameraVehicle::CamEffectFOV() const
         _lastFov = fov;
     }
     return _lastFov;
+}
+
+// Whole world: free flight between the Earth and the moon (EarthMoonFrame.hpp). Near the moon the world
+// switches to a moon tangent frame -- in the Earth frame the moon is ~3.8e8 m out, where a float steps
+// 32 m and the camera shook -- and across the moon it re-centres as the Earth frame does across the
+// Earth. Returns true when `position` (and this camera's orientation and speed) moved to a new frame.
+bool CameraVehicle::ReframeEarthMoon(Vector3& position, const EarthStreaming::Location& earthLocation)
+{
+    using namespace EarthStreaming;
+    const auto sky = Celestial().Sky();
+    D3 moon;
+    if (!sky.valid || !MoonCentreEcef(sky, moon)) return false;
+    Basis from;
+    if (!WorldBasis(earthLocation.latitude, earthLocation.longitude, from)) return false;
+    const D3 camera = ToEcef(from, position[0], position[1], position[2]);
+    const double earthAltitude = Length(camera) - Earth::Radius;
+    const double moonAltitude = Length(camera - moon) - MoonRadius;
+    const bool inMoon = MoonFrameActive();
+    Basis to;
+    bool earthTarget = false;
+    double latitude = 0, longitude = 0;
+    if (!inMoon && moonAltitude < earthAltitude)
+    {
+        SelenographicOf(MoonFixedAxes(moon), camera - moon, latitude, longitude);
+        to = MoonBasis(moon, latitude, longitude);
+    }
+    else if (inMoon && earthAltitude < moonAltitude)
+    {
+        const D3 up = Normalize(camera);
+        latitude = std::asin(std::clamp(up.z, -1.0, 1.0)) * 180.0 / Earth::Pi;
+        longitude = std::atan2(up.y, up.x) * 180.0 / Earth::Pi;
+        if (!ValidateFlightLocation(latitude, longitude, earthAltitude)) return false;
+        to = EarthBasis(latitude, longitude);
+        earthTarget = true;
+    }
+    else if (inMoon)
+    {
+        const double dx = double(position[0]) - Earth::Anchor, dz = double(position[2]) - Earth::Anchor;
+        const double recenter = Earth::RecenterDistance(std::max(double(position[1]), 0.0));
+        if (dx * dx + dz * dz <= recenter * recenter) return false;
+        SelenographicOf(MoonFixedAxes(moon), camera - moon, latitude, longitude);
+        to = MoonBasis(moon, latitude, longitude);
+    }
+    else
+        return false;
+    const auto direction = [&](Vector3Val v) {
+        const D3 d = DirToWorld(to, DirToEcef(from, {v[0], v[1], v[2]}));
+        return Vector3(float(d.x), float(d.y), float(d.z));
+    };
+    const auto point = [&](Vector3Val v) {
+        const D3 d = ToWorld(to, ToEcef(from, v[0], v[1], v[2]));
+        return Vector3(float(d.x), float(d.y), float(d.z));
+    };
+    // Someone standing on the moon goes with a re-centre across it; switching between the bodies, the
+    // player is carried along in local coordinates as the Earth frame always did.
+    Person* player = GWorld ? GWorld->PlayerOn() : nullptr;
+    const bool carryPlayer = inMoon && !earthTarget && player && player != static_cast<Object*>(this);
+    // Arriving at the moon, the player left standing on the Earth keeps his local coordinates as on any
+    // rebase; there he would drop from his Earth terrain height. Stand him on the moon's surface instead.
+    const bool landPlayer = !inMoon && !earthTarget && player && player != static_cast<Object*>(this);
+    const Vector3 playerPos = carryPlayer ? point(player->Position()) : Vector3();
+    Matrix3 playerOrient;
+    if (carryPlayer)
+        playerOrient.SetDirectionAndUp(direction(player->Direction()), direction(player->DirectionUp()));
+    Matrix3 orient;
+    orient.SetDirectionAndUp(direction(Direction()), direction(Orientation().DirectionUp()));
+    const Vector3 speed = direction(_speed);
+    const Vector3 moved = point(position);
+    if (earthTarget)
+    {
+        if (!Locations().Rebase(earthLocation.revision, latitude, longitude, earthAltitude)) return false;
+        Celestial().LeaveMoon();
+    }
+    else
+        Celestial().EnterMoon(latitude, longitude);
+    SetOrientation(orient);
+    _speed = speed;
+    position = moved;
+    if (carryPlayer)
+    {
+        player->SetOrientation(playerOrient);
+        player->Move(playerPos);
+    }
+    if (landPlayer)
+    {
+        Vector3 standing = player->Position();
+        if (const auto ground = QueryGround(standing.X(), standing.Z()))
+            standing[1] = ground->height;
+        player->Move(standing);
+        player->SetSpeed(VZero);
+    }
+    // Same frame for sun, moon and camera (see the Earth rebase in Simulate).
+    if (GScene && GScene->MainLight()) GScene->MainLight()->Recalculate(GWorld);
+    LOG_INFO(Graphics, "Free flight frame: {} at [{:.4f},{:.4f}], camera at {:.0f} m",
+             earthTarget ? "Earth" : (inMoon ? "moon re-centred" : "moon"), latitude, longitude, position[1]);
+    return true;
 }
 
 void ClipboardSaveText(QOStream& stream);
@@ -286,8 +398,46 @@ void CameraVehicle::ResetTargets()
     _lastTgtPos = _target._pos;
 }
 
+namespace
+{
+// Free-fly feathering: the manual camera eases its flight speed and its pan/tilt rate toward what the keys and
+// the mouse ask, exponentially over these time constants (s), so a screen recording pans without the jerks of
+// raw per-frame mouse deltas (owner, 2026-10-22: "just so that if i do screenrecording it looks a bit more
+// professional"). The rate is smoothed, not the angle, so a mouse sweep still turns exactly as far.
+// POSEIDON_FREEFLY_SMOOTH=0: the raw response. The harness drift and yaw (top of Simulate) never pass through it.
+constexpr float FreeFlyMoveTime = 0.1f;
+constexpr float FreeFlyLookTime = 0.06f;
+
+bool FreeFlySmooth()
+{
+    static const bool on = [] {
+        const char* value = std::getenv("POSEIDON_FREEFLY_SMOOTH");
+        return !(value && value[0] == '0');
+    }();
+    return on;
+}
+
+// one step of an exponential follow over time constant tau, whatever the step length
+float FreeFlyFollow(float deltaT, float tau)
+{
+    return 1.0f - std::exp(-deltaT / tau);
+}
+} // namespace
+
 void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
 {
+    if (_harnessDrift.SquareSize() > 0.0f)
+        Move(Position() + _harnessDrift * deltaT);
+    if (_harnessYawRate != 0.0f)
+    {
+        // Rotate the look target about the camera's vertical; the direction follows it.
+        const Vector3 rel = GetTarget() - Position();
+        const float a = _harnessYawRate * deltaT, c = std::cos(a), s = std::sin(a);
+        const Vector3 turned(rel.X() * c - rel.Z() * s, rel.Y(), rel.X() * s + rel.Z() * c);
+        _target = Position() + turned;
+        _oldTarget = nullptr;
+        _lastTgtPos = _target._pos;
+    }
     if (!GetManual())
     {
         if (_movePos.SquareSize() > 0.5)
@@ -365,14 +515,28 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         Matrix3 speedOrient;
         speedOrient.SetUpAndDirection(VUp, Direction());
 
+        const bool earth = EarthStreaming::Enabled();
+        const auto earthLocation = earth ? EarthStreaming::GetLocation() : EarthStreaming::Location{};
+        const auto earthGround = earth ? EarthStreaming::Locations().Ground() : nullptr;
+        const EarthStreaming::FlightPoint earthPrevious{Position()[0], Position()[1], Position()[2]};
+        const bool moonFrame = earth && EarthStreaming::MoonFrameActive();
         float speedScale = 1.0f;
         if (_altitudeSpeedScaling)
         {
             // The curve steepens with altitude: precise placement close to the
             // ground, then rapidly increasing travel speed high above the map.
-            float groundY = GLandscape->SurfaceYAboveWater(Position()[0], Position()[2]);
-            float altitude = fmax(Position()[1] - groundY, 0.0f);
-            speedScale = fmin(1.0f + altitude * 0.03f + altitude * altitude * 0.00002f, 64.0f);
+            const float altitude = earth ? 0.0f :
+                fmax(Position()[1] - GLandscape->SurfaceYAboveWater(Position()[0],Position()[2]),0.0f);
+            speedScale = earth ? EarthStreaming::FlightSpeedScale(earthPrevious, earthGround.get(), earthLocation.revision) :
+                fmin(1.0f + altitude * 0.03f + altitude * altitude * 0.00002f, 64.0f);
+            if (earth)
+            {
+                // Slow down approaching the moon as well as the Earth (EarthFreeFlight.hpp). In the moon
+                // frame the Earth's resident ground means nothing; its clearance is the true altitude.
+                if (moonFrame)
+                    speedScale = float(EarthStreaming::ClearanceSpeedScale(EarthStreaming::EarthAltitude(earthPrevious)));
+                speedScale = fmin(speedScale, float(EarthStreaming::ClearanceSpeedScale(EarthStreaming::MoonClearance(earthPrevious))));
+            }
 
             // Shift is an absolute two-times multiplier for Zeus flight: it
             // accelerates sideways, vertical, and forward movement equally.
@@ -383,6 +547,15 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         }
 
         Vector3 speedWanted = speedOrient * Vector3(aside, up, forward) * speedScale;
+        if (earth)
+        {
+            // Ordinary Zeus flight keeps W/S parallel to the ground. Planet
+            // exploration must instead approach the point we are looking at,
+            // including a nearly vertical descent from orbit. Retain world-up
+            // for the separate raise/lower controls, using physical radial up.
+            const auto radial = EarthStreaming::FlightUpNear(earthPrevious);
+            speedWanted=(Orientation()*Vector3(aside,0,forward)+Vector3(float(radial.x),float(radial.y),float(radial.z))*up)*speedScale;
+        }
         if (_inertia)
         {
             // smooth changes
@@ -394,13 +567,47 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
             saturate(accel[2], -10, +10);
             _speed += accel * deltaT;
         }
+        else if (FreeFlySmooth() && deltaT > 0)
+        {
+            _speed += (speedWanted - _speed) * FreeFlyFollow(deltaT, FreeFlyMoveTime);
+        }
         else
         {
             _speed = speedWanted;
         }
 
         Vector3 position = Position() + _speed * deltaT;
-        const bool earth = EarthStreaming::Enabled();
+        if (earth)
+        {
+            if (!moonFrame)
+            {
+                const auto next = EarthStreaming::ConstrainFlight(earthPrevious,
+                    {position[0],position[1],position[2]}, earthGround.get(), earthLocation.revision);
+                if (next.x != position[0]) _speed[0] = 0;
+                if (next.z != position[2]) _speed[2] = 0;
+                if (next.y != position[1]) _speed[1] = 0;
+                position = Vector3(next.x,next.y,next.z);
+            }
+            // Above the moon's surface: 100 m from the Earth frame (where the surface is not exact), a
+            // standing eye height in the moon frame, where it is.
+            auto outside = EarthStreaming::KeepOutsideMoon({position[0],position[1],position[2]}, moonFrame ? 1.6 : 100.0);
+            if (moonFrame) outside = EarthStreaming::KeepNearMoon(outside);
+            if (outside.x != position[0] || outside.y != position[1] || outside.z != position[2]) _speed = VZero;
+            position = Vector3(outside.x,outside.y,outside.z);
+            if (moonFrame)
+            {
+                // Follow the moon's curvature (EarthFreeFlight.hpp): level flight orbits it.
+                const EarthStreaming::FlightPoint next{position[0],position[1],position[2]};
+                const auto carry = [&](Vector3Val v) {
+                    const auto r = EarthStreaming::MoonTransport(earthPrevious, next, {v[0],v[1],v[2]});
+                    return Vector3(float(r.x),float(r.y),float(r.z));
+                };
+                Matrix3 orient;
+                orient.SetDirectionAndUp(carry(Direction()), carry(Orientation().DirectionUp()));
+                SetOrientation(orient);
+                _speed = carry(_speed);
+            }
+        }
         if (_altitudeSpeedScaling)
         {
             // Zeus is a map-level camera. Its altitude speed boost makes it
@@ -418,6 +625,51 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
             }
             else
             {
+                if (earth && ReframeEarthMoon(position, earthLocation))
+                {
+                    // Switched between the Earth frame and the moon frame, or rebased across the moon
+                    // (EarthMoonFrame.hpp): `position`, the orientation and the speed are in the new frame.
+                }
+                else if (earth && !moonFrame)
+                {
+                    const Earth::Coordinate oldOrigin{earthLocation.latitude,earthLocation.longitude};
+                    if (const auto next = Earth::CameraRebase(oldOrigin,position[0],position[1],position[2]))
+                    {
+                        const double altitude = std::clamp(next->altitude,double(EarthStreaming::FreeFlightAltitudeMinimum),double(EarthStreaming::FlightAltitudeLimit));
+                        if (EarthStreaming::ValidateFlightLocation(next->origin.latitude,next->origin.longitude,altitude))
+                        {
+                            if (!EarthStreaming::Locations().Rebase(earthLocation.revision,
+                                next->origin.latitude,next->origin.longitude,altitude))
+                                return; // An explicit geographic Go superseded this movement.
+                            const auto rotate = [&](Vector3Val v) {
+                                const auto r = Earth::RotateFrame(oldOrigin,next->origin,{v[0],v[1],v[2]});
+                                return Vector3(float(r.x),float(r.y),float(r.z));
+                            };
+                            const Vector3 direction = rotate(Direction()), upDirection = rotate(Orientation().DirectionUp());
+                            Matrix3 orient;
+                            orient.SetDirectionAndUp(direction,upDirection);
+                            SetOrientation(orient);
+                            _speed = rotate(_speed);
+                            EarthStreaming::Locations().AddTravel(position[0] - EarthStreaming::CameraAnchor,
+                                                                  position[2] - EarthStreaming::CameraAnchor);
+                            position = Vector3(EarthStreaming::CameraAnchor,float(altitude),EarthStreaming::CameraAnchor);
+                            // The sun and moon are in the origin's frame: recompute them now, in the frame the
+                            // camera just moved to. The clock step (World::SimulateLandscape) runs before the
+                            // camera, so it caught the rebase a frame late and the sun jumped for one frame on
+                            // every rebase -- often, moving fast in space.
+                            if (GScene && GScene->MainLight()) GScene->MainLight()->Recalculate(GWorld);
+                        }
+                        else
+                        {
+                            // Mercator data does not cover the poles. Keep the
+                            // last valid camera frame rather than shift to an
+                            // origin the terrain/feature providers cannot use.
+                            position = Position();
+                            _speed = VZero;
+                            constrained = true;
+                        }
+                    }
+                }
                 const float oldX = position[0];
                 const float oldZ = position[2];
                 const float lower = earth ? -EarthStreaming::CoordinateLimit : 0.0f;
@@ -450,10 +702,18 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         // above the ground / sea bed only. The clipboard export below keeps heights relative to
         // the sea surface, so an underwater shot exports as a negative camSetPos height.
         // Sinkhole W1 (Malprave terrainHole4): inside a terrain hole it may go down to the hole's floor.
-        Vector3 floorPos = position;
-        float surfY = earth ? -12000.0f : GLandscape->CameraFloorY(floorPos, nullptr, false);
-        saturateMax(position[1], surfY + 0.05);
+        if (!earth)
+        {
+            Vector3 floorPos = position;
+            const float surfY = GLandscape->CameraFloorY(floorPos, nullptr, false);
+            saturateMax(position[1], surfY + 0.05);
+        }
         Move(position);
+        // The legacy manual camera aims at a point 100 km ahead. Orbital flight
+        // can cross that point in one update, causing CamEffectFOV to turn the
+        // camera around. Translate the virtual target with Earth free flight
+        // so W/S retain their direction even at planetary travel speeds.
+        if (earth) ResetTargets();
 
         // get mouse movement
         // or numeric keyboard
@@ -472,6 +732,19 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         const float mouseY = mouseLookActive ? input.GetMouseDeltaY() : 0.0f;
         float headChange = headSpeed * 2 * deltaT * _lastFov - mouseX * mouseLookScale;
         float diveChange = diveSpeed * 2 * deltaT * _lastFov + mouseY * mouseLookScale;
+        if (FreeFlySmooth() && deltaT > 1e-4f)
+        {
+            const float follow = FreeFlyFollow(deltaT, FreeFlyLookTime);
+            _lookHeadRate += (headChange / deltaT - _lookHeadRate) * follow;
+            _lookDiveRate += (diveChange / deltaT - _lookDiveRate) * follow;
+            // settled: stop exactly, so a still camera stays still (and keeps its lock target)
+            if (std::fabs(_lookHeadRate) < 1e-4f && headChange == 0)
+                _lookHeadRate = 0;
+            if (std::fabs(_lookDiveRate) < 1e-4f && diveChange == 0)
+                _lookDiveRate = 0;
+            headChange = _lookHeadRate * deltaT;
+            diveChange = _lookDiveRate * deltaT;
+        }
         Matrix3 orient = Orientation();
         if (headChange)
         {

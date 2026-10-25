@@ -9,6 +9,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace Poseidon
 {
@@ -69,8 +70,18 @@ struct DdsPreparationOptions
     bool compressedPassthrough;
     bool linearTintMultiply;
     int decodedMaxEdge;
+    std::string globalOverlayDataSuffix{};
 };
 DdsPreparationOptions CaptureDdsPreparationOptions();
+
+// RFG-112: whether `enfa|` leaf composites keep their authored mip levels (default on).
+bool AuthoredCompositeMips();
+
+// Whether an `enft|r,g,b|inner` texture is built as a lazy linear-tint VIEW of `inner`
+// (TextureWgpu's loadSource) rather than decoded and tinted as a composite of its own. On
+// that route the DDS factory is asked for `inner`, never for the composite name, so anything
+// preparing sources ahead of the factory must key on `inner` too. One definition, used by both.
+bool LazyBcrTintRoute();
 
 class TextureSourceDDS : public ITextureSource
 {
@@ -88,6 +99,7 @@ class TextureSourceDDS : public ITextureSource
     int _mipmaps = 0;
     bool _hasAlpha = false;
     bool _isTransparent = false;
+    bool _bc7Srgb = false;
     PackedColor _avgColor{};
     Bc3MipChain _preparedBc3; // optional upload-only sidecar; original source/metadata stay unchanged
     bool InitFromMemoryWithOptions(const void* data, size_t size, const char* nameForErrors,
@@ -104,6 +116,16 @@ class TextureSourceDDS : public ITextureSource
     bool PrepareCompositeBc3(size_t reservedBytes, const Bc3EncodingObserver* observer = nullptr);
     // Main-thread one-shot claim. Incompatible dimensions/name leave it unused.
     bool TakeCompositeBc3(const char* sourceName, int width, int height, Bc3MipChain& out);
+    // PERF-FAR-BC3-PREP: a copy of this source's pixels for a worker to encode
+    // (PrepareCompositeBc3 on the copy), and the hand-back of its chain to this
+    // source on the owner thread, where the upload's TakeCompositeBc3 finds it.
+    std::unique_ptr<TextureSourceDDS> CloneForBc3() const;
+    bool HasPreparedBc3() const { return !_preparedBc3.blocks.empty(); }
+    void SetPreparedBc3(Bc3MipChain&& chain) { _preparedBc3 = std::move(chain); }
+    Bc3MipChain TakePreparedBc3() { Bc3MipChain out = std::move(_preparedBc3); _preparedBc3 = {}; return out; }
+    // RFG-112: BC3 from the source's OWN mip levels (each encoded as-is), not mips regenerated
+    // from the top. False unless the levels form an exact halving chain down to 4x4.
+    bool EncodeAuthoredBc3(Bc3MipChain& out) const;
     // Borrow immutable BC7 BCR pixels. The owner MUST retain this source until
     // after the view dies. No I/O, GPU work, cached decoded chain or workers.
     // Declines other formats/materials; the ordinary factory remains fallback.
@@ -125,6 +147,7 @@ class TextureSourceDDS : public ITextureSource
 
     bool IsAlpha() const override { return _hasAlpha; }
     bool IsTransparent() const override { return _isTransparent; }
+    bool IsOriginalBc7Srgb() const { return _bc7Srgb; }
     void ForceAlpha() override { _hasAlpha = true; }
 
     // Testable entry point -- decode from an in-memory buffer, so unit tests can

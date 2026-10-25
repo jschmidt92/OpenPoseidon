@@ -11,6 +11,7 @@
 #include <Poseidon/Graphics/Rendering/Shape/Shape.hpp> // Shapes (triLoadedShapeCount)
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 #include <Poseidon/Network/Network.hpp>
 #include <Poseidon/Network/NetworkCustomAssets.hpp>
 #include <Poseidon/Network/NetworkImpl.hpp>
@@ -116,6 +117,8 @@ GameValue TriEditorMode(const GameState*);
 GameValue TriRemount(const GameState*);
 GameValue TriLoadedShapeCount(const GameState*);
 GameValue TriScenePreloadCount(const GameState*);
+GameValue TriDetailTextureLoads(const GameState*);
+GameValue TriTextureBankReleases(const GameState*);
 GameValue TriClick(const GameState*, GameValuePar);
 GameValue TriClickAt(const GameState*, GameValuePar);
 GameValue TriInvokeButton(const GameState*, GameValuePar);
@@ -199,9 +202,23 @@ GameValue TriDevPanelShow(const GameState*, GameValuePar);
 GameValue TriPhysicsShowcase(const GameState*, GameValuePar);
 GameValue TriTerrainBrushMode(const GameState*, GameValuePar);
 GameValue TriFreeFlyPose(const GameState*, GameValuePar);
+GameValue TriEarthGround(const GameState*, GameValuePar);
+GameValue EarthLocation(const GameState*);
+GameValue EarthPosToGeo(const GameState*, GameValuePar);
+GameValue EarthGeoToPos(const GameState*, GameValuePar);
+GameValue EarthGoTo(const GameState*, GameValuePar);
+GameValue EarthGroundHeight(const GameState*, GameValuePar);
 GameValue TriTerrainPaint(const GameState*, GameValuePar);
 GameValue TriRocketCraters(const GameState*, GameValuePar);
 GameValue TriTerrainHeight(const GameState*, GameValuePar);
+GameValue TriEnfusionDoor(const GameState*, GameValuePar);
+GameValue TriEnfusionDoorSet(const GameState*, GameValuePar);
+GameValue TriEnfusionDoorCensus(const GameState*);
+GameValue TriEnfusionGlass(const GameState*, GameValuePar);
+GameValue TriEnfusionGlassBreak(const GameState*, GameValuePar);
+GameValue TriEnfusionGlassCensus(const GameState*);
+GameValue TriEnfusionDoorsAll(const GameState*, GameValuePar);
+GameValue TriEnfusionGlassBreakAll(const GameState*, GameValuePar);
 GameValue TriDevPanelSelectShadows(const GameState*);
 GameValue TriDevPanelSelectMemory(const GameState*);
 GameValue TriShadowSunFactor(const GameState*);
@@ -1171,6 +1188,54 @@ GameValue TriPlayerPosZ(const GameState* /*state*/)
         return GameValue(-1.0f);
     EntityAI* veh = GWorld->GetRealPlayer()->Brain()->GetVehicle();
     return GameValue(veh ? veh->Position()[2] : -1.0f);
+}
+
+/// triEarthLocation [latitude,longitude,altitude] relocates the opt-in Earth
+/// preview through the same camera/origin transaction as its navigation tab.
+/// An empty array queries the current origin and revision for harness assertions.
+/// triFreeFlyOff ends free flight and hands the view back to the player (the ICBM follow camera).
+GameValue TriFreeFlyOff(const GameState*)
+{
+    DebugOverlay::DisableFreeFly();
+    return GameValue("OK");
+}
+
+/// triZeusBeam: the Zeus "Beam player here" button (dev/harness); returns its status line.
+GameValue TriZeusBeam(const GameState*)
+{
+    return GameValue(RString(DebugOverlay::BeamPlayerHere()));
+}
+
+/// triEarthMoon [altitude, pitch, surface(0/1)] puts the free-fly camera above the moon (dev/harness).
+GameValue TriEarthMoon(const GameState*, GameValuePar arg)
+{
+    if (!EarthStreaming::Enabled()) return GameValue("FAIL:earth_preview_disabled");
+    const GameArrayType& values=arg;
+    if (values.Size()!=3) return GameValue("FAIL:expected_altitude_pitch_surface");
+    for (int i=0;i<3;++i)
+        if (values[i].GetType()!=GameScalar) return GameValue("FAIL:expected_scalars");
+    return GameValue(DebugOverlay::SetEarthMoonPose((GameScalarType)values[0],(GameScalarType)values[1],
+        int((GameScalarType)values[2] + 0.5f)) ? "OK" : "FAIL:no_moon_or_camera");
+}
+
+GameValue TriEarthLocation(const GameState*, GameValuePar arg)
+{
+    if (!EarthStreaming::Enabled()) return GameValue("FAIL:earth_preview_disabled");
+    const GameArrayType& values=arg;
+    if (values.Size()!=0 && values.Size()!=3) return GameValue("FAIL:expected_lat_lon_altitude");
+    if (values.Size()==3)
+    {
+        for (int i=0;i<3;++i)
+            if (values[i].GetType()!=GameScalar) return GameValue("FAIL:expected_scalars");
+        if (!DebugOverlay::SetEarthPreviewLocation((GameScalarType)values[0],(GameScalarType)values[1],
+                (GameScalarType)values[2])) return GameValue("FAIL:invalid_location_or_camera");
+    }
+    const auto location=EarthStreaming::GetLocation();
+    char result[192];
+    snprintf(result,sizeof(result),"OK:latitude=%.8f longitude=%.8f altitude=%.3f revision=%llu",
+        location.latitude,location.longitude,double(location.altitude),
+        static_cast<unsigned long long>(location.revision));
+    return GameValue(result);
 }
 
 /// triPlayerGroundClearance — signed distance from the player vehicle origin to
@@ -2152,6 +2217,24 @@ GameValue TriScenePreloadCount(const GameState* /*state*/)
     return GameValue(static_cast<float>(n));
 }
 
+/// triDetailTextureLoads - how many times the texture bank has derived its detail /
+/// specular / grass / water-bump set from `CfgDetailTextures`. One per content load.
+GameValue TriDetailTextureLoads(const GameState* /*state*/)
+{
+    if (GEngine == nullptr || GEngine->TextBank() == nullptr)
+        return GameValue(0.0f);
+    return GameValue(static_cast<float>(GEngine->TextBank()->NDetailTextureLoads()));
+}
+
+/// triTextureBankReleases - how many times the active texture bank has dropped its loaded set.
+/// A re-mount must add one, or textures a mod replaces under the same path stay the old ones.
+GameValue TriTextureBankReleases(const GameState* /*state*/)
+{
+    if (GEngine == nullptr || GEngine->TextBank() == nullptr)
+        return GameValue(0.0f);
+    return GameValue(static_cast<float>(GEngine->TextBank()->NReleases()));
+}
+
 /// triFontTune ["prefix", renderPx, widthScale]
 /// triFontTune ["prefix", renderPx, widthScale, baselineOffset]
 /// triFontTune ["prefix", renderPx, widthScale, baselineOffset, syntheticBold]
@@ -3115,6 +3198,8 @@ INIT_MODULE(GameStateExtTest, 3)
     GGameState.NewNularOp(GameNular(GameString, "triRemount", TriRemount));
     GGameState.NewNularOp(GameNular(GameScalar, "triLoadedShapeCount", TriLoadedShapeCount));
     GGameState.NewNularOp(GameNular(GameScalar, "triScenePreloadCount", TriScenePreloadCount));
+    GGameState.NewNularOp(GameNular(GameScalar, "triDetailTextureLoads", TriDetailTextureLoads));
+    GGameState.NewNularOp(GameNular(GameScalar, "triTextureBankReleases", TriTextureBankReleases));
     GGameState.NewNularOp(GameNular(GameScalar, "triIsEndForced", TriIsEndForced));
     GGameState.NewNularOp(GameNular(GameString, "triCheatStorePosition", TriCheatStorePosition));
     GGameState.NewNularOp(GameNular(GameString, "triCheatSaveGame", TriCheatSaveGame));
@@ -3131,6 +3216,10 @@ INIT_MODULE(GameStateExtTest, 3)
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerPosX", TriPlayerPosX));
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerPosY", TriPlayerPosY));
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerPosZ", TriPlayerPosZ));
+    GGameState.NewFunction(GameFunction(GameString, "triEarthLocation", TriEarthLocation, GameArray));
+    GGameState.NewFunction(GameFunction(GameString, "triEarthMoon", TriEarthMoon, GameArray));
+    GGameState.NewNularOp(GameNular(GameString, "triFreeFlyOff", TriFreeFlyOff));
+    GGameState.NewNularOp(GameNular(GameString, "triZeusBeam", TriZeusBeam));
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerGroundClearance", TriPlayerGroundClearance));
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerTerrainClearance", TriPlayerTerrainClearance));
     GGameState.NewNularOp(GameNular(GameScalar, "triPlayerContactGroundClearance", TriPlayerContactGroundClearance));
@@ -3243,9 +3332,24 @@ INIT_MODULE(GameStateExtTest, 3)
     GGameState.NewFunction(GameFunction(GameString, "triPhysicsShowcase", TriPhysicsShowcase, GameString));
     GGameState.NewFunction(GameFunction(GameString, "triTerrainBrushMode", TriTerrainBrushMode, GameString));
     GGameState.NewFunction(GameFunction(GameString, "triFreeFlyPose", TriFreeFlyPose, GameString));
+    GGameState.NewFunction(GameFunction(GameString, "triEarthGround", TriEarthGround, GameArray));
+    // Whole-world commands for mission makers (GameStateExtTestEarthGround.cpp).
+    GGameState.NewNularOp(GameNular(GameArray, "earthLocation", EarthLocation));
+    GGameState.NewFunction(GameFunction(GameArray, "earthPosToGeo", EarthPosToGeo, GameArray));
+    GGameState.NewFunction(GameFunction(GameArray, "earthGeoToPos", EarthGeoToPos, GameArray));
+    GGameState.NewFunction(GameFunction(GameBool, "earthGoTo", EarthGoTo, GameArray));
+    GGameState.NewFunction(GameFunction(GameArray, "earthGroundHeight", EarthGroundHeight, GameArray));
     GGameState.NewFunction(GameFunction(GameString, "triTerrainPaint", TriTerrainPaint, GameArray));
     GGameState.NewFunction(GameFunction(GameString, "triRocketCraters", TriRocketCraters, GameString));
     GGameState.NewFunction(GameFunction(GameScalar, "triTerrainHeight", TriTerrainHeight, GameArray));
+    GGameState.NewFunction(GameFunction(GameString, "triEnfusionDoor", TriEnfusionDoor, GameArray));
+    GGameState.NewFunction(GameFunction(GameString, "triEnfusionDoorSet", TriEnfusionDoorSet, GameArray));
+    GGameState.NewFunction(GameFunction(GameScalar, "triEnfusionDoorsAll", TriEnfusionDoorsAll, GameArray));
+    GGameState.NewFunction(GameFunction(GameScalar, "triEnfusionGlassBreakAll", TriEnfusionGlassBreakAll, GameArray));
+    GGameState.NewNularOp(GameNular(GameString, "triEnfusionDoorCensus", TriEnfusionDoorCensus));
+    GGameState.NewFunction(GameFunction(GameString, "triEnfusionGlass", TriEnfusionGlass, GameArray));
+    GGameState.NewFunction(GameFunction(GameString, "triEnfusionGlassBreak", TriEnfusionGlassBreak, GameScalar));
+    GGameState.NewNularOp(GameNular(GameString, "triEnfusionGlassCensus", TriEnfusionGlassCensus));
     GGameState.NewFunction(GameFunction(GameString, "triRadioDeliveryProbe", TriRadioDeliveryProbe, GameArray));
     GGameState.NewNularOp(GameNular(GameString, "triDevPanelSelectShadows", TriDevPanelSelectShadows));
     GGameState.NewNularOp(GameNular(GameString, "triDevPanelSelectMemory", TriDevPanelSelectMemory));

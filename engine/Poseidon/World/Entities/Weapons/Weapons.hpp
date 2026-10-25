@@ -75,6 +75,10 @@ class AmmoType: public VehicleNonAIType
 	/// asks for one. That keeps every existing mission and every upstream config
 	/// working unchanged, which matters more here than a nicer default.
 	float explosionTime;
+	/// AI-XRAY-003: thrown by hand -- some magazine fires it slower than 30 m/s as a shell (the engine's
+	/// hand-grenade test), set by MagazineType::Init. Such a round gets GrenadeFuse's hand-grenade fuse when
+	/// it declares no explosionTime of its own.
+	bool thrown = false;
 
 	Ref<Texture> _texture;
 	AmmoSimulation _simulation;
@@ -204,6 +208,9 @@ public:
 	LocalizedString _displayName;
 	float _magazineReloadTime;
 	SoundPars _sound;
+	// The shot of this weapon whatever magazine it fires (a3SoundShot[]): an Arma 3 weapon on a
+	// CWA carrier fires the carrier's magazines, whose modes hold the CWA shot sound.
+	SoundPars _shotSound;
 	SoundPars _reloadSound;
 	SoundPars _reloadMagazineSound;
 	float _reloadSoundDuration;
@@ -219,6 +226,18 @@ public:
 	bool _backgroundReload;
 	bool _opticsFlare;
 	bool _forceOptics;
+	// Arma 2 3D sights: the aiming view looks along the weapon from its model's "eye"
+	// memory point (WeaponType::_eyePos) instead of over _opticsModel. `optics3D=1`,
+	// written by the Arma 2 weapon importer; _opticsModel stays as the fallback.
+	bool _optics3D = false;
+	float _opticsZoomInit = -1.0f; // initial aiming field of view; <= 0 keeps the engine default
+	// --arma1, a weapon of several muzzles: the Arma 1 muzzle's own sight. _armaOptics its 2D
+	// modelOptics (the M4A1 M203 ACOG's rifle muzzle: optika_ACOG), _armaCamera the memory
+	// point its 3D sight looks from (its M203: "GL eye"); both empty for every other weapon.
+	RString _armaOptics;
+	RString _armaCamera;
+	mutable Vector3 _armaEyePos;
+	mutable bool _hasArmaEye = false;
 
 	int _canBeLocked;
 	int _primary;
@@ -261,6 +280,10 @@ public:
 #define MaskHardMounted			0x00010000	// hard mounted
 #define MaskSlotHandGun			0x00000002	// hand gun
 #define MaskSlotHandGunItem	0x000000E0	// hand gun magazines
+// --arma1: eight more hand gun magazine slots on a man. Arma 1 carries eight pistol
+// magazines (CWA four) and the three bits above hold seven; bit 0x4 is free in CWA (Arma 1's
+// launcher bit, which the importer rewrites as CWA's 0x10). Never set on a magazine.
+#define MaskSlotHandGunItemHigh	0x00000004
 
 inline int GetItemSlotsCount(int slots)
 {
@@ -269,7 +292,7 @@ inline int GetItemSlotsCount(int slots)
 
 inline int GetHandGunItemSlotsCount(int slots)
 {
-	return (slots & MaskSlotHandGunItem) >> 5;	// =  / 0x0020
+	return ((slots & MaskSlotHandGunItem) >> 5) + ((slots & MaskSlotHandGunItemHigh) ? 8 : 0);	// =  / 0x0020
 }
 
 class WeaponType : public RefCount
@@ -290,6 +313,9 @@ public:
 	mutable Ref<LODShapeWithShadow> _model;
 	mutable AnimationAnimatedTexture _animFire;
 	mutable int _shapeRef;
+	// _model's "eye" memory point (Arma 2 weapons): where a 3D-sighted muzzle looks from
+	mutable Vector3 _eyePos;
+	mutable bool _hasEyePos = false;
 
 	mutable AnimationRotation _revolving;
 
@@ -319,6 +345,10 @@ typedef BankInitArray<WeaponType> WeaponTypeBank;
 
 extern MagazineTypeBank MagazineTypes;
 extern WeaponTypeBank WeaponTypes;
+
+// Every muzzle already built that takes `baseMagazine` also takes `magazine` from now on
+// (--arma1: a generated A1x_ magazine of another round count on a CWA magazine).
+void AddMagazineToMuzzlesTaking(const char* baseMagazine, const char* magazine);
 
 } // namespace Poseidon
 namespace Poseidon::Foundation {

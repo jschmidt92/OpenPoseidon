@@ -10,6 +10,9 @@
 
 // Group(4) terrain heightmap + surface_y/surface_grad, shared with shader3d / shadow_depth /
 // gpu_driven, so the GPU shadow silhouette conforms ClipLand vegetation to the same ground.
+// naga 30 / wgpu 30: binding_array needs its enable extension (before any #import or declaration).
+enable wgpu_binding_array;
+
 #import conform::{surface_y}
 
 // group(0): this cascade's light view-projection + the camera world position the casters are
@@ -71,13 +74,20 @@ struct SectionMaterial {
     // NormalPower + pads: the shadow pass never shades, present only so this mirror
     // stays field-for-field with SectionMaterialGpu (272 bytes, 16 stride).
     normal_power: f32,
-    _pad_np0: u32,
+    // RFG-181: Enfusion NormalsToCamera (bit 15 on, 0-14 distance dm, 16-31 height dm i16).
+    far_normals: u32,
     _pad_np1: u32,
     _pad_np2: u32,
     // Crown AO lanes: the shadow pass never shades, present only so this mirror
     // stays field-for-field with SectionMaterialGpu (304 bytes, 16 stride).
     crown_ao_p0: vec4<f32>,
     crown_ao_p1: vec4<f32>,
+    native_pbr_scales: vec4<f32>,
+    layer_mask: array<vec4<f32>, 3>,
+    srgb_bcr_slots: vec4<u32>,
+    global_normal_uv: vec4<f32>,
+    detail_normal_strength: vec4<f32>,
+    global_overlay: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> pass_data: PassData;

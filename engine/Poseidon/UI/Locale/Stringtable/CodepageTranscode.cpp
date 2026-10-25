@@ -635,8 +635,78 @@ Codepage SelectLegacyTextCodepage(const std::string& input, Codepage preferredCp
     return best ? best->cp : preferredCp;
 }
 
+bool DecodeUtf16BomToUtf8(const char* data, size_t size, std::string& out)
+{
+    if (!data || size < 2)
+        return false;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(data);
+    const bool little = bytes[0] == 0xFF && bytes[1] == 0xFE;
+    const bool big = bytes[0] == 0xFE && bytes[1] == 0xFF;
+    if (!little && !big)
+        return false;
+    std::string result;
+    result.reserve(size);
+    const auto unit = [&](size_t i) -> unsigned
+    { return little ? (bytes[i] | (bytes[i + 1] << 8)) : ((bytes[i] << 8) | bytes[i + 1]); };
+    for (size_t i = 2; i + 1 < size; i += 2)
+    {
+        // A UTF-16LE file once written through a TEXT-mode stream has a 0x0D byte inserted before
+        // every line feed's 0x0A: "0A 00" became "0D 0A 00", one byte out of step. Read as units
+        // that is U+0A0D, U+0D00 -- two boxes at every line break, and every later character on
+        // the odd byte. Arma 1's campaign briefings are stored exactly like that (ca.pbo,
+        // m09convoyattack: boxes around each paragraph). Take the three bytes as one line feed.
+        if (little && bytes[i] == 0x0D && bytes[i + 1] == 0x0A && i + 2 < size && bytes[i + 2] == 0x00)
+        {
+            result.push_back('\n');
+            i += 1; // with the loop's 2: past all three bytes, back on a unit boundary
+            continue;
+        }
+        unsigned cp = unit(i);
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < size)
+        {
+            const unsigned low = unit(i + 2);
+            if (low >= 0xDC00 && low <= 0xDFFF)
+            {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                i += 2;
+            }
+            else
+                cp = 0xFFFD;
+        }
+        else if (cp >= 0xD800 && cp <= 0xDFFF)
+            cp = 0xFFFD;
+        if (cp == 0)
+            continue; // embedded NULs would truncate RString consumers
+        if (cp < 0x80)
+            result.push_back(static_cast<char>(cp));
+        else if (cp < 0x800)
+        {
+            result.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else if (cp < 0x10000)
+        {
+            result.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else
+        {
+            result.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            result.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    out = std::move(result);
+    return true;
+}
+
 std::string DecodeLegacyTextToUtf8(const std::string& input, Codepage preferredCp)
 {
+    std::string utf16Decoded;
+    if (DecodeUtf16BomToUtf8(input.data(), input.size(), utf16Decoded))
+        return utf16Decoded;
     const Codepage selected = SelectLegacyTextCodepage(input, preferredCp);
     if (selected == Codepage::Utf8)
     {

@@ -32,7 +32,7 @@ struct CullParams {
     instance_count: u32,
     variant_capacity: u32,   // max args per pipeline variant (partition stride into out_args)
     variant_count: u32,
-    debug_flags: u32,        // bit 0 = no frustum; bit 1 = positive main-camera authority
+    debug_flags: u32,        // bit 0 = no frustum; bit 1 = positive main-camera authority; bit 3 = no coop walk (WGPU-030)
     // Occlusion (main_occlude only; ignored by main). view_proj is the CAMERA-RELATIVE
     // proj*view (translation zeroed) that projects a camera-relative point to clip; the
     // Hi-Z is sampled with the resulting screen rect + reversed-Z depth (see occluded()).
@@ -43,7 +43,8 @@ struct CullParams {
     // Private diagnostic target; Rust CullParamsGpu carries the same aligned tail.
     target_model_id: u32,
     target_count_enabled: u32,
-    _target_pad: vec2<u32>,
+    lod_floor_dist2: f32,    // LOD metric floor for coarse depth-only views (0 = off)
+    _target_pad: u32,
 };
 
 struct Instance {
@@ -75,7 +76,9 @@ struct Lod {
     resolution: f32,         // _resolutions[i]
     section_base: u32,       // first entry in sections[]
     section_count: u32,
-    is_decal: u32,           // 1 = decal LOD (stepped past by the noDecal rule)
+    is_decal: u32,           // bit 0: decal LOD (stepped past by the noDecal rule); bit 1: LOD-STREAM
+                             // not resident (its meshes are evicted) -- classify takes the next
+                             // coarser resident level instead
 };
 
 struct Section {
@@ -141,6 +144,33 @@ struct Record {
 // The histogram is the point of this block: the standing hypothesis is that detailed building
 // and vegetation LODs stay active too far out, and only a per-level population count can test it.
 const STAT_BASE: u32 = 4u;
+
+// WGPU-030 -- cooperative section loops for instances whose LOD has many sections.
+//
+// COUNT, what-if and SCATTER each walk every section of the instance's LOD, and one thread owns one
+// instance, so a model with hundreds of sections (a large building addon: ~300 sections per module,
+// measured 2026-10-21 at cull_total 3.7-4.1 ms for 615 instances) becomes a serial chain of ~7 x 300
+// global-memory steps on a handful of threads. Such an instance is handed to the whole workgroup
+// instead: its owner thread still classifies it and records the per-instance accounting, then all 64
+// threads stride over its sections. The per-section atomics and the integer what-if sums are the
+// same operations in a different order, so every count, run and draw argument is identical; only the
+// order of instances inside one instanced run can differ, and that order was already set by atomics.
+// debug_flags bit 3 (WGR_CULL_COOP=0) restores the one-thread walk.
+const CULL_NO_COOP: u32 = 8u;
+const COOP_MIN_SECTIONS: u32 = 16u;
+const COOP_NONE: u32 = 0xFFFFFFFFu;
+var<workgroup> wg_coop_inst: array<u32, 64>;
+var<workgroup> wg_coop_level: array<u32, 64>;
+var<workgroup> wg_coop_dist2: array<f32, 64>;
+
+// True when the workgroup, not the owner thread, walks this LOD's sections.
+fn coop_owns(section_count: u32) -> bool {
+    return (cull.debug_flags & CULL_NO_COOP) == 0u && section_count >= COOP_MIN_SECTIONS;
+}
+
+fn selected_lod(idx: u32, level: u32) -> Lod {
+    return lods[models[instances[idx].model].lod_base + level];
+}
 
 fn outside_frustum(center: vec3<f32>, radius: f32) -> bool {
     for (var i = 0u; i < 6u; i++) {
@@ -225,7 +255,9 @@ fn classify(idx: u32) -> CullResult {
     }
 
     // Sub-pixel: diameter² < (pixel_limit * lod_scale)² * detail²  -> too small to see.
-    let detail2 = dist2 * cull.lod_inv_width * cull.lod_inv_width;
+    // A coarse depth-only view (weather cover, far shadow cascade) floors the metric at the
+    // distance where a main-view pixel spans one of its texels; the main view leaves it 0.
+    let detail2 = max(dist2, cull.lod_floor_dist2) * cull.lod_inv_width * cull.lod_inv_width;
     let diameter = model.bounding_sphere * 2.0 * scale;
     let px = cull.pixel_limit * cull.lod_scale;
     if (diameter * diameter < px * px * detail2) {
@@ -246,10 +278,16 @@ fn classify(idx: u32) -> CullResult {
         }
         i -= 1u;
         loop {
-            if (i == 0u || lods[model.lod_base + i].is_decal == 0u) { break; }
+            if (i == 0u || (lods[model.lod_base + i].is_decal & 1u) == 0u) { break; }
             i--;
         }
         level = i;
+    }
+    // LOD-STREAM: a level whose geometry is evicted draws the nearest coarser resident one
+    // until it is restored (the CPU keeps the coarsest level resident, always).
+    loop {
+        if (level + 1u >= model.lod_count || (lods[model.lod_base + level].is_decal & 2u) == 0u) { break; }
+        level++;
     }
 
     // Visual-only authored far tier, shared by colour and shadow culls. Never
@@ -257,7 +295,7 @@ fn classify(idx: u32) -> CullResult {
     if ((inst.flags & 16u) != 0u && model.lod_count > 0u) {
         var far_level = model.lod_count - 1u;
         loop {
-            if (far_level == 0u || lods[model.lod_base + far_level].is_decal == 0u) { break; }
+            if (far_level == 0u || (lods[model.lod_base + far_level].is_decal & 1u) == 0u) { break; }
             far_level--;
         }
         level = far_level;
@@ -285,11 +323,17 @@ fn classify(idx: u32) -> CullResult {
 fn count_sections(idx: u32, level: u32) {
     let lod_base = models[instances[idx].model].lod_base;
     let lod = lods[lod_base + level];
-    for (var s = 0u; s < lod.section_count; s++) {
-        atomicAdd(&sec_count[lod.section_base + s], 1u);
+    // WGPU-030: a many-section LOD is tallied by the workgroup (coop_count); the per-instance
+    // accounting below stays with the owner thread so it is recorded exactly once.
+    if (!coop_owns(lod.section_count)) {
+        for (var s = 0u; s < lod.section_count; s++) {
+            atomicAdd(&sec_count[lod.section_base + s], 1u);
+        }
     }
-    atomicAdd(&counters[STAT_BASE + 0u], 1u);
-    atomicAdd(&counters[STAT_BASE + 8u + min(level, 7u)], 1u);
+    // PERF-RFG-206: per-workgroup, published once by whatif_flush (STAT 0 and the 8-bin level
+    // histogram at STAT 8..15 were two more same-word global atomics per surviving instance).
+    atomicAdd(&wg_whatif[4], 1u);
+    atomicAdd(&wg_whatif[5u + min(level, 7u)], 1u);
     // COUNT sees the surviving instance and its exact model together. A zero-section
     // LOD still counts as present, conservatively, for any future retirement.
     if (cull.target_count_enabled != 0u &&
@@ -323,7 +367,7 @@ fn level_for(lod_base: u32, lod_count: u32, resol2: f32) -> u32 {
     }
     i -= 1u;
     loop {
-        if (i == 0u || lods[lod_base + i].is_decal == 0u) { break; }
+        if (i == 0u || (lods[lod_base + i].is_decal & 1u) == 0u) { break; }
         i--;
     }
     return i;
@@ -333,16 +377,20 @@ fn level_for(lod_base: u32, lod_count: u32, resol2: f32) -> u32 {
 // detail multipliers. Sub-pixel and distance culls are not re-evaluated -- the question is
 // what the SAME survivors would cost one step finer or coarser, which is the governor's
 // question. Costs four LOD walks and four section sums per surviving instance.
-fn whatif_triangles(idx: u32, dist2: f32) {
+// PERF-RFG-206: the what-if sums go through a per-workgroup accumulator and ONE global add per
+// workgroup (whatif_flush). Four global atomics on the same four words for every surviving
+// instance in every view serialised the COUNT passes (Everon: cull_total 3.4 ms of a 20 ms frame).
+// [0..3] what-if sums (STAT 16..19), [4] survivors (STAT 0), [5..12] level histogram (STAT 8..15).
+var<workgroup> wg_whatif: array<atomic<u32>, 13>;
+
+// The four what-if levels of one instance, shared by the one-thread and the cooperative sums so
+// both pick exactly the same levels from exactly the same float expressions.
+fn whatif_levels(idx: u32, dist2: f32) -> vec4<u32> {
     let inst = instances[idx];
     let model = models[inst.model];
     if ((inst.flags & 16u) != 0u) {
         let level = level_for(model.lod_base, model.lod_count, 1.0e30);
-        let tris = lod_triangles(model.lod_base, level);
-        for (var i = 16u; i < 20u; i++) {
-            atomicAdd(&counters[STAT_BASE + i], tris);
-        }
-        return;
+        return vec4<u32>(level, level, level, level);
     }
     let base_detail2 = dist2 * cull.lod_inv_width * cull.lod_inv_width;
     let scale2 = cull.lod_scale * cull.lod_scale;
@@ -350,14 +398,52 @@ fn whatif_triangles(idx: u32, dist2: f32) {
     let f1 = 0.70710678;
     let f2 = 1.41421356;
     let f3 = 2.0;
-    let t0 = lod_triangles(model.lod_base, level_for(model.lod_base, model.lod_count, base_detail2 * f0 * f0 * scale2));
-    let t1 = lod_triangles(model.lod_base, level_for(model.lod_base, model.lod_count, base_detail2 * f1 * f1 * scale2));
-    let t2 = lod_triangles(model.lod_base, level_for(model.lod_base, model.lod_count, base_detail2 * f2 * f2 * scale2));
-    let t3 = lod_triangles(model.lod_base, level_for(model.lod_base, model.lod_count, base_detail2 * f3 * f3 * scale2));
-    atomicAdd(&counters[STAT_BASE + 16u], t0);
-    atomicAdd(&counters[STAT_BASE + 17u], t1);
-    atomicAdd(&counters[STAT_BASE + 18u], t2);
-    atomicAdd(&counters[STAT_BASE + 19u], t3);
+    return vec4<u32>(level_for(model.lod_base, model.lod_count, base_detail2 * f0 * f0 * scale2),
+                     level_for(model.lod_base, model.lod_count, base_detail2 * f1 * f1 * scale2),
+                     level_for(model.lod_base, model.lod_count, base_detail2 * f2 * f2 * scale2),
+                     level_for(model.lod_base, model.lod_count, base_detail2 * f3 * f3 * scale2));
+}
+
+fn whatif_triangles(idx: u32, dist2: f32) {
+    let lod_base = models[instances[idx].model].lod_base;
+    let l = whatif_levels(idx, dist2);
+    // WGPU-030: a level the previous step already summed is not summed again (level_for never
+    // decreases as resol2 grows, so repeats are adjacent; a one-LOD model picks level 0 four
+    // times, the far tier one level four times). Same totals, up to a quarter of the walk.
+    let t0 = lod_triangles(lod_base, l.x);
+    var t1 = t0;
+    if (l.y != l.x) { t1 = lod_triangles(lod_base, l.y); }
+    var t2 = t1;
+    if (l.z != l.y) { t2 = lod_triangles(lod_base, l.z); }
+    var t3 = t2;
+    if (l.w != l.z) { t3 = lod_triangles(lod_base, l.w); }
+    atomicAdd(&wg_whatif[0], t0);
+    atomicAdd(&wg_whatif[1], t1);
+    atomicAdd(&wg_whatif[2], t2);
+    atomicAdd(&wg_whatif[3], t3);
+}
+
+// Thread 0 of the workgroup publishes the workgroup's what-if sums. Call from uniform control
+// flow after a barrier that follows every whatif_triangles (and, WGPU-030, coop_count) of the group.
+fn whatif_flush(local: u32) {
+    if (local == 0u) {
+        for (var i = 0u; i < 4u; i++) {
+            let v = atomicLoad(&wg_whatif[i]);
+            if (v != 0u) {
+                atomicAdd(&counters[STAT_BASE + 16u + i], v);
+            }
+        }
+        let survivors = atomicLoad(&wg_whatif[4]);
+        if (survivors != 0u) {
+            atomicAdd(&counters[STAT_BASE + 0u], survivors);
+        }
+        for (var l = 0u; l < 8u; l++) {
+            let v = atomicLoad(&wg_whatif[5u + l]);
+            if (v != 0u) {
+                atomicAdd(&counters[STAT_BASE + 8u + l], v);
+            }
+        }
+    }
 }
 
 // Pass SCATTER (1 thread / surviving instance): append this instance's record into each of its
@@ -365,6 +451,9 @@ fn whatif_triangles(idx: u32, dist2: f32) {
 fn scatter_sections(idx: u32, level: u32) {
     let lod_base = models[instances[idx].model].lod_base;
     let lod = lods[lod_base + level];
+    if (coop_owns(lod.section_count)) {
+        return; // WGPU-030: coop_scatter fills this instance's runs
+    }
     let n_rec = arrayLength(&out_records);
     for (var s = 0u; s < lod.section_count; s++) {
         let gsec = lod.section_base + s;
@@ -373,6 +462,72 @@ fn scatter_sections(idx: u32, level: u32) {
         // still bumps here, but its writes past the end are dropped — nothing draws them anyway.
         if (slot < n_rec) {
             out_records[slot] = Record(idx, gsec);
+        }
+    }
+}
+
+// --- WGPU-030 cooperative walks. Called by every thread of the workgroup after the barrier; each
+// thread takes every 64th section of every instance the workgroup published. No barrier inside, so
+// the data-dependent branches below are fine for uniformity.
+
+// Partial triangle sum of one LOD over this thread's stride (lod_triangles, split 64 ways).
+fn coop_lod_triangles(lod_base: u32, level: u32, li: u32) -> u32 {
+    let lod = lods[lod_base + level];
+    var tris = 0u;
+    for (var s = li; s < lod.section_count; s += 64u) {
+        tris += sections[lod.section_base + s].index_count / 3u;
+    }
+    return tris;
+}
+
+// whatif_triangles for one published instance, with the section sums split across the workgroup
+// and gathered in wg_whatif (one global atomic per word per workgroup, see whatif_flush).
+fn coop_whatif(idx: u32, dist2: f32, li: u32) {
+    let lod_base = models[instances[idx].model].lod_base;
+    let l = whatif_levels(idx, dist2);
+    let t0 = coop_lod_triangles(lod_base, l.x, li);
+    var t1 = t0;
+    if (l.y != l.x) { t1 = coop_lod_triangles(lod_base, l.y, li); }
+    var t2 = t1;
+    if (l.z != l.y) { t2 = coop_lod_triangles(lod_base, l.z, li); }
+    var t3 = t2;
+    if (l.w != l.z) { t3 = coop_lod_triangles(lod_base, l.w, li); }
+    if (t0 != 0u) { atomicAdd(&wg_whatif[0], t0); }
+    if (t1 != 0u) { atomicAdd(&wg_whatif[1], t1); }
+    if (t2 != 0u) { atomicAdd(&wg_whatif[2], t2); }
+    if (t3 != 0u) { atomicAdd(&wg_whatif[3], t3); }
+}
+
+// COUNT half: tally every published instance into its sections, plus its what-if share.
+fn coop_count(li: u32) {
+    for (var t = 0u; t < 64u; t++) {
+        let idx = wg_coop_inst[t];
+        if (idx == COOP_NONE) {
+            continue;
+        }
+        let lod = selected_lod(idx, wg_coop_level[t]);
+        for (var s = li; s < lod.section_count; s += 64u) {
+            atomicAdd(&sec_count[lod.section_base + s], 1u);
+        }
+        coop_whatif(idx, wg_coop_dist2[t], li);
+    }
+}
+
+// SCATTER half: append every published instance's record into each of its sections' runs.
+fn coop_scatter(li: u32) {
+    let n_rec = arrayLength(&out_records);
+    for (var t = 0u; t < 64u; t++) {
+        let idx = wg_coop_inst[t];
+        if (idx == COOP_NONE) {
+            continue;
+        }
+        let lod = selected_lod(idx, wg_coop_level[t]);
+        for (var s = li; s < lod.section_count; s += 64u) {
+            let gsec = lod.section_base + s;
+            let slot = atomicAdd(&sec_count[gsec], 1u);
+            if (slot < n_rec) {
+                out_records[slot] = Record(idx, gsec);
+            }
         }
     }
 }
@@ -452,37 +607,73 @@ fn occluded(center: vec3<f32>, radius: f32) -> bool {
 // see the SAME survivors — an instance counted in a section is scattered into that same run.
 
 // Frustum + distance + LOD only (prepass / occluder set, and every shadow cascade). No Hi-Z.
+// WGPU-030: no early return before the barrier -- every thread of the workgroup must reach it.
 @compute @workgroup_size(64)
-fn count(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn count(@builtin(global_invocation_id) gid: vec3<u32>,
+         @builtin(local_invocation_index) li: u32) {
+    if (li < 13u) {
+        atomicStore(&wg_whatif[li], 0u);
+    }
+    workgroupBarrier();
     let idx = gid.x;
-    if (idx >= cull.instance_count) {
-        return;
+    var coop_idx = COOP_NONE;
+    var coop_level = 0u;
+    var coop_dist2 = 0.0;
+    if (idx < cull.instance_count) {
+        let res = classify(idx);
+        if (!res.culled) {
+            count_sections(idx, res.level);
+            if (coop_owns(selected_lod(idx, res.level).section_count)) {
+                coop_idx = idx;
+                coop_level = res.level;
+                coop_dist2 = res.dist2;
+            } else {
+                whatif_triangles(idx, res.dist2);
+            }
+        }
     }
-    let res = classify(idx);
-    if (res.culled) {
-        return;
-    }
-    count_sections(idx, res.level);
-    whatif_triangles(idx, res.dist2);
+    wg_coop_inst[li] = coop_idx;
+    wg_coop_level[li] = coop_level;
+    wg_coop_dist2[li] = coop_dist2;
+    workgroupBarrier();
+    coop_count(li);
+    workgroupBarrier();
+    whatif_flush(li);
 }
 
 // Frustum + distance + LOD + Hi-Z occlusion (color pass). COUNT half; must agree with the
 // occlusion-view SCATTER (classify + occluded are pure, so both passes see the same survivors).
 @compute @workgroup_size(64)
-fn count_occlude(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn count_occlude(@builtin(global_invocation_id) gid: vec3<u32>,
+                 @builtin(local_invocation_index) li: u32) {
+    if (li < 13u) {
+        atomicStore(&wg_whatif[li], 0u);
+    }
+    workgroupBarrier();
     let idx = gid.x;
-    if (idx >= cull.instance_count) {
-        return;
+    var coop_idx = COOP_NONE;
+    var coop_level = 0u;
+    var coop_dist2 = 0.0;
+    if (idx < cull.instance_count) {
+        let res = classify(idx);
+        if (!res.culled && !(cull.occlusion != 0u && occluded(res.center, res.radius))) {
+            count_sections(idx, res.level);
+            if (coop_owns(selected_lod(idx, res.level).section_count)) {
+                coop_idx = idx;
+                coop_level = res.level;
+                coop_dist2 = res.dist2;
+            } else {
+                whatif_triangles(idx, res.dist2);
+            }
+        }
     }
-    let res = classify(idx);
-    if (res.culled) {
-        return;
-    }
-    if (cull.occlusion != 0u && occluded(res.center, res.radius)) {
-        return;
-    }
-    count_sections(idx, res.level);
-    whatif_triangles(idx, res.dist2);
+    wg_coop_inst[li] = coop_idx;
+    wg_coop_level[li] = coop_level;
+    wg_coop_dist2[li] = coop_dist2;
+    workgroupBarrier();
+    coop_count(li);
+    workgroupBarrier();
+    whatif_flush(li);
 }
 
 // EMIT (1 thread / GLOBAL section): allocate the section's contiguous out_records run and emit
@@ -535,31 +726,46 @@ fn emit_args(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // SCATTER half (main / prepass / shadow views). No Hi-Z.
 @compute @workgroup_size(64)
-fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn scatter(@builtin(global_invocation_id) gid: vec3<u32>,
+           @builtin(local_invocation_index) li: u32) {
     let idx = gid.x;
-    if (idx >= cull.instance_count) {
-        return;
+    var coop_idx = COOP_NONE;
+    var coop_level = 0u;
+    if (idx < cull.instance_count) {
+        let res = classify(idx);
+        if (!res.culled) {
+            scatter_sections(idx, res.level);
+            if (coop_owns(selected_lod(idx, res.level).section_count)) {
+                coop_idx = idx;
+                coop_level = res.level;
+            }
+        }
     }
-    let res = classify(idx);
-    if (res.culled) {
-        return;
-    }
-    scatter_sections(idx, res.level);
+    wg_coop_inst[li] = coop_idx;
+    wg_coop_level[li] = coop_level;
+    workgroupBarrier();
+    coop_scatter(li);
 }
 
 // SCATTER half (color pass, Hi-Z occlusion). Must apply the SAME tests as count_occlude.
 @compute @workgroup_size(64)
-fn scatter_occlude(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn scatter_occlude(@builtin(global_invocation_id) gid: vec3<u32>,
+                   @builtin(local_invocation_index) li: u32) {
     let idx = gid.x;
-    if (idx >= cull.instance_count) {
-        return;
+    var coop_idx = COOP_NONE;
+    var coop_level = 0u;
+    if (idx < cull.instance_count) {
+        let res = classify(idx);
+        if (!res.culled && !(cull.occlusion != 0u && occluded(res.center, res.radius))) {
+            scatter_sections(idx, res.level);
+            if (coop_owns(selected_lod(idx, res.level).section_count)) {
+                coop_idx = idx;
+                coop_level = res.level;
+            }
+        }
     }
-    let res = classify(idx);
-    if (res.culled) {
-        return;
-    }
-    if (cull.occlusion != 0u && occluded(res.center, res.radius)) {
-        return;
-    }
-    scatter_sections(idx, res.level);
+    wg_coop_inst[li] = coop_idx;
+    wg_coop_level[li] = coop_level;
+    workgroupBarrier();
+    coop_scatter(li);
 }

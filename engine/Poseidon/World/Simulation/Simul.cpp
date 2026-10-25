@@ -1,3 +1,4 @@
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <cstdlib>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
@@ -45,6 +46,17 @@
 #endif
 
 #include <Poseidon/Foundation/Math/Statistics.hpp>
+
+namespace
+{
+// Editor-given names (units, vehicles, triggers) are read-only in OFP; Arma 1
+// missions reassign them ("defend=0" for a trigger named defend), so under
+// --arma1 they are ordinary variables.
+inline bool EditorNamesReadOnly()
+{
+    return !Poseidon::Arma1Compat::Active();
+}
+} // namespace
 
 using namespace Poseidon;
 bool IsDedicatedServer();
@@ -1338,7 +1350,8 @@ void Entity::PlaceOnSurface(Matrix4& trans)
     float dx, dz;
     Vector3 pos;
     pos = trans.Position();
-    pos[1] = GLandscape->RoadSurfaceYAboveWater(pos, &dx, &dz);
+    // Sinkhole W5: searched from no lower than the drawn terrain (Landscape::SurfacePlacementProbe)
+    pos[1] = GLandscape->RoadSurfaceYAboveWater(GLandscape->SurfacePlacementProbe(pos), &dx, &dz);
 
     LODShape* shape = GetShape();
 
@@ -1353,7 +1366,11 @@ void Entity::PlaceOnSurface(Matrix4& trans)
         Matrix4 newTransform;
         newTransform.SetUpAndDirection(up, trans.Direction());
     }
-    if (!Static())
+    // An Arma ODOL model (AnimationOrigin set: stored around its bounding centre) stands on its
+    // land contact / geometry like a vehicle, as Arma places objects: through its bounding
+    // centre alone the Arma 1 tents, MASH and houses a mission placed sat half in the ground.
+    const bool armaModel = shape->AnimationOrigin().SquareSize() > 1e-8f;
+    if (!Static() || armaModel)
     {
         Shape* geom = shape->LandContactLevel();
         if (!geom)
@@ -1835,7 +1852,7 @@ Entity* Entity::CreateObject(NetworkMessageContext& ctx)
     if (name.GetLength() > 0)
     {
         veh->SetVarName(name);
-        GWorld->GetGameState()->VarSet(name, GameValueExt(veh), true);
+        GWorld->GetGameState()->VarSet(name, GameValueExt(veh), EditorNamesReadOnly());
     }
 
     NetworkId objectId;

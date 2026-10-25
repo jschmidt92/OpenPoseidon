@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Poseidon/World/Model/Model.hpp>
+#include <Poseidon/Asset/Formats/P3D/MLODTangentFrames.hpp>
 #include <Poseidon/World/Model/ModelComputation.hpp>
 #include <Poseidon/Asset/Formats/P3D/MLODStructures.hpp>
 #include <Poseidon/Asset/Formats/BISBinaryStream.hpp>
@@ -8,6 +9,7 @@
 #include <Poseidon/Core/Types.hpp>
 #include <Poseidon/Graphics/Rendering/Draw/SpecLods.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
@@ -44,7 +46,8 @@ class MLODLoader
         return loadFromBuffer(buffer.data(), static_cast<int>(buffer.size()), filePath);
     }
 
-    static Model loadFromBuffer(const char* data, int size, const std::string& sourcePath)
+    static Model loadFromBuffer(const char* data, int size, const std::string& sourcePath,
+                                const MLOD::TangentFrames* frames = nullptr)
     {
         QIStream     stream(const_cast<char*>(data), size);
         BinaryReader reader(stream);
@@ -57,7 +60,7 @@ class MLODLoader
         model.sourceVersion = header.versionMajor * 10 + header.versionMinor;
 
         for (uint32_t lodIdx = 0; lodIdx < header.lodCount; ++lodIdx)
-            model.lodLevels.push_back(loadLOD(reader, lodIdx));
+            model.lodLevels.push_back(loadLOD(reader, lodIdx, frames && lodIdx < frames->size() ? &(*frames)[lodIdx] : nullptr));
 
         return model;
     }
@@ -75,7 +78,7 @@ class MLODLoader
     // is only knowable by parsing it, which is AST-011B. Guessing a length would
     // resynchronise on arbitrary bytes and yield a model that loads and is wrong,
     // which is worse than one that refuses.
-    static LODLevel loadLOD(BinaryReader& reader, uint32_t lodIndex)
+    static LODLevel loadLOD(BinaryReader& reader, uint32_t lodIndex, const MLOD::LodTangentFrames* frames)
     {
         const MLOD::LodSignature signature = MLOD::peekLodSignature(reader);
         switch (signature)
@@ -83,7 +86,7 @@ class MLODLoader
             case MLOD::LodSignature::SP3X:
                 return loadSP3XLOD(reader);
             case MLOD::LodSignature::P3DM:
-                return loadP3DMLOD(reader);
+                return loadP3DMLOD(reader, frames);
             default:
                 throw MLOD::UnsupportedLodFormat(
                     signature, lodIndex,
@@ -136,7 +139,7 @@ class MLODLoader
     // encodings differ in how the tables are stored, not in what they mean, so a
     // second converter would be a second place for the winding and vertex-merge
     // rules to drift apart.
-    static LODLevel loadP3DMLOD(BinaryReader& reader)
+    static LODLevel loadP3DMLOD(BinaryReader& reader, const MLOD::LodTangentFrames* frames)
     {
         LODLevel lod;
         auto     header = MLOD::readP3DMHeader(reader);
@@ -154,7 +157,10 @@ class MLODLoader
         auto     taggData    = MLOD::readP3DMTAGGSection(reader, header.nPos, header.nFace, totalFaceVertices);
 
         convertUVChannels(lod, faceTable, taggData);
-        auto vertexToPoint = convertGeometry(lod.mesh, vertexTable, normalTable, faceTable, taggData);
+        // A correctly sized sidecar may contain invalid corners. Preserve valid
+        // authored seams; each invalid corner keeps generated-frame fallback.
+        if (frames && frames->size() != faceTable.faces.size()) frames = nullptr;
+        auto vertexToPoint = convertGeometry(lod.mesh, vertexTable, normalTable, faceTable, taggData, frames);
         convertMaterials(lod.mesh, faceTable);
         convertSelections(lod.mesh, taggData.namedSelections, vertexTable, faceTable, vertexToPoint);
         convertProperties(lod.mesh, taggData.namedProperties);
@@ -266,7 +272,8 @@ class MLODLoader
                                                  const MLOD::VertexTable& vertexTable,
                                                  const MLOD::NormalTable& normalTable,
                                                  const MLOD::FaceTable&   faceTable,
-                                                 const MLOD::TAGGData&    taggData)
+                                                 const MLOD::TAGGData&    taggData,
+                                                 const MLOD::LodTangentFrames* frames = nullptr)
     {
         if (faceTable.faces.empty() && !vertexTable.points.empty())
         {
@@ -314,6 +321,10 @@ class MLODLoader
                 return false;
             if (std::abs(a.uv1.v - b.uv1.v) > precUV)
                 return false;
+            if (a.hasTangentFrame != b.hasTangentFrame) return false;
+            if (a.hasTangentFrame &&
+                (a.tangent.x != b.tangent.x || a.tangent.y != b.tangent.y || a.tangent.z != b.tangent.z ||
+                 a.binormal.x != b.binormal.x || a.binormal.y != b.binormal.y || a.binormal.z != b.binormal.z)) return false;
             return true;
         };
 
@@ -356,6 +367,16 @@ class MLODLoader
                             v.uv1 = Vector2((*uv1Source)[at], (*uv1Source)[at + 1]);
                     }
 
+                    if (frames && frames->size() == faceTable.faces.size())
+                    {
+                        const auto& frame = (*frames)[faceIndex][i];
+                        if (MLOD::ValidTangentFrame(frame))
+                        {
+                            v.tangent = frame.tangent;
+                            v.binormal = frame.binormal;
+                            v.hasTangentFrame = true;
+                        }
+                    }
                     uint32_t foundIndex = UINT32_MAX;
                     if (pointIndex >= 0 && pointIndex < static_cast<int32_t>(pointToVertices.size()))
                     {
@@ -412,6 +433,16 @@ class MLODLoader
                             v.uv1 = Vector2((*uv1Source)[at], (*uv1Source)[at + 1]);
                     }
 
+                    if (frames && frames->size() == faceTable.faces.size())
+                    {
+                        const auto& frame = (*frames)[faceIndex][i];
+                        if (MLOD::ValidTangentFrame(frame))
+                        {
+                            v.tangent = frame.tangent;
+                            v.binormal = frame.binormal;
+                            v.hasTangentFrame = true;
+                        }
+                    }
                     uint32_t foundIndex = UINT32_MAX;
                     if (pointIndex >= 0 && pointIndex < static_cast<int32_t>(pointToVertices.size()))
                     {
@@ -445,6 +476,56 @@ class MLODLoader
             }
         }
 
+        // In the point LODs (memory, land contact, hit points ... resolution 1e15 on) points no face uses -- the memory
+        // LOD's eye and weapon points beside its proxy triangles -- become vertices of their own, as in a LOD with no
+        // faces at all (above) and as the binarized form keeps them. Built from the faces alone, a LOD with both lost
+        // them, and every named selection on them came out empty. Visual and geometry LODs keep only face corners: a
+        // stray unused point there is an editing leftover, and the controlled MLOD path refuses unused vertices.
+        //
+        // One exception below the geometry LOD (WGPU-020: visual, pilot/cargo view, shadow-volume and edit LODs, all
+        // resolutions under 1e13): a loose point that a NAMED SELECTION holds is not
+        // a leftover, it is an axis or a marker the author placed on purpose. The engine reads several of those from
+        // a visual LOD -- the steering-wheel axis `osaVolantZac`/`osaVolantKon` comes from the pilot view LOD
+        // (Car.cpp, Motorcycle.cpp, Ship.cpp) -- and dropping the point left the selection empty ("No point in
+        // selection ...") and the wheel without an axis. The legacy SP3X loader keeps every point in every LOD
+        // (ShapeSetup.cpp), so keeping exactly the selected ones brings P3DM to the same answer. The extra vertices
+        // belong to no face, so nothing more is drawn. Geometry LODs (1e13 and the shadow/fire range below 1e15) are left
+        // alone: their selections feed the convex components, and a loose point there would widen a hull.
+        // POSEIDON_MLOD_SELECTION_POINTS=0 restores the old rule.
+        static const bool keepSelectedPoints = []
+        {
+            const char* v = std::getenv("POSEIDON_MLOD_SELECTION_POINTS");
+            return !v || v[0] != '0';
+        }();
+        std::vector<char> pointInSelection;
+        if (keepSelectedPoints && taggData.resolution < 1e13f)
+        {
+            pointInSelection.assign(pointToVertices.size(), 0);
+            for (const auto& sel : taggData.namedSelections)
+            {
+                const size_t n = std::min(sel.pointWeights.size(), pointInSelection.size());
+                for (size_t p = 0; p < n; ++p)
+                {
+                    if (sel.pointWeights[p] > 0)
+                        pointInSelection[p] = 1;
+                }
+            }
+        }
+        const bool keepLoosePoints = taggData.resolution >= 1e15f || !pointInSelection.empty();
+        for (size_t pointIdx = 0; keepLoosePoints && pointIdx < pointToVertices.size(); ++pointIdx)
+        {
+            if (!pointToVertices[pointIdx].empty())
+                continue;
+            if (taggData.resolution < 1e15f && !pointInSelection[pointIdx])
+                continue;
+            const auto& point = vertexTable.points[pointIdx];
+            Vertex v;
+            v.position = Vector3(point.position.x, point.position.y, point.position.z);
+            v.flags    = static_cast<VertexFlags>(convertPointFlagsToClipFlags(static_cast<uint32_t>(point.flags)));
+            pointToVertices[pointIdx].push_back(static_cast<uint32_t>(mesh.vertices.size()));
+            mesh.vertices.push_back(v);
+        }
+
         std::vector<int32_t> vertexToPoint(mesh.vertices.size(), -1);
         for (int32_t pointIdx = 0; pointIdx < static_cast<int32_t>(pointToVertices.size()); ++pointIdx)
         {
@@ -469,14 +550,32 @@ class MLODLoader
         // two distinct materials. Keying on the texture would merge those into a
         // single "#default#" material and silently discard the distinction this
         // ticket exists to preserve.
-        auto keyOf = [](const MLOD::DataFaceEx& face)
-        { return face.textureName + '|' + face.materialName; };
-
+        //
+        // One lookup per run of faces, not two string builds and two lookups per face:
+        // neighbouring faces almost always share their pair, and the same pair always maps
+        // to the same entry, so the result is the same.
         std::unordered_map<std::string, uint32_t> materialMap;
-        for (const auto& face : faceTable.faces)
+        std::vector<uint32_t> faceMaterial(faceTable.faces.size(), 0);
+        const MLOD::DataFaceEx* previous = nullptr;
+        uint32_t previousIndex = 0;
+        std::string key;
+        for (size_t faceIdx = 0; faceIdx < faceTable.faces.size(); ++faceIdx)
         {
-            const std::string key = keyOf(face);
-            if (materialMap.find(key) != materialMap.end())
+            const auto& face = faceTable.faces[faceIdx];
+            if (previous != nullptr && face.textureName == previous->textureName &&
+                face.materialName == previous->materialName)
+            {
+                faceMaterial[faceIdx] = previousIndex;
+                continue;
+            }
+            key.assign(face.textureName);
+            key += '|';
+            key += face.materialName;
+            const auto [slot, inserted] = materialMap.try_emplace(key, static_cast<uint32_t>(mesh.materials.size()));
+            previous = &face;
+            previousIndex = slot->second;
+            faceMaterial[faceIdx] = slot->second;
+            if (!inserted)
                 continue;
 
             Material mat;
@@ -491,14 +590,14 @@ class MLODLoader
             mat.texturePath  = face.textureName;
             mat.materialPath = face.materialName;
 
-            materialMap[key] = static_cast<uint32_t>(mesh.materials.size());
-            mesh.materials.push_back(mat);
+            mesh.materials.push_back(std::move(mat));
         }
 
         size_t triIdx = 0, quadIdx = 0;
-        for (const auto& face : faceTable.faces)
+        for (size_t faceIdx = 0; faceIdx < faceTable.faces.size(); ++faceIdx)
         {
-            const uint32_t materialIdx = materialMap[keyOf(face)];
+            const auto& face = faceTable.faces[faceIdx];
+            const uint32_t materialIdx = faceMaterial[faceIdx];
             if (face.n == 3)
             {
                 if (triIdx < mesh.triangles.size())

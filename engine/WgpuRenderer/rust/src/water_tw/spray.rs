@@ -413,7 +413,7 @@ impl SprayGpu {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         let mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tw_spray_mask"),
@@ -434,7 +434,7 @@ impl SprayGpu {
                 targets: &[Some(mask_target())],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         Self {
             ring,
@@ -532,7 +532,7 @@ impl SprayGpu {
                 0 => {}
                 1 => {
                     let mut h = [0u32; 8];
-                    h.copy_from_slice(bytemuck::cast_slice(&self.readback.slice(..).get_mapped_range()[..32]));
+                    h.copy_from_slice(bytemuck::cast_slice(&self.readback.slice(..).get_mapped_range().expect("wgpu: mapped range of a mapped buffer")[..32]));
                     self.readback.unmap();
                     self.stats = Some(SprayStats::from_head(&h));
                     self.rb_state = Readback::Idle;

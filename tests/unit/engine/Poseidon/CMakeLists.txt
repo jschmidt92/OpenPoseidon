@@ -18,6 +18,7 @@ set(POSEIDON_CORE_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Graphics/test_retail_world_stable_frame_observation.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Graphics/test_geometry_page_rigid_final_surface_certificate.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Support/test_stubs.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Game/Compat/test_arma3_eden.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Asset/Addon/test_config_replace.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/Asset/Formats/Common/test_format_detector.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/engine/Poseidon/UI/Locale/Stringtable/test_stringtable.cpp
@@ -196,6 +197,7 @@ set(POSEIDON_TEST_SOURCES
     Graphics/test_geometry_page_rigid_final_hierarchy_product.cpp
     Graphics/test_retail_page_record_observation.cpp
     Graphics/test_alpha_classify.cpp
+    Graphics/test_material_memo.cpp
     Graphics/test_surface_decompose.cpp
     Graphics/test_shadowmap_math.cpp
     Graphics/test_ephemeris.cpp
@@ -318,6 +320,7 @@ list(APPEND POSEIDON_TEST_SOURCES
     World/Model/test_shape_adapter_odol_animation.cpp
     World/Model/test_shape_adapter_tangent_basis.cpp
     World/Model/test_shape_adapter_collision.cpp
+    World/Model/test_shape_adapter_cfg_sections.cpp
     World/Model/test_shape_adapter_proxy.cpp
     World/Model/test_preparer_determinism.cpp
     World/Model/test_preparer_radius_certificate.cpp
@@ -365,6 +368,7 @@ list(APPEND POSEIDON_TEST_SOURCES
     Asset/Formats/Enfusion/test_resource_database.cpp
     Asset/Formats/Enfusion/test_xob_model.cpp
     Asset/Formats/Enfusion/test_xob_collision.cpp
+    Asset/Formats/Enfusion/test_prefab_resolve.cpp
     Foundation/Algorithms/test_lzo1x.cpp
     Graphics/Rendering/test_paa_lzo_replay_cache.cpp
     Graphics/Rendering/test_paa_dxt_bounds.cpp
@@ -437,10 +441,12 @@ list(APPEND POSEIDON_TEST_SOURCES
     World/test_terrain.cpp
     World/Terrain/test_water_surface_query.cpp
     World/Terrain/test_water_bodies.cpp
+    World/Terrain/test_crater_field.cpp
     World/Terrain/test_terrain_surface_catalog.cpp
     World/test_terrain_gpu_interp.cpp
     World/test_terrain_cdlod.cpp
     World/test_terrain_background.cpp
+    World/test_collision_nonfinite.cpp
     World/test_object_animated_bounds.cpp
     World/test_face_rig.cpp
     World/test_landscape_object_ids.cpp
@@ -506,6 +512,9 @@ list(APPEND POSEIDON_TEST_SOURCES
     # DIAG-001: diagnostics ported from Malprave (JSON helpers, stuck detector, event writer, diag_step)
     Dev/Diag/test_op_diag.cpp
 
+    # NPC chat: reply contract, order whitelist, provider wire formats, key hygiene
+    Dev/NpcChat/test_npc_chat.cpp
+
     # Mission introspection
     Game/Mission/test_mission_info.cpp
 
@@ -540,6 +549,7 @@ list(APPEND POSEIDON_TEST_SOURCES
     # Input tests (batch-14)
     Input/test_binding_conflict.cpp
     Input/test_combo_fire_regression.cpp
+    Input/test_lean_shared_keys.cpp
     Input/test_controls_category.cpp
     Input/test_input_codes.cpp
     Input/test_modifier_combos.cpp
@@ -645,6 +655,7 @@ list(APPEND POSEIDON_TEST_SOURCES
 
     # AI tests
     AI/test_ai.cpp
+    AI/test_danger_list.cpp
     AI/test_path_planner.cpp
     AI/test_simple_path_admission.cpp
     AI/test_entity_event_handlers.cpp
@@ -717,6 +728,8 @@ list(APPEND POSEIDON_TEST_SOURCES
     World/Simulation/test_cloth.cpp
     World/Simulation/test_uniform_wetness.cpp
     Graphics/Rendering/test_muzzle_flash_appearance.cpp
+    Graphics/Rendering/test_muzzle_burst.cpp
+    Graphics/Rendering/test_underwater.cpp
     World/Simulation/test_remote_interp.cpp
 
     # Tools shared library tests

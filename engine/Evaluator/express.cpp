@@ -130,9 +130,27 @@ void GameState::TypeError(GameType exp, GameType was, const char* name) const
 
 void GameState::vynech() const
 {
-    while (isspace(*_e->_pos))
+    for (;;)
     {
-        _e->_pos++;
+        while (isspace(*_e->_pos))
+        {
+            _e->_pos++;
+        }
+        // Arma 2 accepts C++ comments in code that never went through the preprocessor
+        // (init lines, triggers, waypoint statements).
+        if (s_singleQuoteStrings && _e->_pos[0] == '/' && _e->_pos[1] == '/')
+        {
+            while (*_e->_pos && *_e->_pos != '\n')
+                _e->_pos++;
+            continue;
+        }
+        if (s_singleQuoteStrings && _e->_pos[0] == '/' && _e->_pos[1] == '*')
+        {
+            const char* end = strstr(_e->_pos + 2, "*/");
+            _e->_pos = end ? end + 2 : _e->_pos + strlen(_e->_pos);
+            continue;
+        }
+        return;
     }
 }
 
@@ -219,14 +237,15 @@ GameValue GameState::Const() const
         }
         return VarGet(name);
     }
-    else if (*_e->_pos == '"')
+    else if (*_e->_pos == '"' || (*_e->_pos == '\'' && s_singleQuoteStrings))
     {
-        // string
+        // string ("..." always; '...' for Arma 2 content, see s_singleQuoteStrings)
+        const char quote = *_e->_pos;
         const char* start = ++_e->_pos;
         RString string = "";
         for (;;)
         {
-            while (*_e->_pos != '"')
+            while (*_e->_pos != quote)
             {
                 if (!*_e->_pos)
                 {
@@ -240,9 +259,9 @@ GameValue GameState::Const() const
             // check if another quote mark is encountered
             // if yes, append it, and continue parsing, otherwise we are done
             ++_e->_pos;
-            if (*_e->_pos == '"')
+            if (*_e->_pos == quote)
             {
-                string = string + RString("\"");
+                string = string + RString(quote == '"' ? "\"" : "'");
                 ++_e->_pos;
                 start = _e->_pos;
             }
@@ -264,15 +283,16 @@ GameValue GameState::Const() const
         for (;;)
         {
             // note: any quotes inside may prevent closing bracket
-            if (*end == '"')
+            if (*end == '"' || (*end == '\'' && s_singleQuoteStrings))
             {
+                const char quote = *end;
                 end++;
                 // skip anything until another quote mark
-                while (*end != 0 && *end != '"')
+                while (*end != 0 && *end != quote)
                 {
                     end++;
                 }
-                if (*end != '"')
+                if (*end != quote)
                 {
                     SetError(EvalCloseB);
                     return RString();
@@ -299,6 +319,8 @@ GameValue GameState::Const() const
         if (closed)
         {
             _e->_pos = end + 1;
+            if (s_codeValues)
+                return GameValue(new GameDataCode(RString(start, end - start)));
             return RString(start, end - start);
         }
         else
@@ -566,6 +588,8 @@ static GameValue Atan2(const GameState* state, GameValuePar oper1, GameValuePar 
 {
     if ((float)oper1 == 0 && (float)oper2 == 0)
     {
+        if (GameState::s_singleQuoteStrings)
+            return 0.0f; // Arma 1/2: 0 atan2 0 is 0 (BIS_fnc_dirTo of a standing unit)
         state->SetError(EvalDivZero);
         return 0.0f;
     }
@@ -591,6 +615,22 @@ static GameValue Odmocnina(const GameState* state, GameValuePar oper1)
 static GameValue Abs(const GameState* state, GameValuePar oper1)
 {
     return (float)fabs((float)oper1);
+}
+
+// Arma 1 additions (round half away from zero, as Arma does)
+static GameValue Round(const GameState* state, GameValuePar oper1)
+{
+    return (float)std::round((float)oper1);
+}
+
+static GameValue Floor(const GameState* state, GameValuePar oper1)
+{
+    return (float)std::floor((float)oper1);
+}
+
+static GameValue Ceil(const GameState* state, GameValuePar oper1)
+{
+    return (float)std::ceil((float)oper1);
 }
 
 static GameValue BoolNot(const GameState* state, GameValuePar oper1)
@@ -720,6 +760,25 @@ static GameValue ListSet(const GameState* state, GameValuePar oper1, GameValuePa
     return NOTHING;
 }
 
+// Thread-local storage for the value passed to exitWith { expr }.
+// Set by StringExitWith when the condition is true; read and cleared
+// by loop handlers (ForDoOp, StringRepeat) to propagate the exit value.
+static thread_local GameValue tls_exitWithValue;
+static GameValue TakeBreakOutValue(); // after GameState::BreakOutWithValue
+
+// exitWith in a called function leaves that function only: its value is the call's
+// value, and the caller carries on with its next statement.
+static GameValue CallResult(const GameState* state, GameValue ret)
+{
+    if (state->GetLastError() == EvalBreak && GameState::s_breakTarget.empty())
+    {
+        ret = tls_exitWithValue;
+        tls_exitWithValue = GameValue();
+        const_cast<GameState*>(state)->SetError(EvalOK);
+    }
+    return ret;
+}
+
 static GameValue StringCall(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     GameVarSpace local(state->GetContext());
@@ -728,7 +787,7 @@ static GameValue StringCall(const GameState* state, GameValuePar oper1, GameValu
     RString expression = oper2;
     GameValue ret = state->EvaluateMultiple(expression);
     state->EndContext();
-    return ret;
+    return CallResult(state, ret);
 }
 
 static GameValue StringLocal(const GameState* state, GameValuePar oper1)
@@ -772,7 +831,7 @@ static GameValue StringCallNoArg(const GameState* state, GameValuePar oper1)
     RString expression = oper1;
     GameValue ret = state->EvaluateMultiple(expression);
     state->EndContext();
-    return ret;
+    return CallResult(state, ret);
 }
 
 static GameValue StringIgnore(const GameState* state, GameValuePar oper1)
@@ -780,22 +839,29 @@ static GameValue StringIgnore(const GameState* state, GameValuePar oper1)
     return NOTHING;
 }
 
-// Thread-local storage for the value passed to exitWith { expr }.
-// Set by StringExitWith when the condition is true; read and cleared
-// by loop handlers (ForDoOp, StringRepeat) to propagate the exit value.
-static thread_local GameValue tls_exitWithValue;
 
 static GameValue StringRepeat(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     int maxIters = 10000;
+    unsigned yields = GameState::s_scheduledYields ? GameState::s_scheduledYields() : 0;
     for (int i = 0;; i++)
     {
+        if (i >= maxIters && GameState::s_scheduledYields && GameState::s_scheduledYields() != yields)
+        {
+            // a scheduled loop that waits (sleep / waitUntil) is not runaway code
+            yields = GameState::s_scheduledYields();
+            i = 0;
+        }
         if (i >= maxIters)
         {
-            RptF("Max iteration count exceeded in while loop");
+            LOG_WARN(Core, "SQF: max iteration count exceeded in while loop");
             state->SetError(EvalGen);
             break;
         }
+        if (GameState::s_abortLoops)
+            break;
+        if (GameState::s_scheduledTick)
+            GameState::s_scheduledTick();
         // test condition
         {
             GameVarSpace local(state->GetContext());
@@ -820,15 +886,20 @@ static GameValue StringRepeat(const GameState* state, GameValuePar oper1, GameVa
             }
         }
         // perform loop body
+        EvalError bodyError = EvalOK;
         {
             GameVarSpace local(state->GetContext());
             state->BeginContext(&local);
             RString expression = oper2;
             const_cast<GameState*>(state)->Execute(expression);
+            // exitWith in the body ends the loop; its error lives in the body's own context
+            bodyError = state->GetLastError();
             state->EndContext();
         }
-        if (state->GetLastError() == EvalBreak)
+        if (bodyError == EvalBreak || state->GetLastError() == EvalBreak)
         {
+            if (!GameState::s_breakTarget.empty())
+                return NOTHING; // breakTo/breakOut: leave the loop, keep unwinding
             GameValue exitVal = tls_exitWithValue;
             const_cast<GameState*>(state)->SetError(EvalOK);
             return exitVal;
@@ -947,17 +1018,23 @@ static GameValue ForDoOp(const GameState* state, GameValuePar oper1, GameValuePa
     {
         if (count++ >= maxIters)
         {
-            RptF("Max iteration count exceeded in for loop");
+            LOG_WARN(Core, "SQF: max iteration count exceeded in for loop");
             state->SetError(EvalGen);
             break;
         }
+        if (GameState::s_abortLoops)
+            break;
         GameVarSpace local(state->GetContext());
         state->BeginContext(&local);
         state->VarSetLocal(toData->GetVar(), GameValue(i));
         const_cast<GameState*>(state)->Execute(body);
+        // exitWith in the body ends the loop; its error lives in the body's own context
+        const EvalError bodyError = state->GetLastError();
         state->EndContext();
-        if (state->GetLastError() == EvalBreak)
+        if (bodyError == EvalBreak || state->GetLastError() == EvalBreak)
         {
+            if (!GameState::s_breakTarget.empty())
+                return NOTHING; // breakTo/breakOut: leave the loop, keep unwinding
             exitVal = tls_exitWithValue;
             const_cast<GameState*>(state)->SetError(EvalOK);
             break;
@@ -1053,6 +1130,7 @@ static GameValue ListForEach(const GameState* state, GameValuePar oper1, GameVal
         const GameValue& val = array[i];
         // set local varible - will be deleted on EndContext
         state->VarSetLocal("_x", val, true);
+        state->VarSetLocal("_forEachIndex", GameValue(static_cast<float>(i)), true);
         const_cast<GameState*>(state)->Execute(expression);
         if (state->GetLastError())
         {
@@ -1146,7 +1224,8 @@ static const GameOperator* GetDefaultBinary(int* outSize = nullptr)
         GameOperator(GameForTo, "step", function, ForStepOp, GameForTo, GameScalar),
         GameOperator(GameAny, "do", function, ForDoOp, GameForTo, GameString),
 
-        GameOperator(GameAny, "call", function, StringCall, GameVoid, GameString),
+        // Arma 2 accepts a command that returns nothing on the left: (_x kbAddTopic [..]) call RE
+        GameOperator(GameAny, "call", function, StringCall, GameVoid | GameNothing, GameString),
     };
     if (outSize)
     {
@@ -1178,6 +1257,9 @@ static const GameFunction* GetDefaultUnary(int* outSize = nullptr)
         GameFunction(GameScalar, "exp", Exp, GameScalar),
         GameFunction(GameScalar, "sqrt", Odmocnina, GameScalar),
         GameFunction(GameScalar, "abs", Abs, GameScalar),
+        GameFunction(GameScalar, "round", Round, GameScalar),
+        GameFunction(GameScalar, "floor", Floor, GameScalar),
+        GameFunction(GameScalar, "ceil", Ceil, GameScalar),
         GameFunction(GameScalar, "+", Plus, GameScalar), // known special cases
         GameFunction(GameArray, "+", Plus, GameArray),   // replication
         GameFunction(GameScalar, "-", Minus, GameScalar),
@@ -1258,6 +1340,7 @@ void GameState::TypeErrorOperator(const char* name, GameType left, GameType righ
     }
     else
     {
+        LOG_WARN(Core, "SQF operator {}: no overload for operand types 0x{:x}, 0x{:x}", name, (unsigned)left, (unsigned)right);
         SetError(EvalGen);
     }
 }
@@ -1280,6 +1363,7 @@ void GameState::TypeErrorFunction(const char* name, GameType right) const
     }
     else
     {
+        LOG_WARN(Core, "SQF function {}: no overload for operand type 0x{:x}", name, (unsigned)right);
         SetError(EvalGen);
     }
 }
@@ -1317,7 +1401,8 @@ void GameState::VyhCast(int Prio) const
                 {
                     const GameOperator* op = nullptr;
 
-                    if (IsNull(_vars[oper2]))
+                    // The parser already decided this is an operator (a variable of the
+                    // same name -- an object called "spawn" -- cannot be meant here).
                     {
                         const GameOperators& operators = _operators[oper2];
                         if (!_operators.IsNull(operators))
@@ -1518,21 +1603,21 @@ struct VyhodFrameGuard
     // SP are scratch space the next caller is welcome to use.  Saving
     // just the live prefix keeps the cost proportional to actual
     // nesting depth (typical < 10, capped at SL=256).
-    GameValue savedStack[SL];
-    RString savedOperStack[SL];
-    int savedUB[SL];
-    int savedPriorStack[SL];
+    std::vector<GameValue> savedStack;
+    std::vector<RString> savedOperStack;
+    std::vector<int> savedUB;
+    std::vector<int> savedPriorStack;
 
     explicit VyhodFrameGuard(GameEvaluator& ev)
         : e(ev), savedSP(ev.SP), savedParPrior(ev._parPrior), savedListPrior(ev._listPrior), savedPos(ev._pos),
           savedPos0(ev._pos0), savedSubexpBeg(ev._subexpBeg), savedSubexpEnd(ev._subexpEnd)
     {
-        for (int i = 0; i < savedSP; ++i)
+        if (savedSP > 0)
         {
-            savedStack[i] = e._stack[i];
-            savedOperStack[i] = e._operStack[i];
-            savedUB[i] = e.UB[i];
-            savedPriorStack[i] = e._priorStack[i];
+            savedStack.assign(e._stack.begin(), e._stack.begin() + savedSP);
+            savedOperStack.assign(e._operStack.begin(), e._operStack.begin() + savedSP);
+            savedUB.assign(e.UB.begin(), e.UB.begin() + savedSP);
+            savedPriorStack.assign(e._priorStack.begin(), e._priorStack.begin() + savedSP);
         }
     }
 
@@ -1588,7 +1673,7 @@ GameValue GameState::Vyhod() const
                 // empty list construction
                 _e->_pos++;
 
-                if (_e->SP >= SL)
+                if (!_e->Reserve(_e->SP))
                 {
                     SetError(EvalLineLong);
                     return NOTHING;
@@ -1638,7 +1723,7 @@ GameValue GameState::Vyhod() const
         }
         if (!functions || _functions.IsNull(*functions))
         {
-            if (_e->SP >= SL)
+            if (!_e->Reserve(_e->SP))
             {
                 SetError(EvalLineLong);
                 return NOTHING;
@@ -1723,7 +1808,7 @@ GameValue GameState::Vyhod() const
                         array.Add(_e->_stack[i]);
                     }
                     _e->SP = SPP;
-                    if (_e->SP >= SL)
+                    if (!_e->Reserve(_e->SP))
                     {
                         SetError(EvalLineLong);
                         return NOTHING;
@@ -1803,9 +1888,14 @@ GameValue GameState::Vyhod() const
 
                         RString name(_e->_pos, idlen);
                         name.Lower();
-                        if (_e->_checkOnly || IsNull(_vars[name]))
+                        // Here an operator is expected, so a variable of the same name
+                        // cannot be meant: Arma 1 missions name objects "spawn" and
+                        // still write `[] spawn {...}`. Only when no operator of that
+                        // name exists is the name left unresolved, as before.
+                        operators = &_operators[name];
+                        if (!_e->_checkOnly && !IsNull(_vars[name]) && _operators.IsNull(*operators))
                         {
-                            operators = &_operators[name];
+                            operators = nullptr;
                         }
                     }
                     else
@@ -1847,7 +1937,7 @@ GameValue GameState::Vyhod() const
         else // unary operator
         {
             _e->_pos += strlen(functions->_name);
-            if (_e->SP >= SL)
+            if (!_e->Reserve(_e->SP))
             {
                 SetError(EvalLineLong);
                 return NOTHING;
@@ -2021,6 +2111,11 @@ LSError GameDataBool::Serialize(ParamArchive& ar)
 RString GameDataString::GetText() const
 {
     return RString("\"") + _value + RString("\"");
+}
+
+RString GameDataCode::GetText() const
+{
+    return RString("{") + GetString() + RString("}");
 }
 
 bool GameDataString::IsEqualTo(const GameData* data) const
@@ -2403,6 +2498,14 @@ void GameState::Reset()
     VarSet("this", false, true);
 }
 
+// Arma 1/2: a local variable used where no local scope exists (a unit's init line,
+// "_x = [this] execVM ...") lives in one shared scratch scope instead of being an error.
+static GameVarSpace& GlobalScratchLocals()
+{
+    static GameVarSpace scratch;
+    return scratch;
+}
+
 GameValue GameState::VarGet(const char* name) const
 {
     // convert name to lower case
@@ -2424,6 +2527,13 @@ GameValue GameState::VarGet(const char* name) const
     {
         if (source[0] == '_')
         {
+            if (s_emptyStatementKeepsValue)
+            {
+                GameValue ret;
+                if (GlobalScratchLocals().VarGet(source, ret))
+                    return ret;
+                return GameValueNil();
+            }
             SetError(EvalNamespace);
             return GameValueNil();
         }
@@ -2434,6 +2544,15 @@ GameValue GameState::VarGet(const char* name) const
     {
         // get variable value
         return var._value;
+    }
+    if (s_resolveGlobal && source[0] != '_')
+    {
+        GameValue resolved;
+        if (s_resolveGlobal(source, resolved))
+        {
+            const_cast<GameState*>(this)->VarSet(source, resolved);
+            return resolved;
+        }
     }
 
     return GameValueNil();
@@ -2555,6 +2674,8 @@ void GameState::VarSet(const char* name, GameValuePar value, bool readOnly, bool
     source.Lower();
 
     GameVarSpace* space = (forceLocal || *name == '_' ? _e->local : this);
+    if (!space && s_emptyStatementKeepsValue)
+        space = &GlobalScratchLocals();
     if (!space)
     {
         SetError(EvalNamespace);
@@ -2631,6 +2752,8 @@ int GameState::GetLastErrorPos() const
 
 GameValue GameState::Evaluate(const char* expression) const
 {
+    if (s_traceExpression)
+        s_traceExpression(expression);
     // Snapshot _e on entry so any nested Evaluate triggered by an
     // operator handler (UI menu condition checks, animation rotations,
     // mission scripts, harness eval, etc.) leaves the outer caller's
@@ -2699,10 +2822,23 @@ static const char* CheckAssignment(const char* p)
 }
 
 // localOnly restricts assignments to local variables.
+// scopeName belongs to one code block: each evaluation starts unnamed and gives the
+// enclosing block its name back when it returns.
+struct ScopeNameGuard
+{
+    GameEvaluator& e;
+    RString saved;
+    explicit ScopeNameGuard(GameEvaluator& ev) : e(ev), saved(ev._scopeName) { ev._scopeName = RString(); }
+    ~ScopeNameGuard() { e._scopeName = saved; }
+};
+
 GameValue GameState::EvaluateMultiple(const char* expression, bool localOnly) const
 {
+    if (s_traceExpression)
+        s_traceExpression(expression);
     // Reentrancy guard — see Evaluate above and VyhodFrameGuard.
     VyhodFrameGuard frameGuard(*_e);
+    ScopeNameGuard scopeGuard(*_e);
 
     _e->_pos = _e->_pos0 = expression;
     _e->_subexpBeg = expression;
@@ -2723,6 +2859,13 @@ GameValue GameState::EvaluateMultiple(const char* expression, bool localOnly) co
             }
         }
         vynech();
+        if (s_emptyStatementKeepsValue && (*_e->_pos == 0 || *_e->_pos == ';'))
+        {
+            if (*_e->_pos == 0)
+                break;
+            _e->_pos++;
+            continue;
+        }
         // check if expression is assignment
         // assignment must start with identifier
         _e->_subexpBeg = _e->_pos;
@@ -2741,9 +2884,21 @@ GameValue GameState::EvaluateMultiple(const char* expression, bool localOnly) co
             CleanStack();
             if (_e->_error)
             {
-                // exitWith propagates its value even when breaking
+                bool leaveScope = false;
+                if (CatchBreak(leaveScope))
+                {
+                    ret = NOTHING;
+                    if (leaveScope)
+                    {
+                        ret = TakeBreakOutValue();
+                        break;
+                    }
+                    goto NextStatement;
+                }
+                // exitWith gives the scope its value (the statement itself stops before
+                // returning one, so it is taken from where exitWith left it)
                 if (_e->_error == EvalBreak)
-                    ret = value;
+                    ret = s_breakTarget.empty() ? tls_exitWithValue : value;
                 break;
             }
 
@@ -2752,6 +2907,7 @@ GameValue GameState::EvaluateMultiple(const char* expression, bool localOnly) co
             // if result is fake type it is not OK
             ret = value;
         } // single command executed
+    NextStatement:
         vynech();
         char c = *_e->_pos;
         if (c == 0)
@@ -2815,6 +2971,10 @@ bool GameState::IdtfGoodName(const char* name) const
 
 bool GameState::LValueGoodName(const char* name) const
 {
+    // Arma 3 assigns this like any variable: its exported compositions (Old Man's sector layers)
+    // run each object's init as "this = _item855; <init>"
+    if (s_codeValues && strcmp(name, "this") == 0)
+        return VarGoodName(name);
     if (VarReadOnly(name))
     {
         return false;
@@ -2834,6 +2994,25 @@ bool GameState::PerformAssignment(bool localOnly)
         declareLocal = true;
         _e->_pos += 7;
         vynech();
+    }
+
+    // Arma 3 init lines write "0 = [] spawn {...};" (an init line must not return a value):
+    // a number on the left, so the value is computed and dropped. Arma 3 only (code values).
+    if (s_codeValues && !declareLocal && isdigit(static_cast<unsigned char>(*_e->_pos)))
+    {
+        while (isdigit(static_cast<unsigned char>(*_e->_pos)))
+            _e->_pos++;
+        vynech();
+        if (*_e->_pos != '=')
+        {
+            SetError(EvalEqu);
+            return false;
+        }
+        _e->_pos++;
+        vynech();
+        GameValue dropped = Vyhod();
+        CleanStack();
+        return !_e->_error;
     }
 
     char name[MAX_EXPR_LEN];
@@ -2917,8 +3096,11 @@ bool GameState::PerformAssignment(bool localOnly)
 
 void GameState::Execute(const char* expression)
 {
+    if (s_traceExpression)
+        s_traceExpression(expression);
     // Reentrancy guard — see Evaluate above and VyhodFrameGuard.
     VyhodFrameGuard frameGuard(*_e);
+    ScopeNameGuard scopeGuard(*_e);
 
     _e->_error = EvalOK;
     _e->_errorText = RString();
@@ -2950,6 +3132,13 @@ void GameState::Execute(const char* expression)
             CleanStack();
             if (_e->_error)
             {
+                bool leaveScope = false;
+                if (CatchBreak(leaveScope))
+                {
+                    if (leaveScope)
+                        break;
+                    goto NextExecStatement;
+                }
                 break;
             }
 
@@ -2965,6 +3154,7 @@ void GameState::Execute(const char* expression)
                 }
             }
         } // single command executed
+    NextExecStatement:
         vynech();
         char c = *_e->_pos;
         if (c == 0)
@@ -3010,7 +3200,7 @@ void GameState::ShowError() const
     }
 }
 
-GameEvaluator::GameEvaluator(GameVarSpace* vars)
+GameEvaluator::GameEvaluator(GameVarSpace* vars) : _stack(SL), UB(SL), _priorStack(SL), _operStack(SL)
 {
     local = vars;
     // Initialize parser-private fields so VyhodFrameGuard's snapshot of an
@@ -3059,9 +3249,88 @@ void GameState::EndContext() const
         Poseidon::Foundation::ErrorMessage("GameState context stack underflow");
         return;
     }
+    const bool breaking = !s_breakTarget.empty() && _contextStack[_actContext]->_error == EvalBreak;
     _contextStack[_actContext].Free();
     _actContext--;
     _e = _contextStack[_actContext];
+    if (breaking)
+        _e->_error = EvalBreak; // breakTo/breakOut unwinds into the enclosing scope
+}
+
+void GameState::SetScopeName(const char* name) const
+{
+    _e->_scopeName = name;
+}
+
+static thread_local GameValue tls_breakOutValue;
+static thread_local bool tls_breakOutHasValue = false;
+
+void GameState::BreakOutWithValue(const char* name, const GameValue& value) const
+{
+    tls_breakOutValue = value;
+    tls_breakOutHasValue = true;
+    BreakToScope(name, true);
+}
+
+// The value a scope left by "value breakOut name" gives (taken once).
+static GameValue TakeBreakOutValue()
+{
+    GameValue v = tls_breakOutHasValue ? tls_breakOutValue : GameValue(NOTHING);
+    tls_breakOutValue = GameValue();
+    tls_breakOutHasValue = false;
+    return v;
+}
+
+void GameState::BreakToScope(const char* name, bool out) const
+{
+    s_breakTarget = name ? name : "";
+    s_breakOut = out;
+    const_cast<GameState*>(this)->SetError(EvalBreak);
+}
+
+// Moves the parser past the rest of the current statement (to its ';' or the end).
+static const char* SkipStatement(const char* p)
+{
+    int depth = 0;
+    while (*p)
+    {
+        const char c = *p;
+        if (c == '"' || (c == '\'' && GameState::s_singleQuoteStrings))
+        {
+            const char q = c;
+            p++;
+            while (*p && *p != q)
+                p++;
+            if (*p)
+                p++;
+            continue;
+        }
+        if (c == '{' || c == '(' || c == '[')
+            depth++;
+        else if (c == '}' || c == ')' || c == ']')
+            depth--;
+        else if (c == ';' && depth <= 0)
+            return p;
+        p++;
+    }
+    return p;
+}
+
+bool GameState::CatchBreak(bool& leaveScope) const
+{
+    leaveScope = false;
+    if (_e->_error != EvalBreak || s_breakTarget.empty())
+        return false;
+    if (_e->_scopeName.GetLength() == 0 || stricmp(_e->_scopeName, s_breakTarget.c_str()) != 0)
+        return false;
+    leaveScope = s_breakOut;
+    s_breakTarget.clear();
+    s_breakOut = false;
+    _e->_error = EvalOK;
+    _e->_errorText = RString();
+    if (!leaveScope && _e->_pos)
+        _e->_pos = SkipStatement(_e->_pos);
+    return true;
 }
 
 bool GameState::CheckEvaluate(const char* expression) const

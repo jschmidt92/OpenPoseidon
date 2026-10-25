@@ -159,7 +159,7 @@ impl SkyBake {
                 module: &depth_shader,
                 entry_point: Some("vs_bake_depth"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: vertex_stride,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[wgpu::VertexAttribute {
@@ -167,7 +167,7 @@ impl SkyBake {
                         offset: 0,
                         shader_location: 0,
                     }],
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -186,7 +186,7 @@ impl SkyBake {
             multisample: wgpu::MultisampleState::default(),
             fragment: None,
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
@@ -244,7 +244,7 @@ impl SkyBake {
             module: &reduce_shader,
             entry_point: Some("cs_bake"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         SkyBake {
@@ -576,7 +576,7 @@ impl PendingBake {
             Err(std::sync::mpsc::TryRecvError::Disconnected) | Ok(Err(_)) => Some(None),
             Ok(Ok(())) => {
                 let slice = self.staging.slice(..);
-                let data = slice.get_mapped_range();
+                let data = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
                 let out = bytemuck::cast_slice::<u8, [f32; 4]>(&data).to_vec();
                 drop(data);
                 self.staging.unmap();

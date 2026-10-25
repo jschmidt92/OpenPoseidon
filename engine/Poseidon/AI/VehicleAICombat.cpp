@@ -1,12 +1,18 @@
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 hooks, empty unless POSEIDON_DIAG
+#include <Poseidon/AI/AIDangerList.hpp> // AI-XRAY-004: typed dangers
 #include <Poseidon/AI/VehicleAI.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <Poseidon/Graphics/Rendering/Effects/MuzzleBurst.hpp>
+#include <algorithm>
 #include <Poseidon/AI/AI.hpp>
 #include <Poseidon/AI/AIRadio.hpp>
 #include <Poseidon/World/World.hpp>
+#include <Poseidon/World/SimVehicleCost.hpp>
 #include <Poseidon/World/Entities/Vehicles/Transport.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <Poseidon/World/Entities/Weapons/Shots.hpp>
+#include <Poseidon/World/Entities/Weapons/RecoilTuning.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
 #include <Poseidon/Audio/Core/WaveLifecycle.hpp>
 #include <float.h>
@@ -18,6 +24,10 @@
 #include <Poseidon/Foundation/Containers/StaticArray.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
 #include <Poseidon/Foundation/Framework/Log.hpp>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <cstdio>
 #include <Poseidon/Foundation/Math/Math3D.hpp>
 #include <Poseidon/Foundation/Math/Math3DP.hpp>
 #include <Poseidon/Foundation/Math/MathDefs.hpp>
@@ -48,7 +58,6 @@
 #include <Poseidon/Game/Commands/GameStateExt.hpp>
 #include <Poseidon/Foundation/Strings/Mbcs.hpp>
 #include <Poseidon/World/Entities/Weapons/Ballistics.hpp>
-#include <Poseidon/AI/AIHunt.hpp>
 
 extern void SDLGamepad_PlayRamp(float beg, float end, float dur);
 
@@ -228,6 +237,46 @@ void EntityAI::HitBy(EntityAI* killer, float howMuch, RString ammo)
     }
     base::HitBy(killer, howMuch, ammo);
     AIGroup* g = GetGroup();
+    // AI-XRAY-004: the victim notes where the shooter is, squadmates near him that he was hit or killed
+    if ((DangerList::Enabled() || DangerList::BadCoverEnabled()) && howMuch > 0.01f)
+    {
+        AIUnit* me = CommanderUnit();
+        AICenter* myCenter = g ? g->GetCenter() : nullptr;
+        // only an enemy's fire: not a friend's stray round, a fall, a friendly truck, his own grenade
+        const bool hostile = me && killer && killer != this && myCenter && !myCenter->IsFriendly(killer->GetTargetSide());
+        // AI-XRAY-006: hit by the enemy while hiding behind something: that cover is bad for his side
+        if (hostile && me->IsFreeSoldier() && DangerList::BadCoverEnabled())
+        {
+            const Object* cover = GetHideBehind();
+            if (cover && Position().DistanceXZ(cover->Position()) < cover->CollisionSize() + CollisionSize() + 4.0f)
+            {
+                DangerList::NoteBadCover(myCenter, Position());
+                // and he moves on himself (X-Ray): drop this cover and look again now (HideThink keeps a soldier
+                // behind his cover otherwise); the new search skips the bad spot
+                _hideBehind = nullptr;
+                _hideRefreshTime = Glob.time - 10;
+            }
+        }
+        if (hostile && me->IsFreeSoldier()) // a soldier on foot (not a hit vehicle's commander)
+        {
+            // where it came from is a guess, as the stock reaction's +-100 m reveal of the killer is
+            const float dist = killer->Position().Distance(Position());
+            DangerList::Note(me, DangerList::Type::Hit, killer->Position(), dist * 0.1f);
+        }
+        if (hostile && g && me->IsFreeSoldier()) // a soldier on foot (a hit vehicle is not a squadmate down)
+        {
+            const DangerList::Type what =
+                IsDammageDestroyed() ? DangerList::Type::SquadmateDied : DangerList::Type::SquadmateHit;
+            for (int id = 1; id <= MAX_UNITS_PER_GROUP; id++)
+            {
+                AIUnit* mate = g->UnitWithID(id);
+                if (mate && mate != me)
+                {
+                    DangerList::Note(mate, what, Position());
+                }
+            }
+        }
+    }
     if (g && killer)
     {
         AIUnit* killerUnit = killer->CommanderUnit();
@@ -911,9 +960,37 @@ void EntityAI::SimulateWeaponActivity(float deltaT, SimulationImportance prec)
 
     if (_forceFireWeapon >= 0 && !_isDead)
     {
+        // OP_FORCEFIRE_LOG=1: why a scripted `fire` does or does not go off, twice a second
+        // per unit (selected weapon, loaded, weapon elevation, aimed).
+        static const bool forceFireLog = [] {
+            const char* e = std::getenv("OP_FORCEFIRE_LOG");
+            return e && *e == '1';
+        }();
+        static std::map<const EntityAI*, float> forceFireLogged;
+        bool logNow = false;
+        if (forceFireLog)
+        {
+            float& last = forceFireLogged[this];
+            logNow = Glob.time.toFloat() - last >= 0.5f || Glob.time.toFloat() < last;
+            if (logNow)
+                last = Glob.time.toFloat();
+        }
+        if (logNow)
+        {
+            const int w = _currentWeapon;
+            LOG_INFO(AI, "force fire {}: wanted {} selected {} loaded {} dirY {:.2f}",
+                     (const char*)GetDebugName(), _forceFireWeapon, w,
+                     w >= 0 && w < NMagazineSlots() ? (GetWeaponLoaded(w) ? 1 : 0) : -1,
+                     w >= 0 && w < NMagazineSlots() ? GetWeaponDirection(w).Y() : 0.0f);
+        }
         if (_forceFireWeapon == SelectedWeapon())
         {
-            bool aimed = AimWeaponForceFire(_currentWeapon);
+            // The player's own unit aims where the player aims: a scripted `fire` on it
+            // (player fire "M16") goes off in that direction instead of waiting for an AI
+            // aim the player's input never lets settle -- it never fired before.
+            bool aimed = QIsManual() ? true : AimWeaponForceFire(_currentWeapon);
+            if (logNow)
+                LOG_INFO(AI, "force fire {}: aimed {}", (const char*)GetDebugName(), aimed ? 1 : 0);
             if (GetWeaponLoaded(_currentWeapon) && (GetWeaponDirection(_currentWeapon).Y() >= 0.7 || aimed))
             {
                 const WeaponModeType* mode = GetWeaponMode(_currentWeapon);
@@ -932,7 +1009,10 @@ void EntityAI::SimulateWeaponActivity(float deltaT, SimulationImportance prec)
                 }
                 else
                 {
-                    if (FireWeapon(_currentWeapon, nullptr))
+                    const bool fired = FireWeapon(_currentWeapon, nullptr);
+                    if (logNow)
+                        LOG_INFO(AI, "force fire {}: FireWeapon {}", (const char*)GetDebugName(), fired ? 1 : 0);
+                    if (fired)
                     {
                         _forceFireWeapon = -1;
                     }
@@ -958,6 +1038,7 @@ void EntityAI::SimulateWeaponActivity(float deltaT, SimulationImportance prec)
         bool on = _pilotLight && GetHit(info.hitPoint) < 0.9;
         light->Switch(on);
     }
+    UpdateAutoVehicleLights(); // LGT-AUTO-001
 
     // advance time for all looping weapon sounds
     for (int i = 0; i < _weaponFired.Size(); i++)
@@ -1063,6 +1144,106 @@ void EntityAI::OnAddImpulse(Vector3Par force, Vector3Par torque)
     StartRecoil(recoil, factor * GetRecoilFactor());
 }
 
+// PIM-RECOIL: PhysicalInventory 17's recoil model (inspiration/CWR-Physical Inventory), ported
+// 2026-10-22 on a tester's report that the Recoil page was missing. Tuned live from the
+// inventory edit menu's Recoil page (RecoilTuning.hpp).
+// Recoil tuning, applied to every weapon in the game at the one point _recoilFactor is
+// assigned.
+// Scales the authored curve, which contributes the shove back along the bore (its rotation is
+// discarded - see ApplyRecoil's translationOnly). Half strength, matching PhysicalInventory 17.
+static const float& kRecoilScale = GRecoilTune.scale;
+
+// Arma 3's CfgRecoils muzzleOuter[] = {x, y, a, b} - x/y are the ellipse CENTRE, a/b its
+// magnitudes. Bohemia's documented sample is {0.3, 1.0, 0.3, 0.2}: vertical centre 1.0
+// against a horizontal magnitude of only 0.3, so the kick is overwhelmingly UP and merely
+// wanders a little to the sides. Ratio of up-bias to sideways spread is 3.3 : 1.
+//
+// The values below had that ratio at 0.5 : 1 - nearly SEVEN times too wide horizontally,
+// which is why the M16 waggled side to side. Corrected to Bohemia's proportions, with one
+// deliberate departure: the horizontal CENTRE is 0 rather than 0.3, because ReDiS's whole
+// premise is that vanilla's fixed "up and right to the Moon" drift is wrong and recoil
+// should be symmetric and random. So: climbs, wanders evenly either side, no systematic
+// pull in one direction.
+static const float kRecoilBiasRight = 0.00f;  // ellipse centre (x) - 0.3 in vanilla Arma 3
+// Vertically centred too, so muzzle RISE is gone for every weapon, not just belt-feds.
+// With the centre at (0,0) the impulse direction is drawn uniformly around the ellipse and
+// is zero-mean on both axes: the muzzle shakes but does not drift anywhere, and sustained
+// fire no longer parks it above the aim point. Was 1.00, which put dy in [0.75, 1.25] -
+// always positive, so every single shot kicked upward. Pair this with kRecoilPermanent = 0
+// below; either one alone leaves rise behind (see the note there).
+static const float& kRecoilBiasUp = GRecoilTune.biasUp;   // ellipse centre (y)
+static const float kRecoilSpreadX = 0.45f;    // ellipse horizontal magnitude (a)
+static const float kRecoilSpreadY = 0.25f;    // ellipse vertical magnitude (b)
+// The kick is a spring-damper rather than a keyframed curve, which is what gives the
+// rubber-band feel: a shot adds an impulse to the VELOCITY, so acceleration is highest at
+// the instant of firing and then falls away along the spring's own curve as it settles.
+// Because the impulse lands on whatever displacement is already there, rounds in a burst
+// compound smoothly instead of each one restarting the animation from zero - that restart
+// was the jerkiness.
+// Peak displacement of a critically damped spring is v0 / (w * e), where w is the natural
+// frequency 2*pi/period and e is 2.718. At a 0.45 s period that is w = 13.96, so the
+// divisor is ~37.9: an impulse of 0.5 rad/s peaks at 0.013 rad, a bit under a degree.
+// That is the "slight wiggle at the muzzle" target - use the same arithmetic to retune
+// rather than guessing, since the two constants interact.
+// Permanent climb per shot, in radians, before the recoil factor scales it. Arma 3 calls
+// this `permanent` in CfgRecoils and pairs it with `temporary`; 0.0025 rad is ~0.14 deg a
+// round, so a 30-round burst walked the muzzle about 4 degrees up and left it there.
+//
+// Zero: no weapon accumulates climb any more. Note this is only HALF of removing rise -
+// zeroing it alone still left a residual, because the temporary spring was fed an impulse
+// that always pointed up, so during sustained fire it settled at a non-zero mean ABOVE the
+// aim point (measured: 3.5 deg of the 14.8 deg total on a 100-round belt). Re-centring the
+// impulse ellipse via kRecoilBiasUp = 0 above is the other half.
+static const float& kRecoilPermanent = GRecoilTune.permanent;
+// Peak rotation of CfgRecoils::riffleSingle, the reference every other weapon is measured
+// against for per-weapon strength.
+static const float kRecoilReferenceRotX = 0.04f;
+// Arma 3's kickVisual: camera-only kick, in rad/s. Larger than the aim impulse on purpose
+// - the view absorbs the shot so the aim does not have to.
+static const float& kRecoilKickVisual = GRecoilTune.kickVisual;
+static const float& kRecoilCamPeriod = GRecoilTune.camPeriod;    // settles faster than the aim
+static const float& kRecoilCamDamping = GRecoilTune.camDamping;  // and bounces more
+static const float& kRecoilImpulse = GRecoilTune.impulse;        // rad/s per unit recoil factor
+static const float& kRecoilSpringPeriod = GRecoilTune.springPeriod;  // one natural oscillation
+// Exact update for a damped harmonic oscillator, x'' + 2*z*w*x' + w^2*x = 0, advanced by dt.
+//
+// Closed form rather than stepped explicit integration, whose accuracy depends on the step
+// size and therefore on the FRAME RATE. Measured on the aim spring under the old stepped
+// scheme (maxStep = period*0.1): the same impulse peaked at 0.0107 rad at 30 fps against
+// 0.0281 at 144 fps - recoil strength literally depended on how fast the machine ran. This
+// form is exact for any dt and needs no sub-stepping.
+//
+// Because exact integration no longer loses energy, the impulse defaults are scaled to match
+// what v17 ACTUALLY produced at 60 fps (see RecoilTuning.hpp): 0.672x for the aim spring,
+// 0.519x for the camera. The feel is v17's, without drifting with frame rate.
+static void SpringStepExact(float& x, float& v, float period, float damping, float dt)
+{
+    const float w = 2.0f * H_PI / period;
+    const float z = damping;
+    const float e = exp(-z * w * dt);
+    if (z < 1.0f)
+    {
+        const float wd = w * sqrt(1.0f - z * z);
+        const float c1 = x;
+        const float c2 = (v + z * w * x) / wd;
+        const float cs = cos(wd * dt);
+        const float sn = sin(wd * dt);
+        const float xn = e * (c1 * cs + c2 * sn);
+        v = e * (-z * w * (c1 * cs + c2 * sn) + wd * (c2 * cs - c1 * sn));
+        x = xn;
+    }
+    else
+    {
+        // Critically damped (and a safe stand-in if anyone tunes damping past 1).
+        const float c2 = v + w * x;
+        const float xn = e * (x + c2 * dt);
+        v = e * (c2 - w * (x + c2 * dt));
+        x = xn;
+    }
+}
+
+static const float& kRecoilDamping = GRecoilTune.springDamping;
+
 void EntityAI::StartRecoil(RecoilFunction* recoil, float recoilFactor)
 {
     if (recoil->GetTerminated(0))
@@ -1070,27 +1251,177 @@ void EntityAI::StartRecoil(RecoilFunction* recoil, float recoilFactor)
         // no need to start recoil that has already been terminated
         return;
     }
-    if (_recoil)
+    // Does this shot take over the authored CURVE? Only the curve is subject to "a stronger
+    // recoil is already playing - prefer it"; the per-shot impulses below are NOT, and that
+    // separation is the fix for shots that silently produced no recoil at all.
+    //
+    // The player's manual-fire floor is 0.05 s (kManualFireFloor) and every curve in
+    // CfgRecoils is longer than that - riffleSingle 0.10 s, sniperSingle 0.37 s - so on
+    // rapid fire a curve is ALWAYS still playing and this test ALWAYS runs. It used to
+    // compare the incoming recoilFactor against _recoilFactor, which is the curve SCALE
+    // (kRecoilScale, a constant 0.5), not a factor: prone aimPrecision is 0.3, so every
+    // follow-up shot taken while lying down lost the comparison and returned early, throwing
+    // away its spring impulse, permanent climb, camera kick and force feedback. Comparing
+    // against the factor the playing curve was actually started with restores the intended
+    // meaning, and moving the impulses out from under the early return means no shot can be
+    // dropped even when the curve legitimately keeps playing.
+    const bool takeCurve = !_recoil || recoilFactor >= _recoilFactorAsked;
+    if (takeCurve)
     {
-        if (recoilFactor < _recoilFactor)
+        if (_recoil)
         {
-            // current recoil is stronger - prefer it
-            return;
+            OnRecoilAbort();
         }
-        OnRecoilAbort();
+        _recoil = recoil;
+        _recoilTime = 0;
+        // KICKBACK - the authored curve's shove back along the bore, plus the force-feedback
+        // ramps. Deliberately NOT scaled by the incoming recoilFactor: that carries the
+        // animation's aim precision, which drops when prone, and the shove a round gives your
+        // shoulder does not care what stance you are in. Constant, so it feels the same
+        // standing, crouched or prone.
+        _recoilFactor = kRecoilScale;
+        _recoilFactorAsked = recoilFactor;
     }
-    _recoil = recoil;
-    _recoilTime = 0;
-    _recoilFactor = recoilFactor;
-    _recoilFFIndex = 0;
-    if (this == GWorld->CameraOn())
+    // Per-weapon strength, standing in for Arma 3's per-weapon muzzleOuter. The authored
+    // OFP curve already says how hard this weapon kicks, so its peak rotation is measured
+    // against a reference rifle and everything below scales by the ratio - an MG or a LAW
+    // hits harder than an M16 without a line of new config anywhere.
+    float weaponScale = recoil->GetPeakRotX() / kRecoilReferenceRotX;
+    saturate(weaponScale, 0.25f, 4.0f);
+
+    // Belt-fed weapons take the MG multipliers from RecoilTuning.hpp. All default to 1.00, so
+    // this is a no-op until one is dragged.
+    const float mgWander = IsMachineGunFire() ? GRecoilTune.mgWander : 1.0f;
+
+    // Belt-fed weapons take the machine-gun profile from Recoil.hpp: less wander, and a harder
+    // shove (applied to the kickback impulse further down).
+    // NOTE the kickback multiplier is deliberately NOT folded into _recoilFactor below.
+    // _recoilFactor is what the "current recoil is stronger - prefer it" test above compares
+    // the incoming factor against, so inflating it would make a burst's own later shots lose
+    // that comparison and get their recoil skipped entirely.
+
+    // Kick this shot in a random direction. A point is drawn uniformly inside the
+    // muzzleOuter ellipse (sqrt on the radius keeps it area-uniform rather than clumping
+    // at the centre) and becomes the direction of a velocity impulse. Added to the
+    // existing velocity, never assigned - that is what makes a burst compound rather than
+    // restart, and it is why the direction can be fully random without feeling jerky.
     {
-        StartRecoilFF();
+        const float t = GRandGen.RandomValue() * (2.0f * H_PI);
+        const float r = sqrt(GRandGen.RandomValue());
+        // A belt-fed weapon re-centres the ellipse vertically, so the direction is zero-mean
+        // and sustained fire does not park the muzzle above the aim point. See Recoil.hpp.
+        const float dx = kRecoilBiasRight + kRecoilSpreadX * r * cos(t);   // sideways
+        const float dy = kRecoilBiasUp + kRecoilSpreadY * r * sin(t);      // upward
+        const float len = sqrt(dx * dx + dy * dy);
+        if (len > 1e-6f)
+        {
+            const float ux = dy / len;   // pitch component of the direction
+            const float uy = dx / len;   // yaw component
+
+            // TEMPORARY: an impulse into the spring, which pulls it back to zero. This is
+            // the shake - it settles on its own and costs the player nothing.
+            //
+            // The ANGULAR kick scales with the incoming recoilFactor, so a braced stance
+            // still settles the muzzle - only the kickback above is held constant.
+            const float mag = kRecoilImpulse * recoilFactor * kRecoilScale * weaponScale * mgWander;
+            _recoilKickVX += mag * ux;
+            _recoilKickVY += mag * uy;
+
+            // PERMANENT: a small displacement that does NOT come back. Accumulated here
+            // and handed to the UI, which applies it to the aim itself, so the muzzle
+            // climbs through a burst and STAYS climbed until the player pulls down. This
+            // is the piece the engine never had and the single biggest reason sustained
+            // fire felt nothing like Arma 3 - without it every shot is self-correcting and
+            // holding the trigger costs you nothing.
+            const float perm = kRecoilPermanent * recoilFactor * kRecoilScale * weaponScale;
+            _recoilPermPitch += perm * ux;
+            _recoilPermYaw += perm * uy;
+
+            // VISUAL: Arma 3's kickVisual - a camera-only punch. Bigger and faster than
+            // the aim kick, because the view taking the hit is most of what makes a shot
+            // feel like it went off, and it costs nothing in accuracy since it never
+            // touches where the weapon points.
+            const float cam = kRecoilKickVisual * recoilFactor * weaponScale * mgWander;
+            _recoilCamVX += cam * ux;
+            _recoilCamVY += cam * uy;
+        }
+    }
+
+    // Force feedback replays the CURVE's ramps, so it restarts only when the curve did.
+    // Rewinding it while an older, stronger curve is still running would desync the two.
+    if (takeCurve)
+    {
+        _recoilFFIndex = 0;
+        if (this == GWorld->CameraOn())
+        {
+            StartRecoilFF();
+        }
     }
 }
 
+namespace
+{
+// POSEIDON_SIM_VEHICLE_COST=1: where EntityAI::Simulate spends its time, by section, logged
+// every 3000 calls of men (ms per call, average and slowest). MP_Detector's 431 Arma 2
+// soldiers spend most of Man::Simulate in its `base` section, which is this. Off: one test.
+struct EntityAISimProbe
+{
+    static constexpr int N = 6;
+    struct Accum
+    {
+        double ms[N] = {};
+        double maxMs[N] = {};
+        long long calls = 0;
+    };
+    static Accum& Totals()
+    {
+        static Accum a;
+        return a;
+    }
+    bool on;
+    std::uint64_t last = 0;
+    explicit EntityAISimProbe(bool man) : on(man && SimVehCost::Enabled())
+    {
+        if (on)
+            last = SimVehCost::NowNs();
+    }
+    void Mark(int i)
+    {
+        if (!on)
+            return;
+        const std::uint64_t now = SimVehCost::NowNs();
+        const double ms = static_cast<double>(now - last) * 1.0e-6;
+        last = now;
+        Accum& a = Totals();
+        a.ms[i] += ms;
+        if (ms > a.maxMs[i])
+            a.maxMs[i] = ms;
+    }
+    ~EntityAISimProbe()
+    {
+        if (!on)
+            return;
+        Accum& a = Totals();
+        if (++a.calls < 3000)
+            return;
+        static const char* const names[N] = {"lock", "weapons", "flag", "burst", "recoil", "laser"};
+        const double inv = 1.0 / static_cast<double>(a.calls);
+        std::string line;
+        char part[64];
+        for (int i = 0; i < N; i++)
+        {
+            std::snprintf(part, sizeof(part), " %s=%.3f/%.1f", names[i], a.ms[i] * inv, a.maxMs[i]);
+            line += part;
+        }
+        LOG_INFO(World, "EntityAI::Simulate (men) ms/call (avg/max) over {} calls:{}", a.calls, line);
+        a = Accum();
+    }
+};
+} // namespace
+
 void EntityAI::Simulate(float deltaT, SimulationImportance prec)
 {
+    EntityAISimProbe probe(SimVehCost::Enabled() && GetType() && GetType()->IsKindOf(GWorld->Preloaded(VTypeMan)));
     if (_shape && !_static) // do not lock buildings
     {
         if (HasGeometry() && (_isStopped || _speed.SquareSize() < Square(1.5)) &&
@@ -1116,8 +1447,10 @@ void EntityAI::Simulate(float deltaT, SimulationImportance prec)
         saturate(delta, -0.2 * deltaT, +0.2 * deltaT);
     }
     _avoidAside += delta;
+    probe.Mark(0);
 
     SimulateWeaponActivity(deltaT, prec);
+    probe.Mark(1);
 
     // simulate flag
     Texture* texture = GetFlagTexture();
@@ -1166,6 +1499,7 @@ void EntityAI::Simulate(float deltaT, SimulationImportance prec)
         }
     }
 
+    probe.Mark(2);
     // simulate burst fire
     if (IsLocal())
     {
@@ -1178,6 +1512,40 @@ void EntityAI::Simulate(float deltaT, SimulationImportance prec)
                 // fire on same target as before
                 FireWeapon(weapon, _shootTarget);
             }
+        }
+    }
+
+    probe.Mark(3);
+    // Integrate the recoil spring. OUTSIDE the _recoil test on purpose: the displacement
+    // has to keep settling after the shot's own curve has finished, and that tail is the
+    // whole point of the spring.
+    //
+    // Advanced by the CLOSED FORM rather than stepped explicitly. The stepped version's
+    // accuracy depended on the step size and so on the frame rate: the same impulse peaked at
+    // 0.0107 rad at 30 fps against 0.0281 at 144 fps, i.e. recoil strength varied with how
+    // fast the machine ran. The impulse defaults are scaled to match what that scheme actually
+    // produced at 60 fps, so the feel is unchanged and only the frame-rate drift is gone.
+    if (_recoilKickX != 0 || _recoilKickY != 0 || _recoilKickVX != 0 || _recoilKickVY != 0)
+    {
+        SpringStepExact(_recoilKickX, _recoilKickVX, kRecoilSpringPeriod, kRecoilDamping, deltaT);
+        SpringStepExact(_recoilKickY, _recoilKickVY, kRecoilSpringPeriod, kRecoilDamping, deltaT);
+        // Park it once it is visually at rest, so it stops costing anything.
+        if (fabs(_recoilKickX) < 1e-5f && fabs(_recoilKickY) < 1e-5f && fabs(_recoilKickVX) < 1e-4f &&
+            fabs(_recoilKickVY) < 1e-4f)
+        {
+            _recoilKickX = _recoilKickY = _recoilKickVX = _recoilKickVY = 0;
+        }
+    }
+
+    // ...and the camera spring, on its own faster, bouncier constants.
+    if (_recoilCamX != 0 || _recoilCamY != 0 || _recoilCamVX != 0 || _recoilCamVY != 0)
+    {
+        SpringStepExact(_recoilCamX, _recoilCamVX, kRecoilCamPeriod, kRecoilCamDamping, deltaT);
+        SpringStepExact(_recoilCamY, _recoilCamVY, kRecoilCamPeriod, kRecoilCamDamping, deltaT);
+        if (fabs(_recoilCamX) < 1e-5f && fabs(_recoilCamY) < 1e-5f && fabs(_recoilCamVX) < 1e-4f &&
+            fabs(_recoilCamVY) < 1e-4f)
+        {
+            _recoilCamX = _recoilCamY = _recoilCamVX = _recoilCamVY = 0;
         }
     }
 
@@ -1206,6 +1574,7 @@ void EntityAI::Simulate(float deltaT, SimulationImportance prec)
             }
         }
     }
+    probe.Mark(4);
     if (IsLocal())
     {
         if (!_laserTargetOn)
@@ -1217,6 +1586,7 @@ void EntityAI::Simulate(float deltaT, SimulationImportance prec)
             TrackLaser(_currentWeapon);
         }
     }
+    probe.Mark(5);
 }
 
 void EntityAI::AddDefaultWeapons() {}
@@ -1336,6 +1706,9 @@ void EntityAI::Animate(int level)
         {
             type->_hiddenSelections[i].Unhide(_shape, level);
             type->_hiddenSelections[i].SetTexture(_shape, level, _hiddenSelectionsTextures[i]);
+            if (i < _hiddenSelectionsMaterials.Size() && _hiddenSelectionsMaterials[i])
+                type->_hiddenSelections[i].SetMaterial(_shape, level, _hiddenSelectionsMaterials[i],
+                                                       _hiddenSelectionsSavedMaterials);
         }
         else
         {
@@ -1394,26 +1767,54 @@ void EntityAI::Deanimate(int level)
     {
         type->_hiddenSelections[i].Unhide(_shape, level);
     }
+    // The shape is shared: give the next instance its sections' own materials back.
+    AnimationSection::RestoreMaterials(_shape, level, _hiddenSelectionsSavedMaterials);
 
     base::Deanimate(level);
 }
 
+// --arma1 diagnostic: why a gunner of an Arma 1 vehicle (generated A1x_ class) holds fire --
+// the HMMWV M2 and UAZ DShKM gunners never fired at known enemies (a1gunfire), CWA's own
+// JeepMG with the same crew did. At most one line per vehicle every 2 s.
+static bool A1AimDiagDue(const EntityAI* self)
+{
+    if (!Arma1Compat::Active() || self->GetType()->IsKindOf(GWorld->Preloaded(VTypeMan)))
+        return false;
+    const char* name = self->GetType()->GetName();
+    if (!name || _strnicmp(name, "A1x_", 4) != 0)
+        return false;
+    static std::map<const void*, float> last;
+    float& t = last[self];
+    if (t > 0 && Glob.time.toFloat() - t < 2.0f)
+        return false;
+    t = Glob.time.toFloat();
+    return true;
+}
+
 float EntityAI::GetAimed(int weapon, Target* target) const
 {
+    const auto why = [&](const char* reason) {
+        if (A1AimDiagDue(this))
+            LOG_INFO(AI, "A1 aim {}: weapon {} holds fire: {}", (const char*)GetType()->GetName(), weapon, reason);
+    };
     if (weapon < 0 || weapon >= NMagazineSlots())
     {
+        why("no such weapon slot");
         return 0;
     }
     if (!target)
     {
+        why("no target");
         return 0;
     }
     if (!target->idExact)
     {
+        why("target not identified");
         return 0;
     }
     if (target->lastSeen < Glob.time - 5)
     {
+        why("target not seen for 5 s");
         return 0;
     }
 
@@ -1429,6 +1830,7 @@ float EntityAI::GetAimed(int weapon, Target* target) const
     }
     if (target->posError.SquareSize() > Square(ammo->indirectHitRange * 2))
     {
+        why("target position error too large");
         return 0;
     }
 
@@ -1473,6 +1875,12 @@ float EntityAI::GetAimed(int weapon, Target* target) const
             GlobalShowMessage(2000, "Error %.1f, tgtSize %.1f, maxError %.1f", error, tgtSize, maxError);
         }
 #endif
+        if (A1AimDiagDue(this))
+            LOG_INFO(AI,
+                     "A1 aim {}: weapon {} error {:.2f} max {:.2f} visible {:.2f} dist {:.0f} wPos {:.1f} {:.1f} {:.1f} "
+                     "wDir {:.2f} {:.2f} {:.2f} target {:.1f} {:.1f} {:.1f}",
+                     (const char*)GetType()->GetName(), weapon, error, maxError, visible, dist, wPos.X(), wPos.Y(),
+                     wPos.Z(), wDir.X(), wDir.Y(), wDir.Z(), estPos.X(), estPos.Y(), estPos.Z());
         return (error < maxError) * visible;
     }
     else
@@ -1783,6 +2191,30 @@ Vector3 EntityAI::GetWeaponCenter(int weapon) const
 {
     // in model coordinates
     return VZero;
+}
+
+void EntityAI::ArmaVehicleMuzzleBurst(Vector3Par muzzleModel, Vector3Par dirModel, const WeaponModeType* mode)
+{
+    if (!mode || !mode->_ammo || !GetType() || !GetType()->_par)
+        return;
+    const ParamEntry* want = GetType()->_par->FindEntry("a1MuzzleFlash");
+    if (!want || want->IsClass() || want->IsArray() || (int)*want == 0)
+        return;
+    const Vector3 muzzle = GetHierachyParent() ? WorldTransform().FastTransform(muzzleModel) : PositionModelToWorld(muzzleModel);
+    Vector3 dir = GetHierachyParent() ? WorldTransform().Rotate(dirModel) : DirectionModelToWorld(dirModel);
+    if (dir.SquareSize() < 1e-6f)
+        dir = Direction();
+    static std::uint32_t shots = 0;
+    const Vector3 carrier = WorldSpeed();
+    Poseidon::render::MuzzleBurstShot shot;
+    shot.muzzle = {muzzle.X(), muzzle.Y(), muzzle.Z()};
+    shot.forward = {dir.X(), dir.Y(), dir.Z()};
+    shot.carrier = {carrier.X(), carrier.Y(), carrier.Z()};
+    shot.birthMs = Glob.time.toInt();
+    shot.size = std::clamp(std::sqrt(std::max(mode->_ammo->hit, 1.0f) / 8.0f), 0.55f, 1.8f);
+    shot.seed = ++shots * 2654435761u ^ std::uint32_t(reinterpret_cast<std::uintptr_t>(this) >> 4) ^
+                std::uint32_t(shot.birthMs);
+    Poseidon::render::RecordMuzzleBurst(shot);
 }
 
 Vector3 EntityAI::GetWeaponPoint(int weapon) const
@@ -2354,10 +2786,13 @@ void EntityAI::FireWeaponEffects(int weapon, const Magazine* magazine, EntityAI*
     if (mType && slot._mode >= 0 && slot._mode < mType->_modes.Size())
     {
         mode = mType->_modes[slot._mode];
-        sound = &mode->_sound;
-        continuous = mode->_soundContinuous;
+        // An Arma 2/3 weapon's own shot is one round, played for every round of a burst
+        // (Arma 2: soundBurst=0); a CWA burst mode's sound is the whole burst, played once.
+        const bool ownShot = muzzle && muzzle->_shotSound.name.GetLength() > 0;
+        sound = ownShot ? &muzzle->_shotSound : &mode->_sound;
+        continuous = ownShot ? false : mode->_soundContinuous;
         // sound only on first shot in burst
-        if (magazine->_burstLeft > 0)
+        if (magazine->_burstLeft > 0 && !ownShot)
         {
             noSound = true;
         }
@@ -2537,15 +2972,8 @@ bool EntityAI::FireWeapon(int weapon, TargetType* target)
 
     int burst = mode->_mult;
     saturateMin(burst, magazine->_ammo);
-    // Malprave aiCoverGrenades: squad grenade interval (AIHunt) -- remember when an AI soldier threw one
-    if (mode->_ammo && mode->_ammo->_simulation == AmmoShotShell && type && type->_initSpeed < 30)
-    {
-        AIUnit* thrower = CommanderUnit();
-        if (thrower && !thrower->IsAnyPlayer())
-        {
-            Hunt::OnGrenadeThrown(thrower->GetGroup());
-        }
-    }
+    // Malprave aiCoverGrenades: the squad grenade interval is claimed when the throw starts (Man::FireWeapon,
+    // AI-XRAY-001), not here at the release
     magazine->_ammo -= burst;
     // Infinite ammo cheat — refund the burst we just consumed.  Hook
     // lives here so it covers MGun / shell / missile firing through

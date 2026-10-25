@@ -37,6 +37,9 @@ class Shot: public Vehicle
 	float VisibleSize() const override {return 0;}
 	void Sound( bool inside, float deltaT ) override;
 	void UnloadSound() override;
+	/// Share of the ammo's `hit` this shot delivers right now (1 except for a round
+	/// slowed under water; see ShotShell::UnderwaterHitScale).
+	virtual float DamageScale() const {return 1.0f;}
 
 	float Rigid() const override {return 0;}
 
@@ -136,7 +139,8 @@ protected:
 
 	/// Seconds left on the fuse. Only meaningful while `_fuseArmed`.
 	float _fuse = 0.0f;
-	/// True when the ammo config declared `explosionTime > 0`. Everything the fuse
+	/// True when the round has a fuse (GrenadeFuse::FuseSeconds > 0: the config's `explosionTime`, or the default
+	/// one a stock hand grenade now gets). Everything the fuse
 	/// changes hangs off this one flag, so a round without it takes byte-identical
 	/// paths to before.
 	bool _fuseArmed = false;
@@ -144,6 +148,21 @@ protected:
 	/// skipped while this holds -- otherwise gravity keeps accumulating into
 	/// `_speed` and a resting grenade slowly sinks through the ground it lies on.
 	bool _atRest = false;
+
+	/// UNDERWATER (UnderwaterBallistics.hpp): the round crossed the water surface and
+	/// now moves under water drag -- a bullet is spent within a metre or two, a fused
+	/// grenade sinks. Everything hangs off this flag; above water nothing changes.
+	bool _underwater = false;
+	float _waterEntrySpeed = 0.0f; ///< m/s as it entered: the reference its hit scales against
+	float _waterK = 0.0f;          ///< water drag k (1/m) of a bullet
+	float _waterStepSpeed = 0.0f;  ///< speed at the start of this tick's underwater segment
+	float _hitScaleNow = 1.0f;     ///< DamageScale() for the hit being resolved this tick
+
+	/// Moves `position` one tick under water and updates `_speed` (exact drag for a
+	/// bullet, a sinking step for a grenade). Records the bullet's bubble trail.
+	void StepUnderwater(Vector3& position, float deltaT);
+	/// Share of the hit a bullet still carries at `point` on this tick's segment.
+	float UnderwaterHitScale(Vector3Par point) const;
 
 public:
 	ShotShell( EntityAI *parent, const AmmoType *type );
@@ -162,6 +181,7 @@ public:
 	void Detonate(Vector3Par pos, Object *hitObject, Vector3Par hitNormal);
 	bool Invisible() const override;
 	void Sound( bool inside, float deltaT ) override;
+	float DamageScale() const override {return _underwater ? _hitScaleNow : 1.0f;}
 
 	USE_CASTING(base)
 	USE_FAST_ALLOCATOR
@@ -289,6 +309,7 @@ class SmokeShell: public ShotShell
 
 protected:
 	SmokeSource _smoke;
+	float _volumeColor[4] = {0.8f, 0.8f, 0.8f, 1.2f}; // FIRE-001 smoke plume: linear albedo, density
 
 public:
 	SmokeShell( EntityAI *parent, const AmmoType *type );

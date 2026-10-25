@@ -34,9 +34,18 @@ struct ScriptLabel
 namespace Poseidon
 {
 
+struct ScriptFiber; // Scripts.cpp: Arma 2 scheduled code running on its own stack
+
+// Arma 3 runs a mission's scheduled scripts behind its briefing, where the mission's time stands at
+// 0. While this is set (the briefing's own script steps), a script that gave the frame back resumes
+// on the next step instead of waiting for time to move.
+void SetScriptTimeStands(bool stands);
+
 class Script : public RemoveLLinks
 {
+	friend struct ScriptFiber;
 protected:
+	ScriptFiber *_fiber = nullptr;
 	GameValue _argument;
 	Poseidon::Foundation::Time _baseTime;
 	int _currentLine;
@@ -47,12 +56,23 @@ protected:
 	float _suspendedUntil;
 	int _maxLinesAtOnce;
 	RString _name;
+	int _handle = 0;
 
 public:
 	Script();
 	Script(RString name, GameValuePar argument, int maxLines=-1);
 	Script(const AutoArray<RString> &lines, GameValuePar argument, int maxLines=-1);
 	~Script() override;
+
+	// Scheduled SQF (spawn / execVM): `code` is split into its top-level statements;
+	// a top-level `waitUntil {..}` or `sleep n` suspends the script exactly like SQS
+	// '@' and '~'. Suspension nested inside other statements is not available and is
+	// reported once. Returns a script with a fresh handle (see GetHandle).
+	static Script *CreateFromCode(RString name, RString code, GameValuePar argument);
+	// Arma 2: the same as a coroutine that may suspend anywhere (see ScriptFiber).
+	static Script *CreateFiberScript(RString name, RString code, GameValuePar argument);
+	int GetHandle() const {return _handle;}
+	static Script *FindByHandle(int handle);
 
 	RString GetDebugName() const {return _name;}
 	void SetName(RString name) {_name=name;}
@@ -68,6 +88,7 @@ public:
 	static Script *CreateObject(ParamArchive &ar) {return new Script();}
 	
 	bool SimulateBody();
+	bool SimulateFiber();
 	bool OnSimulate();
 	bool Simulate(float deltaT);
 	bool IsTerminated() const;

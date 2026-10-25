@@ -180,9 +180,18 @@ protected:
 
 	RString _action;
 
+	// style ST_PICTURE (Arma 1 strategic-map icons): _text names a texture
+	Ref<Texture> _picture;
+	RString _pictureName;
+
 public:
 
 	CActiveText(ControlsContainer *parent, int idc, const ParamEntry &cls);
+
+	// Hover and click respond only over the drawn text, not the whole layout
+	// rectangle: menu rows are far wider than their labels, and a click beside
+	// one used to land on it. A control without text keeps its full rectangle.
+	bool IsInside(float x, float y) override;
 
 	bool OnKeyDown(unsigned nChar, unsigned nRepCnt, unsigned nFlags) override;
 	bool OnKeyUp(unsigned nChar, unsigned nRepCnt, unsigned nFlags) override;
@@ -524,6 +533,10 @@ protected:
 	Poseidon::Foundation::UITime _scrollTime;
 
 	CScrollBar _scrollbar;
+	// Arma-era list boxes paint the selected row in colorSelectBackground (CWA paints it in
+	// colorText, which Arma sets to the black of its text).
+	bool _hasSelBg = false;
+	PackedColor _selBgColor;
 public:
 
 	CListBox(ControlsContainer *parent, int idc, const ParamEntry &cls);

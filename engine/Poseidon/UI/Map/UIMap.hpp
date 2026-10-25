@@ -2,8 +2,14 @@
 
 #include <Poseidon/UI/Map/UIMapBase.hpp>
 
+#include <memory>
+
 namespace Poseidon
 {
+namespace Arma3Menu
+{
+class Screen;
+}
 
 class DisplayNotebook : public Display
 {
@@ -250,7 +256,12 @@ protected:
 };
 
 #define WEAPON_SLOTS			5
-#define MAGAZINE_SLOTS		14
+// The gear page's magazine slots: items from 0, hand gun magazines from
+// HANDGUN_MAGAZINE_START. CWA men carry 10 + 4; --arma1 men 12 + 8 (Arma 1), and the mask
+// holds up to 15 items, so the hand gun magazines start after them. (10 + 4 until 2026-10-25.)
+#define HANDGUN_MAGAZINE_START	15
+#define ITEM_ROW_SPLIT		4	// the first row of items, the primary weapon's
+#define MAGAZINE_SLOTS		(HANDGUN_MAGAZINE_START + 15)
 #define TOTAL_SLOTS				WEAPON_SLOTS + MAGAZINE_SLOTS
 
 struct UnitWeaponsInfo : public SerializeClass
@@ -342,6 +353,11 @@ protected:
 	WeaponsInfo _weaponsInfo;
 
 	CursorType _cursor;
+
+	// Arma 3's own briefing / map screen (Arma3Menu): its diary over the engine's map, which then
+	// fills the screen; CWA's notebook, compass, watch and radio are put away.
+	std::shared_ptr<Arma3Menu::Screen> _arma3;
+	void ApplyArma3Look();
 public:
 
 	DisplayMap(ControlsContainer *parent, RString resource);
@@ -381,6 +397,7 @@ public:
 
 	void OnButtonClicked(int idc) override;
 	void OnHTMLLink(int idc, RString link) override;
+	void OnLBSelChanged(int idc, int curSel) override;
 
 	void ResetHUD() override;
 
@@ -748,6 +765,8 @@ public:
 
 	void ShowButtons();
 	void CycleControllerMode(int delta);
+	// Whole World: save the mission being edited (the world map moves the mission area by restarting).
+	bool SaveMissionTo(const char *filename) { return SaveTemplates(filename); }
 
 protected:
 	LSError SerializeAll(ParamArchive &ar, bool merge = false);
@@ -788,10 +807,10 @@ public:
 
 
 	void ShowHint(RString hint);
+	void OpenInterrupt(); // the pause menu (Esc); public for the capture click hook
 
 protected:
 	void InitUI();
-	void OpenInterrupt();
 	void OpenInventory();
 	bool RetryMission();
 //	bool RestartMission();

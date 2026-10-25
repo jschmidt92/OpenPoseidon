@@ -1,8 +1,10 @@
 #include <Poseidon/World/Entities/Infantry/SoldierOldCommon.hpp>
+#include <Poseidon/AI/AICombatPace.hpp> // AI-AIM-001
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 hooks, empty unless POSEIDON_DIAG
 #include <Poseidon/World/Weather/SnowField.hpp>
 #include <Poseidon/World/Weather/MudField.hpp>
 #include <Poseidon/World/Weather/MudContact.hpp>
+#include <Poseidon/World/Effects/MudSpray.hpp>
 #include <Poseidon/World/Weather/SandContact.hpp>
 #include <Poseidon/World/Weather/SandField.hpp>
 #include <Poseidon/World/Entities/Infantry/GroundBootEvents.hpp>
@@ -195,6 +197,18 @@ void Man::EmitGroundBootContact(bool left, SimulationImportance prec)
         if (yr <= ys + 0.2f && !GLandscape->InTerrainHoleBelow(pos, 0.3f))
         {
             mudChanged = StampMudFootstep(*GLandscape, *this, pos, Direction());
+            if (mudChanged)
+            {
+                // MUD-001: a boot in wet mud splashes a little of it up and forward
+                MudSprayReport spray;
+                spray.pos = pos + VUp * 0.03f;
+                spray.vel = Direction() * 0.5f + VUp * 0.9f;
+                spray.count = 10.0f;
+                spray.velSpread = 0.6f;
+                spray.size = 0.022f;
+                spray.posSpread = 0.06f;
+                ReportMudSpray(spray);
+            }
             sandChanged = StampSandFootstep(*GLandscape, *this, pos, Direction());
             if (GSnow().CoverActive() && !GSnow().NeedsWalkingChannelAt(pos.X(), pos.Z()) && ys > GLandscape->GetSeaLevel())
             {
@@ -239,11 +253,36 @@ bool Man::AdvanceMoveQueue(float deltaT, float adjustSpeed, float& moveX, float&
     bool change = false;
     bool finished = false;
 
+    // AnimDone (Arma 3's scripts end a cutscene move by it: Old Man's opening crouch)
+    if (_animDonePending.GetLength() > 0)
+    {
+        const RString done = _animDonePending;
+        _animDonePending = RStringB();
+        OnEvent(EEAnimDone, done);
+    }
+
     const MoveInfo* prim = Type()->GetMoveInfo(_primaryMove.id);
     if (prim)
     {
         const AnimationRT* primA = *prim;
         float priSpeed = prim->GetSpeed();
+        // AI-AIM-001 (CfgAIFork proneSpeed): AI drop to prone and turn while prone faster (the player never)
+        if (CombatPace::ProneSpeed() != 1.0f && Brain() && !Brain()->IsPlayer() && !QIsManual())
+        {
+            const RStringB name = Type()->GetMoveName(_primaryMove.id);
+            const char* n = name;
+            auto has = [n](const char* part)
+            {
+                for (const char* p = n; p && *p; ++p)
+                    if (strnicmp(p, part, strlen(part)) == 0)
+                        return true;
+                return false;
+            };
+            if (has("tolying") || has("lyingturn"))
+            {
+                priSpeed *= CombatPace::ProneSpeed();
+            }
+        }
         if (priSpeed > 1e5)
         {
             // static looped animation: no movement contribution
@@ -261,6 +300,8 @@ bool Man::AdvanceMoveQueue(float deltaT, float adjustSpeed, float& moveX, float&
             if (_primaryTime >= 1)
             {
                 finished = true;
+                if (GetEventHandlers(EEAnimDone).Size() > 0)
+                    _animDonePending = Type()->GetMoveName(_primaryMove.id);
                 if (primA->GetLooped())
                 {
                     _primaryTime -= 1;
@@ -697,6 +738,10 @@ void Man::StartActionProcessing(const UIAction& action, AIUnit* unit)
 
 bool Man::IsActionInProgress(MoveFinishF action) const
 {
+    if (_upperContext && _upperContext->function == action)
+    {
+        return true; // played on the upper body (SoldierOldUpperBody.cpp)
+    }
     if (_primaryMove.context && _primaryMove.context->function == action)
     {
         return true;
@@ -740,7 +785,9 @@ bool Man::ReloadMagazine(int slotIndex, int iMagazine)
             context->param2 = magazine->_id;
             context->param3 = muzzleID;
 
-            reloadOk = unit->GetPerson()->PlayAction(magazine->_type->_reloadAction, context);
+            // RELOAD-LAYER: the player's reload from the action menu keeps him free to move.
+            reloadOk = StartReloadOnUpperBody(magazine->_type, context, false, false) ||
+                       unit->GetPerson()->PlayAction(magazine->_type->_reloadAction, context);
             if (reloadOk)
             {
                 PlayReloadMagazineSound(slotIndex, muzzle);

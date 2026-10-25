@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <functional>
+#include <cmath>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/AI/AI.hpp>
 #include <Poseidon/UI/Locale/Stringtable/CodepageTranscode.hpp>
@@ -124,9 +128,20 @@ void AILocker::UnlockItem(int x, int z, bool soldier)
     fld->Lock(x1, z1, soldier, false);
 }
 
+// Cells a lock of this radius covers. A non-finite or absurd radius (a vehicle whose model
+// reports a huge bounding sphere: C6B_DogsOfWar sat 60 s in LockPosition) would lock
+// millions of cells; no real vehicle covers more than a few dozen. Lock and unlock both
+// come here, so they always cover the same cells.
+static int LockCellRange(float radius)
+{
+    if (!std::isfinite(radius) || radius <= 0.0f)
+        return 0;
+    return std::min(toIntCeil(std::min(radius, 200.0f) * InvOperItemGrid), 64);
+}
+
 void AILocker::LockPosition(Vector3Val pos, float radius, bool soldier, float size)
 {
-    int LockRange = toIntCeil(radius * InvOperItemGrid);
+    int LockRange = LockCellRange(radius);
     if (LockRange < 0)
     {
         LockRange = 0;
@@ -185,11 +200,14 @@ void AILocker::LockPosition(Vector3Val pos, float radius, bool soldier, float si
         {
             for (int z = zMin; z <= zMax; z++)
             {
-                const ObjectList& list = GLandscape->GetObjects(z, x);
-                int n = list.Size();
+                // Only buildings have path points: the cell's own mirror of them (see
+                // ObjectListFull::_pathObjects) instead of every object in it. Every match
+                // is locked, so the order they are visited in does not matter.
+                const ObjectListFull* list = GLandscape->GetObjects(z, x).GetList();
+                const int n = list ? list->GetPathObjectCount() : 0;
                 for (int i = 0; i < n; i++)
                 {
-                    Object* obj = list[i];
+                    Object* obj = list->GetPathObject(i);
 
                     IPaths* building = const_cast<IPaths*>(obj->GetIPaths());
                     if (!building)
@@ -216,7 +234,7 @@ void AILocker::LockPosition(Vector3Val pos, float radius, bool soldier, float si
 
 void AILocker::UnlockPosition(Vector3Val pos, float radius, bool soldier)
 {
-    int LockRange = toIntCeil(radius * InvOperItemGrid);
+    int LockRange = LockCellRange(radius);
     if (LockRange < 0)
     {
         LockRange = 0;
@@ -272,7 +290,7 @@ void AILocker::UnlockPosition(Vector3Val pos, float radius, bool soldier)
 
 void AILocker::LockPositionMan(Vector3Val pos, float radius)
 {
-    int LockRange = toIntCeil(radius * InvOperItemGrid);
+    int LockRange = LockCellRange(radius);
     if (LockRange < 0)
     {
         LockRange = 0;
@@ -296,7 +314,7 @@ void AILocker::LockPositionMan(Vector3Val pos, float radius)
 
 void AILocker::UnlockPositionMan(Vector3Val pos, float radius)
 {
-    int LockRange = toIntCeil(radius * InvOperItemGrid);
+    int LockRange = LockCellRange(radius);
     if (LockRange < 0)
     {
         LockRange = 0;
@@ -464,10 +482,31 @@ void AIUnit::Load(const ParamEntry& cls)
         info._name = DecodeLegacyTextToRString(cls >> "name", GLanguage);
         info._face = cls >> "face";
         info._glasses = cls >> "glasses";
+        // --arma2: Arma 2 gives every man it creates a face of his own kind (his class's
+        // identityTypes); this identity is CWA's next generic one, its face a CWA face.
+        if (const RString a2Face = Arma1Compat::Arma2RandomFace(
+                soldier->GetType()->GetName(), soldier->GetShape() ? soldier->GetShape()->GetName() : "",
+                static_cast<uint32_t>(std::hash<std::string>{}(std::string((const char*)info._name) + "|" +
+                                                                (const char*)info._face)));
+            a2Face.GetLength() > 0)
+        {
+            info._face = a2Face;
+        }
         soldier->SetFace(info._face);
         soldier->SetGlasses(info._glasses);
         info._speaker = cls >> "speaker";
         info._pitch = cls >> "pitch";
+        // --arma2: and a voice of his kind (Male01EN, Male03TK, ...), at one of Arma 2's
+        // pitches (CfgVoice >> variants).
+        const uint32_t voiceSeed = static_cast<uint32_t>(
+            std::hash<std::string>{}(std::string((const char*)info._name) + "|voice|" + (const char*)info._face));
+        if (const RString a2Voice = Arma1Compat::Arma2RandomSpeaker(
+                soldier->GetType()->GetName(), soldier->GetShape() ? soldier->GetShape()->GetName() : "", voiceSeed);
+            a2Voice.GetLength() > 0)
+        {
+            info._speaker = a2Voice;
+            info._pitch = Arma1Compat::Arma2VoicePitch(voiceSeed / 7);
+        }
         SetSpeaker(info._speaker, info._pitch);
     }
 }
@@ -1281,8 +1320,36 @@ void AIUnit::SetSpeaker(RString speaker, float pitch)
         speaker = (cfg >> "voices")[0];
     }
     const ParamEntry* entry = cfg.FindEntry(speaker);
+    // --arma2: a CWA voice on an Arma 2 man (the player's, from the CWA profile) becomes an
+    // Arma 2 voice of his kind, as every other Arma 2 man has.
+    if (entry && Arma1Compat::Generation() >= 2)
+    {
+        if (Person* person = GetPerson())
+        {
+            const RString name = person->GetInfo()._name;
+            const RString a2 = Arma1Compat::Arma2RandomSpeaker(
+                person->GetType()->GetName(), person->GetShape() ? person->GetShape()->GetName() : "",
+                static_cast<uint32_t>(std::hash<std::string>{}(std::string((const char*)name) + "|voice|" +
+                                                                (const char*)speaker)));
+            if (a2.GetLength() > 0)
+            {
+                speaker = a2;
+                entry = nullptr;
+            }
+        }
+    }
     if (!entry)
     {
+        // --arma2: an Arma 2 voice speaks Arma 2's radio, CWA's first voice what it lacks.
+        if (const ParamEntry* a2 = Arma1Compat::Arma2VoiceClass(speaker))
+        {
+            if (const ParamEntry* a2Words = Arma1Compat::Arma2VoiceWords(*a2))
+            {
+                const ParamEntry& fallback = cfg >> RString((cfg >> "voices")[0]);
+                _speaker = new Speaker(new BasicSpeaker(fallback, *a2, *a2Words), pitch);
+                return;
+            }
+        }
         speaker = (cfg >> "voices")[0];
         entry = cfg.FindEntry(speaker);
     }
@@ -1369,6 +1436,9 @@ bool AIUnit::IsInCargo() const
 
 void AIUnit::SetAbility(float ability)
 {
+    // Arma 1/2 missions may give a unit skill 0; keep the inverse finite.
+    if (ability <= 0 && Poseidon::Arma1Compat::Active())
+        ability = 0.05f;
     AI_ERROR(ability > 0);
     _ability = ability;
     _invAbility = 1.0 / ability;
@@ -2123,6 +2193,11 @@ bool AIUnit::CreateNoRoadPath(Vector3Val from, Vector3Val pos, const IPaths* fro
     float zStart = fromOutside.Z();
     float xEnd = toOutside.X();
     float zEnd = toOutside.Z();
+    if (!std::isfinite(xStart) || !std::isfinite(zStart) || !std::isfinite(xEnd) || !std::isfinite(zEnd))
+    {
+        LOG_WARN(AI, "Unit {}: path with a non-finite end point refused", (const char*)GetDebugName());
+        return false;
+    }
 
     float xsf = xStart * InvOperItemGrid;
     float zsf = zStart * InvOperItemGrid;
@@ -2152,6 +2227,12 @@ bool AIUnit::CreateNoRoadPath(Vector3Val from, Vector3Val pos, const IPaths* fro
 #else
     const int border = 1;
 #endif
+
+    if ((xMax - xMin + 1) * (zMax - zMin + 1) > 400)
+    {
+        LOG_WARN(AI, "Unit {}: operative path over {}x{} fields ({:.0f},{:.0f} -> {:.0f},{:.0f})", (const char*)GetDebugName(),
+                 xMax - xMin + 1, zMax - zMin + 1, xStart, zStart, xEnd, zEnd);
+    }
 
     OperMap map;
     map.CreateMap(veh, xMin - border, zMin - border, xMax + border, zMax + border);

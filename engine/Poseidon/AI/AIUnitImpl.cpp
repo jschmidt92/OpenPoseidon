@@ -4,6 +4,8 @@
 #include <Poseidon/AI/AICostAccum.hpp> // PERF-019
 #include <Poseidon/AI/AITuning.hpp>    // PERF-020
 #include <Poseidon/AI/AIRadio.hpp>
+#include <Poseidon/AI/AIDangerList.hpp> // AI-XRAY-004: typed dangers
+#include <Poseidon/AI/AIGrenadeDanger.hpp>
 #include <Poseidon/AI/AIHunt.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
@@ -1383,6 +1385,22 @@ void AIUnit::SetWatch()
                     _watchDirHead = _watchPos - GetVehicle()->CameraPosition();
                     _watchDirHead.Normalize();
                 }
+                // AI-XRAY-004: nothing hostile in view -- look where the top danger is (X-Ray: turn to it)
+                Vector3 dangerPos;
+                AICenter* center = grp ? grp->GetCenter() : nullptr;
+                const bool enemyInView = tgt && center && center->IsEnemy(tgt->side);
+                if (!enemyInView && DangerList::Top(this, dangerPos))
+                {
+                    Vector3 dir = dangerPos - GetVehicle()->CameraPosition();
+                    dir[1] = 0;
+                    if (dir.SquareSize() > 1.0f)
+                    {
+                        dir.Normalize();
+                        _watchDir = dir;
+                        _watchDirHead = dir;
+                        DangerList::LogTurn(this, dangerPos);
+                    }
+                }
             }
         }
         break;
@@ -1945,6 +1963,19 @@ bool AIUnit::CreateOperativePath()
         if (!CreatePath(Position(), _expPosition))
         {
             LOG_DEBUG(AI, "{}: path not found - iteration {}", (const char*)GetDebugName(), _iter);
+            {
+                // POSEIDON_STRAT_DIAG=1 (see PathPlanner.cpp): the operative half of "can't get there".
+                static const bool diag = []
+                {
+                    const char* v = std::getenv("POSEIDON_STRAT_DIAG");
+                    return v && *v && *v != '0';
+                }();
+                static int budget = 200;
+                if (diag && budget-- > 0)
+                    LOG_INFO(AI, "OPER {}: no operative path {:.0f},{:.0f} -> {:.0f},{:.0f} (iteration {})",
+                             (const char*)GetDebugName(), Position().X(), Position().Z(), _expPosition.X(),
+                             _expPosition.Z(), _iter);
+            }
             if (++_iter > 2)
             {
                 LOG_DEBUG(AI, "  fail command");
@@ -2039,6 +2070,8 @@ bool AIUnit::Think(ThinkImportance prec)
     // find attack position if neccessary
 
     SetWatch(); // instrumented inside: unitAttack + unitWatch cover it entirely
+    // AI-XRAY-003: get clear of a live grenade first
+    GrenadeDanger::React(this);
     // Malprave aiHunting: soldier-level hunting of an enemy that has dropped out of sight
     Hunt::Think(this);
     // some parts of AIUnit::Think may be executed less often

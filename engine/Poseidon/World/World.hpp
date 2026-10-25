@@ -1,4 +1,7 @@
 #pragma once
+
+#include <map>
+#include <vector>
 #include <Poseidon/Core/Types.hpp>
 #include <Poseidon/Core/Game/FixedStepAccumulator.hpp>
 #include <Poseidon/World/Entities/Vehicles/Vehicle.hpp>
@@ -190,6 +193,13 @@ struct GridInfo
 
 DECL_ENUM(AICenterMode)
 
+/// The clock the renderer animates with (water, clouds, foliage sway): the simulation clock at the
+/// DRAWN time, i.e. between the last two ticks by the same interpolation alpha the objects are
+/// drawn with (REN-INTERP-001). Glob.time only moves on fixed 1/60 s ticks, so at 87 fps about
+/// one frame in three saw no advance at all and every wave stepped unevenly ("as if it skipped
+/// frames"). Equals Glob.time when paused or with POSEIDON_RENDER_INTERP=0.
+float PresentationClockSeconds();
+
 class World
 {
 	protected:
@@ -213,6 +223,14 @@ class World
 	Ref<CameraEffect> _cameraEffect;
 	Ref<TitleEffect> _titleEffect;
 	Ref<TitleEffect> _cutEffect;
+	// Arma 3's numbered cut layers ("10 cutText [...]"): one effect each, drawn in layer order
+	// with _cutEffect as layer 0; SetCutEffect fills the layer SetCutLayer chose
+	std::map<int, Ref<TitleEffect>> _cutLayers;
+	int _cutLayer = 0;
+	// A title / cut layer a script blacked the screen with (BLACK, BLACK OUT, BLACK FADED), and since
+	// when: Arma 3 missions lift a stuck one (LiftStuckBlack).
+	const TitleEffect* _blackEffect = nullptr;
+	Poseidon::Foundation::UITime _blackSince;
 	RefArray<Script> _scripts;
 	LLink<Script> _cameraScript;
 
@@ -272,6 +290,9 @@ class World
 
 	float _actualFog;
 	float _wantedFog;
+	// FOG-HOLD: a fog the player set by hand (Weather tab "Fog amount", POSEIDON_TEST_FOG) stays
+	// put -- the weather's random drift and the mission's forecast no longer move it. < 0 = not held.
+	float _heldFog = -1.0f;
 	float _speedFog; // speed of change
 
 	// geography latitude - positive is south
@@ -346,6 +367,23 @@ class World
 	AutoArray<Vector3> _taxiInPathsCiv;
 	AutoArray<Vector3> _taxiOffPathsCiv;
 
+	// Every airport of the world: [0] the main one (ilsPosition / ilsDirection / ilsTaxiIn / ilsTaxiOff), then
+	// each class of CfgWorlds >> world >> SecondaryAirports (Arma's convention; none = the main one only, as
+	// before). An AI plane uses the nearest its side may use (AirplaneAuto::Airport).
+	public:
+	struct Airport
+	{
+		Vector3 pos, dir;
+		AutoArray<Vector3> taxiIn, taxiOff;
+		// the class name ("main" or the world's airportName for [0]); a mission's say (setAirportClosed,
+		// setAirportSide): closed to all, or only for this side and its friends (-1: anyone)
+		RString name;
+		bool closed = false;
+		int side = -1;
+	};
+	protected:
+	std::vector<Airport> _airports;
+
 	float _gridOffsetX;
 	float _gridOffsetY;
 	AutoArray<GridInfo> _gridInfo;
@@ -416,6 +454,17 @@ class World
 
 	const AutoArray<Vector3> GetTaxiInPath( TargetSide side );
 	const AutoArray<Vector3> GetTaxiOffPath( TargetSide side );
+	// The same for one of the world's airports (0 = the main one; out of range = the main one).
+	int AirportCount() const { return static_cast<int>(_airports.size()); }
+	int NearestAirport( Vector3Par pos ) const;
+	// by number (0 = the main one) or name, case-insensitive; -1 when there is none
+	int FindAirport( const char *name ) const;
+	const Airport &GetAirport( int airport ) const {return _airports[airport];}
+	void SetAirportClosed( int airport, bool closed ) {_airports[airport].closed = closed;}
+	void SetAirportSide( int airport, int side ) {_airports[airport].side = side;}
+	bool GetILS( Vector3 &pos, Vector3 &dir, TargetSide side, int airport );
+	const AutoArray<Vector3> GetTaxiInPath( TargetSide side, int airport );
+	const AutoArray<Vector3> GetTaxiOffPath( TargetSide side, int airport );
 
 	float GetGridOffsetX() const {return _gridOffsetX;}
 	float GetGridOffsetY() const {return _gridOffsetY;}
@@ -455,7 +504,14 @@ class World
 	void ForceEnd(bool force = true) {_endForced = force;}
 
 	void SetCutEffect( TitleEffect *effect );
-	TitleEffect *GetCutEffect() const {return _cutEffect;}
+	TitleEffect *GetCutEffect() const {return _cutLayer == 0 ? _cutEffect.GetRef() : CutLayerEffect(_cutLayer);}
+	void SetCutLayer(int layer) {_cutLayer = layer;}
+	TitleEffect *CutLayerEffect(int layer) const {auto it = _cutLayers.find(layer); return it == _cutLayers.end() ? nullptr : it->second.GetRef();}
+	// The effect just set by titleText / cutText holds the screen black (see _blackEffect).
+	void NoteBlackEffect( const TitleEffect *effect );
+	// Arma 3 (--arma3): a mission whose scripts went black and never come back (they wait on Arma 3
+	// features this engine lacks) is shown after 30 s, with a log line, instead of staying black.
+	void LiftStuckBlack();
 
 	void AddScript(Script *script);
 #if POSEIDON_DIAG
@@ -464,6 +520,8 @@ class World
 	Script *DiagScript(int i) const {return _scripts[i];}
 #endif
 	void TerminateScript(Script *script);
+	// ends every running script; returns how many there were
+	int TerminateAllScripts();
 
 	void AddAttachment( AttachedOnVehicle *attach );
 	void RemoveAttachment( AttachedOnVehicle *attach );
@@ -730,6 +788,9 @@ class World
 	void ScanPlayers(StaticArrayAuto< OLink<Person> > &players); // used in multiplayers
 
 	void SetWeather(float overcast, float fog, float time);
+	// FOG-HOLD: set the fog now and keep it there until the next HoldFog (< 0 releases it).
+	void HoldFog(float fog);
+	bool FogHeld() const { return _heldFog >= 0.0f; }
 	void SetDate(int year, int month, int day, int hour, int minute);
 	float GetLatitude() const {return _latitude;}
 	float GetLongitude() const {return _longitude;}

@@ -16,9 +16,13 @@ Python requirement. For an already built tool:
 ./scripts/Build-DefaultContent.ps1
 ```
 
-Output is `dist/x64-win-<configuration>/Mods/@OP_VisualUpgrade`, containing mod.json
-and AddOns/op_ground_materials.pbo, plus `@OP_VehicleActions` with mod.json and
-AddOns/op_jeep_actions.pbo. Deploy.ps1 copies these own files and verifies
+Output is `dist/x64-win-<configuration>/assets/Mods/@OP_VisualUpgrade`, containing mod.json
+and AddOns/op_ground_materials.pbo, plus `@OP_VehicleActions`, `@OP_Swim`, `@OP_TidewaterBoat` and
+`@OP_TidewaterWildlife` beside it. Engine feature packs live in `assets/Mods` (owner, 2026-10-20): the
+game is `OpenPoseidon.exe` + `wgpu_renderer.dll` + `assets/`, and `scripts/Package-Share.ps1` builds
+exactly that for a player who has Cold War Assault installed. Maps (`@OP_Fusion`, `@OP_Showcase`,
+`@OP_SizeProbe`) stay in `Mods`. The engine looks in the other place too, and Deploy removes the files
+it put in an old `Mods/@OP_*` feature pack once the `assets` copy is installed. Deploy.ps1 copies these own files and verifies
 their SHA256; it does not modify Dta/Data.pbo, LandText.pbo, original models or WRP.
 Source-only roughness/height/soil artifacts are not claimed as bound maps.
 
@@ -58,11 +62,19 @@ An exact original-archive ownership check prevents the default road mapping from
 replacing a texture selected from a different user-mod archive. End-to-end user
 mod precedence and clean-release tests remain on the acceptance list.
 
+## Swim moves (`@OP_Swim`)
+
+`swim/` holds the swim moves (`config.cpp`, 19 RTMs, made by Claude). `scripts/Build-Swim.ps1`,
+which `Build-DefaultContent.ps1` calls, packs them as `Mods/@OP_Swim/AddOns/swim.pbo` (prefix
+`swim`) with the missions `swim-bay.Eden` and `swim-squad.Eden`. Without the pack, soldiers walk
+the sea bed as before. See `swim/README.md` for how they are made and the repair applied to them.
+
 ## Disable (restart required)
 
 ```powershell
 ./OpenPoseidon.exe --no-visual-upgrade
 ./OpenPoseidon.exe --no-vehicle-actions
+./OpenPoseidon.exe --no-swim
 ```
 
 These suppress automatic loading independently. Explicitly passing the same

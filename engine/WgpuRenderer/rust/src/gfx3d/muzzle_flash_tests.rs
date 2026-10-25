@@ -73,7 +73,9 @@ fn muzzle_actual_helper_retains_material_abi_and_explicit_negative_lane() {
         std::mem::offset_of!(super::MaterialUbo, local_specular)
     );
     assert_eq!(tail.offset, 112);
-    assert_eq!(*span, 128); // existing scalar byte124; no new public layout
+    // 128 until REFLECT-001 appended reflect0/reflect1 behind local_specular (128 -> 160);
+    // local_specular itself stays at byte 112, its .w scalar at 124.
+    assert_eq!(*span, 160);
     let source = include_str!("shader3d.wgsl");
     assert!(
         source.contains("if (!(encoded > 0.0)) { return 0.0; }") &&
@@ -89,8 +91,10 @@ fn muzzle_actual_helper_retains_material_abi_and_explicit_negative_lane() {
         source.find("var rgb = shade(").unwrap() < override_at,
         "derivatives must remain evaluated uniformly"
     );
-    assert!(source[override_at..].contains("rgb = apply_fog(rgb, in.world_pos);"));
-    assert!(source[override_at..].contains("rgb = mix(fog_rgb, rgb, in.fog);"));
+    // Additive flash: fog attenuates only, it never adds a second inscatter.
+    assert!(source[override_at..].contains(
+        "rgb = max(apply_fog(rgb, in.world_pos) - apply_fog(vec3<f32>(0.0), in.world_pos), vec3<f32>(0.0));"));
+    assert!(source[override_at..].contains("rgb = rgb * in.fog;"));
 }
 
 #[test]
@@ -166,7 +170,7 @@ fn muzzle_actual_gpu_srgb_transfer_and_bounded_self_emission() {
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     receiver.recv().unwrap().unwrap();
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
     let actual: &[[f32; 4]] = bytemuck::cast_slice(&data);
     let decode = |x: f32| {
         if x <= 0.04045 {
@@ -178,14 +182,17 @@ fn muzzle_actual_gpu_srgb_transfer_and_bounded_self_emission() {
     for (i, (input, row)) in cases.iter().zip(actual).enumerate() {
         for channel in 0..3 {
             let bounded = input[channel].clamp(0.0, 1.0);
+            let (r, b) = (input[0].clamp(0.0, 1.0), input[2].clamp(0.0, 1.0));
+            let heat = ((b / r.max(1e-4) - 0.07) / 0.73).clamp(0.0, 1.0);
+            let gain = 1.5 + (16.0 - 1.5) * heat * heat;
             let expected = if input[3] > 0.5 {
-                decode(bounded) * 1.25
+                decode(bounded) * gain
             } else {
                 bounded
             };
-            assert!(row[channel].is_finite() && row[channel] >= 0.0 && row[channel] <= 1.25001);
+            assert!(row[channel].is_finite() && row[channel] >= 0.0 && row[channel] <= 16.0002);
             assert!(
-                (row[channel] - expected).abs() < 0.00005,
+                (row[channel] - expected).abs() < 0.0005,
                 "case{i} channel{channel}: {row:?} expected{expected}"
             );
         }

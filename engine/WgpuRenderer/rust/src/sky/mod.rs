@@ -27,7 +27,27 @@ fn compose_sky(composer:&mut naga_oil::compose::Composer)->naga::Module {
 #[cfg(test)]
 mod reference;
 pub mod milkyway;
+// REFLECT-001 phase D: GGX-prefiltered mips of the reflection env map.
+pub mod env_prefilter;
+pub mod moonmap;
 pub mod starcat;
+
+// The island game composes the sky WITHOUT the WHOLE_WORLD define (shaders::shader_defs), but tests
+// always set it -- so a whole-world identifier used outside its #ifdef composed in every test and
+// panicked at renderer creation in every non-whole-world session (2026-10-23, moon_relief_tex). Compose
+// and validate that variant too.
+#[test]
+fn sky_wgsl_validates_outside_whole_world() {
+    let mut composer=crate::shaders::build_composer();
+    let mut defs=crate::shaders::shader_defs();
+    defs.remove("WHOLE_WORLD");
+    let module=composer.make_naga_module(naga_oil::compose::NagaModuleDescriptor {
+        source:include_str!("sky.wgsl"),file_path:"sky/sky.wgsl",shader_defs:defs,..Default::default()
+    }).unwrap_or_else(|e|panic!("compose wgr_sky_shader without WHOLE_WORLD: {}",e.emit_to_string(&composer)));
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(),naga::valid::Capabilities::all())
+        .validate(&module)
+        .unwrap_or_else(|e|panic!("sky.wgsl without WHOLE_WORLD fails validation: {e:?}"));
+}
 
 // Guards every sky.wgsl edit: parse + validate the module offline so a WGSL error
 // surfaces in CI/tests instead of as a pipeline-creation panic at runtime.
@@ -207,6 +227,7 @@ mod sky_device_tests {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
@@ -327,7 +348,8 @@ mod sky_device_tests {
             queue,
             params,
             ivp,
-            [0.0, 0.0, 0.0, 0.0],
+            if params.cloud4[3] > 0.5 { [6400.0, params.night_zenith[3], 6400.0, 0.0] }
+            else { [0.0, 0.0, 0.0, 0.0] },
             &bytemuck::Zeroable::zeroed(),
             &bytemuck::Zeroable::zeroed(),
         );
@@ -379,7 +401,7 @@ mod sky_device_tests {
         queue.submit(Some(encoder.finish()));
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let data = buf.slice(..).get_mapped_range();
+        let data = buf.slice(..).get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
         let halves: &[u16] = bytemuck::cast_slice(&data);
         let out = halves
             .chunks_exact(4)
@@ -395,6 +417,36 @@ mod sky_device_tests {
         drop(data);
         buf.unmap();
         out
+    }
+
+    #[test]
+    fn earth_daylight_space_has_catalogue_stars_below_the_tangent_horizon() {
+        let Some((device, queue)) = headless() else { return; };
+        let mut sky = super::Sky::new(&device, &queue, crate::HDR_FORMAT, 1);
+        sky.milky_way = 0.0; // Verify actual catalogue points, not a diffuse band.
+        let fwd = normalize([0.0, -0.25, 1.0]);
+        let right = normalize(cross([0.0, 1.0, 0.0], fwd));
+        let up = cross(fwd, right);
+        let ivp = [
+            [right[0] * 0.5, right[1] * 0.5, right[2] * 0.5, 0.0],
+            [up[0] * 0.5, up[1] * 0.5, up[2] * 0.5, 0.0],
+            [0.0; 4], [fwd[0], fwd[1], fwd[2], 1.0],
+        ];
+        let mut p = crate::ffi::WgrSky::default();
+        p.sun_dir = [0.0, 1.0, 0.0, 22.0]; // Daytime; ordinary night gate is closed.
+        p.params[1] = 0.0; // Isolate catalogue radiance from atmosphere/discs.
+        p.night_params[2] = 0.0;
+        p.fog_color[3] = 0.0;
+        p.night_zenith[3] = 10_000_000.0;
+        p.cloud0[0] = 0.0;
+        p.moon_params[3] = 0.0;
+        let ordinary = render_sky_rgba(&device, &queue, &mut sky, &p, ivp);
+        p.cloud4[3] = 1.0;
+        let earth = render_sky_rgba(&device, &queue, &mut sky, &p, ivp);
+        let energy = |v: &[[f32; 4]]| v.iter().map(|p| p[0] + p[1] + p[2]).sum::<f32>();
+        assert!(energy(&ordinary) < 1e-5, "ordinary daylight sky acquired stars");
+        assert!(energy(&earth) > 1e-3, "space catalogue missing: {}", energy(&earth));
+        assert!(earth.iter().flatten().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -742,12 +794,38 @@ struct SkyUniform {
     // own. SKY-004: y = moonlight gain on the cloud decks, z = the stylistic blue shift on that
     // light. w = current admitted weather-fog chroma neutralization (private).
     night_sky: [f32; 4],
+    // Whole world: x = origin latitude, y = longitude (radians); see sky.wgsl's `earth_frame`.
+    earth_frame: [f32; 4],
+    // Whole world geometry in world coordinates of the active frame (WgrSkyRuntime).
+    earth_centre: [f32; 4],
+    moon_centre: [f32; 4],
+    ecef_x: [f32; 4],
+    ecef_z: [f32; 4],
 }
 
 // The atmosphere-only fields that determine the LUTs (sun/night/exposure excluded,
 // since the sun is a LUT axis and those don't change the tables). A change here
 // dirties the LUTs; per-frame celestial pushes do not.
 type LutKey = [f32; 14];
+
+fn sky_lut_tolerance() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WGR_SKY_LUT_TOLERANCE").ok().and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.002)
+    })
+}
+
+/// Whether any key component moved more than `tol` relative to the built one (exact when 0).
+fn lut_key_moved(built: &LutKey, now: &LutKey, tol: f32) -> bool {
+    built.iter().zip(now.iter()).any(|(a, b)| {
+        if tol <= 0.0 {
+            a != b
+        } else {
+            (a - b).abs() > tol * a.abs().max(b.abs()).max(1e-12)
+        }
+    })
+}
 
 fn lut_key(sky: &WgrSky) -> LutKey {
     [
@@ -1097,6 +1175,8 @@ pub struct Sky {
     pub fog: crate::layered_fog::LayeredFog,
     // Main fullscreen sky pipeline (targets the scene format).
     sky_pipeline: wgpu::RenderPipeline,
+    // PERF-SKY-AFTER-PREPASS: sky_pipeline depth-tested against the prepass (render_depth_tested).
+    sky_pipeline_depth_tested: wgpu::RenderPipeline,
     // Single-sample twin for the resolution-scaled planar reflection.
     planar_sky_pipeline: wgpu::RenderPipeline,
     sky_bind: wgpu::BindGroup,
@@ -1106,6 +1186,9 @@ pub struct Sky {
     #[allow(dead_code)]
     env_tex: wgpu::Texture,
     env_view: wgpu::TextureView,
+    // REFLECT-001 phase D: the single-mip view the bake renders into, and the prefilter chain.
+    env_target_view: wgpu::TextureView,
+    env_prefilter: env_prefilter::EnvPrefilter,
     // Tileable 3D cloud noise, sampled by the cloud march (bound into sky_bind). Held to keep the
     // texture alive (the view/sampler are owned by the bind group).
     #[allow(dead_code)]
@@ -1115,6 +1198,8 @@ pub struct Sky {
     sh_pipeline: wgpu::ComputePipeline,
     sh_bind: wgpu::BindGroup,
     sh_buf: wgpu::Buffer,
+    // RFG-186: the ground-bounce inputs of the SH projection (sky_sh.wgsl `Ground`).
+    sh_ground_buf: wgpu::Buffer,
     // LUT build pipelines (target LUT_FORMAT) + their target views/binds.
     transmittance_pipeline: wgpu::RenderPipeline,
     transmittance_bind: wgpu::BindGroup,
@@ -1199,6 +1284,10 @@ pub struct Sky {
     cirrus_soft: f32,
     /// Eased, for the same reason the others are: this changes every cloud edge on screen at once.
     cirrus_soft_now: f32,
+    earth_frame: [f32; 4],
+    earth_geometry: [[f32; 4]; 4],
+    // The moon height map's lowest and highest height (metres; moonmap::MoonRelief).
+    moon_relief_range: [f32; 2],
     // Group(1) of cs_froxel: the terrain sun-shadow mask, rebuilt each frame (the mask
     // texture is Terrain-owned and regenerated) from the lent view + these two.
     froxel_shadow_layout: wgpu::BindGroupLayout,
@@ -1236,6 +1325,11 @@ pub struct Sky {
     // LUTs are rebuilt only when the atmosphere key changes (None = never built).
     last_lut: Option<LutKey>,
     lut_dirty: bool,
+    // PERF-CLOUD-TEMPORAL: the camera of the most recent upload (the main one by the time the
+    // over-scene march runs) and the phase counter of the 2x2 march rotation.
+    last_ivp: [[f32; 4]; 4],
+    last_cam: [f32; 3],
+    cloud_tc_frame: u32,
 }
 
 // One cached low-res cloud march target. `_tex` keeps the allocation alive for `view`.
@@ -1249,6 +1343,29 @@ struct CloudLoTarget {
     layer_fog: bool,
     composite_bind: Option<wgpu::BindGroup>,
     depth_bind: Option<wgpu::BindGroup>,
+    // PERF-CLOUD-TEMPORAL: last frame's march (copied after each over-scene march), the
+    // per-target uniform telling fs_cloud whether and how to reuse it, and what it was made with.
+    hist: wgpu::Texture,
+    hist_view: wgpu::TextureView,
+    tc_buf: wgpu::Buffer,
+    hist_valid: bool,
+    prev_ivp: Option<[[f32; 4]; 4]>,
+    prev_cam: [f32; 3],
+}
+
+/// fs_cloud's CloudTemporal uniform (sky.wgsl): the previous frame's direction projection and
+/// (enabled, phase, -, -).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CloudTemporalUniform {
+    prev_vp: [[f32; 4]; 4],
+    params: [f32; 4],
+}
+
+/// PERF-CLOUD-TEMPORAL lever: WGR_CLOUD_TEMPORAL=0 marches every pixel every frame.
+fn cloud_temporal_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("WGR_CLOUD_TEMPORAL").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
 // How many distinct low-res cloud sizes to keep. Two are live every frame (screen/2 and
@@ -1353,6 +1470,26 @@ impl Sky {
                 star_buf_entry(10),
                 star_buf_entry(11),
                 tex_entry(12),
+                // The whole world's moon surface map (moonmap.rs) and its sampler, wrapping in longitude.
+                tex_entry(13),
+                // The moon's topography (moonmap::MoonRelief): R32Float metres, read with textureLoad and
+                // filtered in the shader (moon_height_at), so not a filterable binding.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -1402,6 +1539,54 @@ impl Sky {
             &mw.texels,
         );
         let mw_view = mw_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // The whole world's moon: NASA LRO WAC mosaic from the game folder, or a 1x1 placeholder.
+        let moon_map = moonmap::load();
+        eprintln!("[wgr] sky: moon map {} ({}x{}, {} levels)", moon_map.source, moon_map.width, moon_map.height, moon_map.levels.len());
+        let moon_tex = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("wgr_sky_moon_map"),
+                size: wgpu::Extent3d { width: moon_map.width, height: moon_map.height, depth_or_array_layers: 1 },
+                mip_level_count: moon_map.levels.len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &moon_map.levels.concat(),
+        );
+        let moon_view = moon_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let relief = moonmap::load_relief();
+        eprintln!("[wgr] sky: moon relief {} ({}x{}, {} levels, {:.0}..{:.0} m)", relief.source, relief.width, relief.height,
+                  relief.levels.len(), relief.range[0], relief.range[1]);
+        let relief_tex = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("wgr_sky_moon_relief"),
+                size: wgpu::Extent3d { width: relief.width, height: relief.height, depth_or_array_layers: 1 },
+                mip_level_count: relief.levels.len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &relief.levels.concat(),
+        );
+        let relief_view = relief_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let moon_relief_range = relief.range;
+        let moon_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wgr_sky_moon_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         // Only the main sky pass draws into the (MSAA) scene target; the transmittance +
         // multiscatter LUTs are single-sample offscreen renders, so each pipeline takes its
         // own sample count.
@@ -1409,7 +1594,8 @@ impl Sky {
                              layout: &wgpu::BindGroupLayout,
                              fs: &str,
                              format: wgpu::TextureFormat,
-                             samples: u32| {
+                             samples: u32,
+                             depth: Option<wgpu::TextureFormat>| {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &[Some(layout)],
@@ -1425,7 +1611,15 @@ impl Sky {
                     compilation_options: Default::default(),
                 },
                 primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
+                // PERF-SKY-AFTER-PREPASS: the depth-tested twin draws only where the depth
+                // prepass left the far plane (reversed-Z 0; the triangle's own depth is 0).
+                depth_stencil: depth.map(|format| wgpu::DepthStencilState {
+                    format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState {
                     count: samples,
                     ..Default::default()
@@ -1441,7 +1635,7 @@ impl Sky {
                     compilation_options: Default::default(),
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
 
@@ -1451,6 +1645,7 @@ impl Sky {
             "fs_transmittance",
             LUT_FORMAT,
             1,
+            None,
         );
         let multiscatter_pipeline = make_pipeline(
             "wgr_sky_multiscatter",
@@ -1458,13 +1653,16 @@ impl Sky {
             "fs_multiscatter",
             LUT_FORMAT,
             1,
+            None,
         );
         let sky_pipeline =
-            make_pipeline("wgr_sky", &sky_layout, "fs_sky", color_format, sample_count);
+            make_pipeline("wgr_sky", &sky_layout, "fs_sky", color_format, sample_count, None);
+        let sky_pipeline_depth_tested = make_pipeline("wgr_sky_depth_tested", &sky_layout, "fs_sky",
+            color_format, sample_count, Some(crate::gfx3d::depth_format(device)));
         let planar_sky_pipeline =
-            make_pipeline("wgr_sky_planar", &sky_layout, "fs_sky", color_format, 1);
+            make_pipeline("wgr_sky_planar", &sky_layout, "fs_sky", color_format, 1, None);
         // Env-map bake: same group(0) layout as the sky pass, single-sample, LUT_FORMAT target.
-        let env_pipeline = make_pipeline("wgr_sky_env", &sky_layout, "fs_sky_env", ENV_FORMAT, 1);
+        let env_pipeline = make_pipeline("wgr_sky_env", &sky_layout, "fs_sky_env", ENV_FORMAT, 1, None);
         let env_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wgr_sky_env"),
             size: wgpu::Extent3d {
@@ -1472,7 +1670,9 @@ impl Sky {
                 height: ENV_H,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            // REFLECT-001 phase D: level 0 is the bake as before; levels 1.. are the GGX
+            // prefilter (env_prefilter.rs). Every existing reader samples level 0 explicitly.
+            mip_level_count: env_prefilter::ENV_MIPS,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: ENV_FORMAT,
@@ -1480,6 +1680,14 @@ impl Sky {
             view_formats: &[],
         });
         let env_view = env_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // A render target view must cover exactly one mip.
+        let env_target_view = env_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("wgr_sky_env_mip0"),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let env_prefilter = env_prefilter::EnvPrefilter::new(device, &env_tex, ENV_FORMAT, ENV_W, ENV_H);
 
         // SH-9 sky-irradiance projection: reads the env map (textureLoad, non-filtering) and writes
         // 9 vec4 RGB coefficients into sh_buf (also bound UNIFORM into the camera group). Zero-init
@@ -1495,9 +1703,24 @@ impl Sky {
                 | wgpu::BufferUsages::UNIFORM
                 | wgpu::BufferUsages::COPY_DST,
         });
+        let sh_ground_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgr_sky_sh_ground"),
+            contents: &[0u8; 64],
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let sh_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("wgr_sky_sh_layout"),
             entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -1532,6 +1755,10 @@ impl Sky {
                     binding: 1,
                     resource: sh_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: sh_ground_buf.as_entire_binding(),
+                },
             ],
         });
         let sh_pipeline = {
@@ -1546,7 +1773,7 @@ impl Sky {
                 module: &sh_shader,
                 entry_point: Some("cs_sky_sh"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
 
@@ -1695,6 +1922,18 @@ impl Sky {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: wgpu::BindingResource::TextureView(&mw_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&moon_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::Sampler(&moon_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&relief_view),
                 },
             ],
         });
@@ -1938,7 +2177,7 @@ impl Sky {
                 module: &shader,
                 entry_point: Some("cs_froxel"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
         // Same group(0) as the froxel fill -- it needs the sky uniform and the cloud noise, and
@@ -1956,7 +2195,7 @@ impl Sky {
                 module: &shader,
                 entry_point: Some("cs_cloud_shadow"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
         let smoke_shadow_header_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2030,6 +2269,27 @@ impl Sky {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
+                    },
+                    count: None,
+                },
+                // PERF-CLOUD-TEMPORAL: last frame's march + the reuse uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 }],
@@ -2117,7 +2377,7 @@ impl Sky {
                     },
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
         let cloud_pipeline = build_cloud_pipeline("wgr_cloud", &cloud_overrides);
@@ -2214,7 +2474,7 @@ impl Sky {
                     compilation_options: Default::default(),
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
         let cloud_composite_pipeline = make_cloud_composite("wgr_cloud_composite", sample_count);
@@ -2241,11 +2501,14 @@ impl Sky {
         Self {
             fog,
             sky_pipeline,
+            sky_pipeline_depth_tested,
             planar_sky_pipeline,
             sky_bind,
             env_pipeline,
             env_tex,
             env_view,
+            env_target_view,
+            env_prefilter,
             cloud_noise_tex,
             cloud_pipeline,
             cloud_temporal_view: None,
@@ -2261,6 +2524,7 @@ impl Sky {
             sh_pipeline,
             sh_bind,
             sh_buf,
+            sh_ground_buf,
             transmittance_pipeline,
             transmittance_bind,
             transmittance_view,
@@ -2314,6 +2578,9 @@ impl Sky {
             cirrus_match_now: look_env.map_or(CIRRUS_MATCH_DEFAULT, |v| v.1),
             cirrus_soft: soft_env.unwrap_or(CIRRUS_SOFT_DEFAULT),
             cirrus_soft_now: soft_env.unwrap_or(CIRRUS_SOFT_DEFAULT),
+            earth_frame: [0.0; 4],
+            earth_geometry: [[0.0; 4]; 4],
+            moon_relief_range,
             cloud_shadow_span: CLOUD_SHADOW_SPAN_MIN,
             cloud_shadow_map_params: [0.0, 0.0, 1.0 / CLOUD_SHADOW_SPAN_MIN, 0.85],
             froxel_view,
@@ -2326,6 +2593,9 @@ impl Sky {
             linear,
             last_lut: None,
             lut_dirty: true,
+            last_ivp: [[0.0; 4]; 4],
+            last_cam: [0.0; 3],
+            cloud_tc_frame: 0,
         }
     }
 
@@ -2488,6 +2758,15 @@ impl Sky {
     // Queue writes precede the entire encoder, including its earlier froxel
     // dispatch. upload() resets this lane for every camera; unknown/unencoded
     // weather and Legacy mode therefore leave both sky and froxels unchanged.
+    /// Whole world: origin latitude/longitude (radians) for the Earth-fixed planet cloud layer.
+    pub fn set_earth_frame(&mut self, latitude: f32, longitude: f32) {
+        self.earth_frame = [latitude, longitude, 0.0, 0.0];
+    }
+    /// Whole world: Earth centre, moon centre, Earth-fixed x and z axes in world coordinates.
+    pub fn set_earth_geometry(&mut self, geometry: [[f32; 4]; 4]) {
+        self.earth_geometry = geometry;
+    }
+
     pub fn update_fog_chroma(&self,queue:&wgpu::Queue,ready:bool,weather:f32) {
         let strength=if ready && weather.is_finite() && (0.0..=1.0).contains(&weather) {
             0.85*(weather*4.0).min(1.0)
@@ -2527,8 +2806,17 @@ impl Sky {
             }
         }
 
+        let earth_preview = sky.cloud4[3] > 0.5;
+        let mut adjusted_sky = *sky;
+        if earth_preview { adjusted_sky.params[2] = 6_378_137.0; }
+        let sky = &adjusted_sky;
         let key = lut_key(sky);
-        if self.last_lut != Some(key) {
+        // PERF-SKY-LUT: the key is auto-derived from the sun's elevation every frame, so as game
+        // time runs it drifts by millionths and an EXACT compare rebuilt both LUTs every frame
+        // (0.28 ms GPU, Durras and village alike). Rebuilt now when any component has moved more
+        // than WGR_SKY_LUT_TOLERANCE (relative, default 0.002) from what the LUTs were built
+        // with -- a few seconds of game time apart, far below anything visible. 0 = exact.
+        if self.last_lut.is_none_or(|last| lut_key_moved(&last, &key, sky_lut_tolerance())) {
             self.last_lut = Some(key);
             self.lut_dirty = true;
         }
@@ -2547,6 +2835,8 @@ impl Sky {
         self.cirrus_amount_now += (self.cirrus_amount - self.cirrus_amount_now) * CIRRUS_PUFF_EASE;
         self.cirrus_match_now += (self.cirrus_match - self.cirrus_match_now) * CIRRUS_PUFF_EASE;
         self.cirrus_soft_now += (self.cirrus_soft - self.cirrus_soft_now) * CIRRUS_PUFF_EASE;
+        self.last_ivp = inv_view_proj;
+        self.last_cam = [cam_pos[0], cam_pos[1], cam_pos[2]];
         let u = SkyUniform {
             inv_view_proj,
             sun_dir: sky.sun_dir,
@@ -2581,7 +2871,9 @@ impl Sky {
             ],
             cam_pos: [
                 cam_pos[0], cam_pos[1], cam_pos[2],
-                self.ocean_level.map_or(0.0, |level| (cam_pos[1] - level).max(0.0)),
+                if earth_preview { -1.0 } else {
+                    self.ocean_level.map_or(0.0, |level| (cam_pos[1] - level).max(0.0))
+                },
             ],
             // Whatever begin_cloud_shadow_frame fixed for this frame -- NOT a fresh
             // derivation from this call's cam_pos. This is the identical number the camera
@@ -2606,6 +2898,12 @@ impl Sky {
                 self.moon_cloud_blue,
                 0.0,
             ],
+            earth_frame: self.earth_frame,
+            earth_centre: self.earth_geometry[0],
+            moon_centre: self.earth_geometry[1],
+            // .w of the two axis lanes: the moon height map's range in metres (sky.wgsl moon_height_range).
+            ecef_x: [self.earth_geometry[2][0], self.earth_geometry[2][1], self.earth_geometry[2][2], self.moon_relief_range[0]],
+            ecef_z: [self.earth_geometry[3][0], self.earth_geometry[3][1], self.earth_geometry[3][2], self.moon_relief_range[1]],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
         // Terrain sun-shadow mask mapping for cs_froxel's occlusion lookup (own copy so
@@ -2677,6 +2975,14 @@ impl Sky {
         pass.draw(0..3, 0..1);
     }
 
+    /// PERF-SKY-AFTER-PREPASS: the sky in a pass that carries the depth prepass's depth, shaded
+    /// only where nothing was drawn. Same shader, same output on every pixel it touches.
+    pub fn render_depth_tested(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.sky_pipeline_depth_tested);
+        pass.set_bind_group(0, &self.sky_bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     pub fn render_planar(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.planar_sky_pipeline);
         pass.set_bind_group(0, &self.sky_bind, &[]);
@@ -2686,7 +2992,10 @@ impl Sky {
     // Clouds are drawn only on the HDR path (the composite blends linear radiance over the HDR scene)
     // and when coverage is non-zero. lib.rs gates the cloud pass + composite on this.
     pub fn clouds_active(&self, sky: &WgrSky) -> bool {
-        self.linear > 0.5 && sky.cloud0[0] > 0.001
+        // Whole world above 12 km: the same pass carries the air in front of the globe
+        // (sky.wgsl earth_aerial), which a clear sky needs as much as a cloudy one.
+        let earth_aerial = sky.cloud4[3] > 0.5 && sky.night_zenith[3] > 12000.0;
+        self.linear > 0.5 && (sky.cloud0[0] > 0.001 || earth_aerial)
     }
 
     pub fn cloud_temporal_view(&self) -> Option<&wgpu::TextureView> {
@@ -2700,6 +3009,7 @@ impl Sky {
     pub fn render_cloud(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
         width: u32,
@@ -2726,10 +3036,28 @@ impl Sky {
                     dimension: wgpu::TextureDimension::D2,
                     format: crate::HDR_FORMAT,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                let hist = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("wgr_cloud_hist"),
+                    size: wgpu::Extent3d { width: lo.0, height: lo.1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: crate::HDR_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let hist_view = hist.create_view(&wgpu::TextureViewDescriptor::default());
+                let tc_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wgr_cloud_temporal"),
+                    size: std::mem::size_of::<CloudTemporalUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
                 // Evict oldest first so a window resize cannot grow this without bound.
                 if self.cloud_lo.len() >= CLOUD_LO_CACHE {
                     self.cloud_lo.remove(0);
@@ -2742,6 +3070,12 @@ impl Sky {
                     layer_fog: false,
                     composite_bind: None,
                     depth_bind: None,
+                    hist,
+                    hist_view,
+                    tc_buf,
+                    hist_valid: false,
+                    prev_ivp: None,
+                    prev_cam: [0.0; 3],
                 });
                 self.cloud_lo.len() - 1
             }
@@ -2786,6 +3120,14 @@ impl Sky {
                     entries: &[wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&target.hist_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: target.tc_buf.as_entire_binding(),
                     }],
                 }));
                 target.depth_src = Some(depth_view.clone());
@@ -2798,6 +3140,35 @@ impl Sky {
             .depth_bind
             .clone()
             .expect("cloud depth bind just built");
+        // PERF-CLOUD-TEMPORAL: on the over-scene march, each 2x2 block of the low-res buffer
+        // marches one pixel per frame (a rotating phase) and the other three take last frame's
+        // march at the direction reprojected through last frame's camera (fs_cloud). Reuse only
+        // happens for upward rays whose whole neighbourhood is sky; everything else -- terrain,
+        // silhouettes, the planar reflection, the first frame, a resize, a camera jump over 20 m
+        // -- marches every pixel exactly as before. Each pixel is re-marched every fourth frame,
+        // so nothing on screen is more than three frames old.
+        {
+            self.cloud_tc_frame = self.cloud_tc_frame.wrapping_add(u32::from(!reflection));
+            let (cur_ivp, cur_cam, frame) = (self.last_ivp, self.last_cam, self.cloud_tc_frame);
+            let target = &mut self.cloud_lo[slot];
+            let mut params = [0.0f32, (frame % 4) as f32, 0.0, 0.0];
+            let mut prev_vp = [[0.0f32; 4]; 4];
+            if !reflection && cloud_temporal_enabled() && target.hist_valid {
+                if let Some(prev) = target.prev_ivp {
+                    let moved = (0..3).map(|i| (cur_cam[i] - target.prev_cam[i]).powi(2)).sum::<f32>();
+                    let inv = glam::DMat4::from_cols_array_2d(&prev.map(|c| c.map(f64::from))).inverse();
+                    if moved < 400.0 && inv.is_finite() {
+                        prev_vp = inv.as_mat4().to_cols_array_2d();
+                        params[0] = 1.0;
+                    }
+                }
+            }
+            queue.write_buffer(&target.tc_buf, 0, bytemuck::bytes_of(&CloudTemporalUniform { prev_vp, params }));
+            if !reflection {
+                target.prev_ivp = Some(cur_ivp);
+                target.prev_cam = cur_cam;
+            }
+        }
         let lo_view = &self.cloud_lo[slot].view;
         if !reflection {
             self.cloud_temporal_view = Some(lo_view.clone());
@@ -2828,6 +3199,15 @@ impl Sky {
         pass.set_bind_group(1, &depth_bind, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
+        if !reflection && cloud_temporal_enabled() {
+            let target = &mut self.cloud_lo[slot];
+            encoder.copy_texture_to_texture(
+                target._tex.as_image_copy(),
+                target.hist.as_image_copy(),
+                wgpu::Extent3d { width: lo.0, height: lo.1, depth_or_array_layers: 1 },
+            );
+            target.hist_valid = true;
+        }
         encoder.pop_debug_group();
     }
 
@@ -2856,7 +3236,7 @@ impl Sky {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("wgr_sky_env"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.env_view,
+                view: &self.env_target_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -2872,6 +3252,10 @@ impl Sky {
         pass.set_pipeline(&self.env_pipeline);
         pass.set_bind_group(0, &self.sky_bind, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+        // REFLECT-001 phase D: rough reflections read the prefiltered levels (no-op unless
+        // WGR_REFLECT / WGR_REFLECT_DEBUG is set).
+        self.env_prefilter.record(encoder);
     }
 
     // The reflection env map view, lent to the water bind group (water look plan Stage 4a).
@@ -2882,6 +3266,60 @@ impl Sky {
     // Project the env map into SH-9 diffuse sky irradiance for this frame. Must run after render_env
     // (reads the freshly-baked env) and before the lit-mesh / terrain passes read `sh_buf`. One tiny
     // dispatch. Recorded on the same encoder so wgpu barriers env-write -> read and sh-write -> read.
+    /// RFG-186: this frame's ground-bounce inputs for the SH projection. `sun` is the main
+    /// camera's sun_diffuse (E/pi, already cloud-dimmed), `sun_up` the sun direction's y.
+    /// WGR_GROUND_BOUNCE=0 restores the horizon-continued lower hemisphere;
+    /// WGR_GROUND_BOUNCE_ALBEDO=r,g,b (linear) replaces the default ground.
+    /// RFG-196: `native` = a native Reforger world, whose sky is lifted to its authored indirect
+    /// share (WGR_NATIVE_INDIRECT=0 off; WGR_NATIVE_INDIRECT_RATIO overrides Lighting_Eden's 0.5).
+    pub fn set_ground_bounce(&self, queue: &wgpu::Queue, sun: [f32; 3], sun_up: f32, native: bool) {
+        static CFG: std::sync::OnceLock<(bool, [f32; 3])> = std::sync::OnceLock::new();
+        let (on, albedo) = *CFG.get_or_init(|| {
+            let on = std::env::var("WGR_GROUND_BOUNCE").map(|v| v.trim() != "0").unwrap_or(true);
+            // An ESTIMATE of open European ground (grass, soil): green-brown, ~0.15 broadband.
+            // Not measured; tune against the parity poses with the env var.
+            let mut albedo = [0.14f32, 0.16, 0.09];
+            if let Ok(v) = std::env::var("WGR_GROUND_BOUNCE_ALBEDO") {
+                let parts: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                if parts.len() == 3 {
+                    albedo = [parts[0], parts[1], parts[2]];
+                }
+            }
+            (on, albedo)
+        });
+        static NORM: std::sync::OnceLock<(bool, f32)> = std::sync::OnceLock::new();
+        static NEUTRAL: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let neutral = *NEUTRAL.get_or_init(|| {
+            std::env::var("WGR_NATIVE_INDIRECT_NEUTRAL").ok().and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)).unwrap_or(1.0)
+        });
+        let (norm_on, ratio) = *NORM.get_or_init(|| {
+            let on = std::env::var("WGR_NATIVE_INDIRECT").map(|v| v.trim() != "0").unwrap_or(true);
+            let ratio = std::env::var("WGR_NATIVE_INDIRECT_RATIO").ok().and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.5);
+            (on, ratio)
+        });
+        // RFG-200: the native dome scale, mirrored from EngineWgpu (WGR_NATIVE_SKY_SCALE, default
+        // 2.5) -- undone for the SH so the sky's LIGHT stays the physical sky's.
+        static DOME: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let dome = *DOME.get_or_init(|| {
+            std::env::var("WGR_NATIVE_SKY_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(2.5)
+        });
+        let phys = if native { 1.0 / dome } else { 1.0 };
+        // Whole world near the moon (its frame: the moon's centre is the near one): the ground is regolith,
+        // grey and ~0.12 (Apollo photometry), not grass. Under the black sky it is the only fill there is --
+        // with the grass estimate a soldier in shadow on the moon was black on black.
+        let [earth, moon, _, _] = self.earth_geometry;
+        let dist = |c: [f32; 4]| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let moon_frame = moon[3] > 0.5 && earth[3] > 0.5 && dist(moon) < dist(earth);
+        let albedo = if moon_frame { [0.13f32, 0.12, 0.11] } else { albedo };
+        let data: [f32; 16] = [sun[0], sun[1], sun[2], sun_up, albedo[0], albedo[1], albedo[2],
+            if on { 1.0 } else { 0.0 }, ratio, if norm_on && native { 1.0 } else { 0.0 }, 24.0, neutral,
+            phys, 0.0, 0.0, 0.0];
+        queue.write_buffer(&self.sh_ground_buf, 0, bytemuck::cast_slice(&data));
+    }
+
     pub fn render_sh(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.push_debug_group("wgr_sky_sh");
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3480,6 +3918,13 @@ mod sky_uniform_layout_tests {
             // SKY-002's star cloud-occlusion strength. Renderer-written like `cirrus`, and on this
             // list for the same reason: the two structs are only kept in step by this assertion.
             "night_sky",
+            // Whole world: the geographic origin, then the Earth/moon geometry in world coordinates
+            // of the active frame (WgrSkyRuntime's last four lanes).
+            "earth_frame",
+            "earth_centre",
+            "moon_centre",
+            "ecef_x",
+            "ecef_z",
         ];
         assert_eq!(
             wgsl, rust,

@@ -1,5 +1,6 @@
 
 #include <Poseidon/AI/ArcadeTemplate.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/AI/AI.hpp>
 #include <Poseidon/IO/ParamFile/ParamFile.hpp>
 #include <Poseidon/IO/Serialization/ParamArchive.hpp>
@@ -21,6 +22,7 @@
 #include <Poseidon/Foundation/Common/FltOpts.hpp>
 #include <Poseidon/Foundation/Containers/RStringArray.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/Foundation/Math/MathDefs.hpp>
 #include <Poseidon/Foundation/platform.hpp>
 
@@ -69,6 +71,10 @@ const EnumName* Foundation::GetEnumNames(ArcadeWaypointType dummy)
                                                        EnumName(ACSUPPORT, "SUPPORT"),
                                                        EnumName(ACAND, "AND"),
                                                        EnumName(ACOR, "OR"),
+                                                       // Arma 2 types read as their nearest CWA type
+                                                       EnumName(ACGETIN, "GETIN NEAREST"),
+                                                       EnumName(ACMOVE, "DISMISS"),
+                                                       EnumName(ACMOVE, "LOITER"),
                                                        EnumName()};
     return ArcadeWaypointTypeNames;
 }
@@ -174,6 +180,10 @@ const EnumName* Foundation::GetEnumNames(ArcadeSensorActivation dummy)
                                                            EnumName(ASAGroup, "GROUP"),
                                                            EnumName(ASALeader, "LEADER"),
                                                            EnumName(ASAMember, "MEMBER"),
+                                                           // Arma 2 "seized by" activations read as presence of that side
+                                                           EnumName(ASAWest, "WEST SEIZED"),
+                                                           EnumName(ASAEast, "EAST SEIZED"),
+                                                           EnumName(ASAGuerrila, "GUER SEIZED"),
                                                            EnumName()};
     return ArcadeSensorActivationNames;
 }
@@ -253,6 +263,7 @@ ArcadeUnitInfo::ArcadeUnitInfo(const ArcadeUnitInfo& src)
     ammo = src.ammo;
     name = src.name;
     markers = src.markers;
+    synchronizations = src.synchronizations;
     selected = src.selected;
     init = src.init;
 }
@@ -282,6 +293,7 @@ void ArcadeUnitInfo::Init()
     ammo = 1.0;
     name = "";
     markers.Clear();
+    synchronizations.Clear();
     selected = false;
     init = "";
 }
@@ -373,10 +385,59 @@ LSError ArcadeUnitInfo::Serialize(ParamArchive& ar)
     PARAM_CHECK(ar.SerializeEnum("side", side, 1))
 
     PARAM_CHECK(ar.Serialize("vehicle", vehicle, 1))
+    RString arma2Init; // init event handler of an Arma 2 module class (FunctionsManager, ...)
+    if (ar.IsLoading())
+    {
+        arma2Init = Arma1Compat::Arma2ModuleInit(vehicle);
+        const RString requested = vehicle;
+        vehicle = Arma1Compat::ResolveVehicleClass(vehicle); // identity unless --arma1
+        // an Arma 2 animal placed with its own model and moves lives by its agent tasks
+        if (arma2Init.GetLength() == 0 && vehicle.GetLength() > 4 && _strnicmp(vehicle, "A1x_", 4) == 0)
+            arma2Init = Arma1Compat::Arma2AgentTasks(requested);
+        // A class the compat layer leaves out on purpose (Arma 2's animals, until their
+        // models and moves are in) resolves to nothing: the unit is not placed at all
+        // (presence and presenceCondition were read above; the class below only keeps the
+        // entry valid for the editor and a save). Treated as a missing addon, every sheep
+        // and cow became a CWA civilian (139 of them in run 15, the census's only CWA
+        // stand-ins). A playable unit ignores presence, so one stays a stand-in.
+        if (Arma1Compat::Active() && vehicle.GetLength() == 0 && requested.GetLength() > 0)
+        {
+            presence = 0;
+            presenceCondition = "false";
+            vehicle = side == TEast ? "SoldierEB" : side == TWest ? "SoldierWB" : side == TGuerrila ? "SoldierGB"
+                                                                                                   : "Civilian";
+        }
+        // A class neither game defines (a third-party addon that is not installed): Arma 1
+        // reports it and plays on without it. Here it is stood in for by a plain unit of
+        // the same side (an empty object by a game logic), so the mission still loads.
+        if (Arma1Compat::Active() && !(Pars >> "CfgVehicles").FindEntry(vehicle))
+        {
+            const char* standIn = side == TEast       ? "SoldierEB"
+                                  : side == TWest     ? "SoldierWB"
+                                  : side == TGuerrila ? "SoldierGB"
+                                  : side == TCivilian ? "Civilian"
+                                                      : "Logic";
+            LOG_WARN(Mission, "{}: class '{}' is not installed (missing addon); '{}' stands in", Arma1Compat::Label(),
+                     (const char*)vehicle, standIn);
+            vehicle = standIn;
+        }
+    }
     PARAM_CHECK(ar.SerializeEnum("player", player, 1, APNonplayable))
     PARAM_CHECK(ar.Serialize("leader", leader, 1, 0))
     if (ar.IsSaving() || ar.GetArVersion() >= 11)
-        PARAM_CHECK(ar.SerializeEnum("lock", lock, 1, (LockState)LSDefault))
+    {
+        // Arma 3 adds LOCKEDPLAYER: locked for players, open to the AI -- what OFP's LOCKED is.
+        RString lockName;
+        if (!ar.IsSaving() && Arma1Compat::Active() && ar.Serialize("lock", lockName, 1, RString()) == LSOK &&
+            stricmp(lockName, "LOCKEDPLAYER") == 0)
+        {
+            lock = LSLocked;
+        }
+        else
+        {
+            PARAM_CHECK(ar.SerializeEnum("lock", lock, 1, (LockState)LSDefault))
+        }
+    }
     else
     {
         bool locked;
@@ -391,6 +452,13 @@ LSError ArcadeUnitInfo::Serialize(ParamArchive& ar)
     PARAM_CHECK(ar.Serialize("text", name, 7, ""))
     PARAM_CHECK(ar.SerializeArray("markers", markers, 1))
     PARAM_CHECK(ar.Serialize("init", init, 7, ""))
+    PARAM_CHECK(ar.SerializeArray("synchronizations", synchronizations, 1))
+    if (ar.IsLoading() && arma2Init.GetLength() > 0)
+    {
+        // Arma 2 starts a module from its class's init event handler, with _this = [unit],
+        // before the unit's own init field runs.
+        init = RString("[this] call {") + arma2Init + RString("}; ") + init;
+    }
 
     if (ar.IsLoading() && ar.GetPass() == ParamArchive::PassFirst)
     {
@@ -766,20 +834,46 @@ void ArcadeMarkerInfo::OnColorChanged()
 {
     if (markerType == MTIcon && stricmp(colorName, "Default") == 0)
     {
-        const ParamEntry& cls = Pars >> "CfgMarkers" >> type;
-        color = GetPackedColor(cls >> "color");
+        // the icon's own colour; an icon type the config lacks (or none at all -- Arma 3
+        // missions of the older layout leave it empty) is drawn black
+        const ParamEntry* markers = Pars.FindEntry("CfgMarkers");
+        const ParamEntry* cls = markers && type.GetLength() > 0 ? markers->FindEntry(type) : nullptr;
+        const ParamEntry* value = cls && cls->IsClass() ? cls->FindEntry("color") : nullptr;
+        color = value && value->IsArray() && value->GetSize() == 4 ? GetPackedColor(*value) : PackedBlack;
     }
     else
     {
-        const ParamEntry& cls = Pars >> "CfgMarkerColors" >> colorName;
-        color = GetPackedColor(cls >> "color");
+        // A colour this game's config does not define (Arma 3's side colours ColorGUER,
+        // ColorWEST, ColorCIV ... in a mission of the older layout) is drawn in its nearest CWA
+        // colour, else black: looking it up regardless failed the whole mission load.
+        const ParamEntry* colors = Pars.FindEntry("CfgMarkerColors");
+        const ParamEntry* cls = colors && colorName.GetLength() > 0 ? colors->FindEntry(colorName) : nullptr;
+        if (!cls || !cls->IsClass() || !cls->FindEntry("color"))
+        {
+            static const char* const kNearest[][2] = {
+                {"ColorGUER", "ColorGreen"},   {"ColorIndependent", "ColorGreen"}, {"ColorWEST", "ColorBlue"},
+                {"ColorBLUFOR", "ColorBlue"},  {"ColorEAST", "ColorRed"},          {"ColorOPFOR", "ColorRed"},
+                {"ColorCIV", "ColorYellow"},   {"ColorCivilian", "ColorYellow"},   {"ColorUNKNOWN", "ColorBlack"},
+                {"ColorGrey", "ColorBlack"},   {"ColorPink", "ColorRed"},          {"ColorBrown", "ColorOrange"},
+                {"ColorKhaki", "ColorOrange"}, {"ColorWhite", "ColorWhite"}};
+            cls = nullptr;
+            for (const auto& pair : kNearest)
+                if (colors && stricmp(colorName, pair[0]) == 0)
+                    cls = colors->FindEntry(pair[1]);
+            if ((!cls || !cls->IsClass()) && colors)
+                cls = colors->FindEntry("ColorBlack");
+        }
+        const ParamEntry* value = cls && cls->IsClass() ? cls->FindEntry("color") : nullptr;
+        color = value && value->IsArray() && value->GetSize() == 4 ? GetPackedColor(*value) : PackedBlack;
     }
 }
 
 void ArcadeMarkerInfo::OnFillChanged()
 {
-    const ParamEntry& cls = Pars >> "CfgMarkerBrushes" >> fillName;
-    RString brush = cls >> "texture";
+    const ParamEntry* brushes = Pars.FindEntry("CfgMarkerBrushes");
+    const ParamEntry* cls = brushes && fillName.GetLength() > 0 ? brushes->FindEntry(fillName) : nullptr;
+    // a brush this config lacks (Arma 3's "SolidBorder", "DiagGrid" ...) fills as none
+    RString brush = cls && cls->IsClass() && cls->FindEntry("texture") ? RString((*cls) >> "texture") : RString();
     if (brush.GetLength() == 0)
     {
         fill = nullptr;
@@ -794,9 +888,20 @@ void ArcadeMarkerInfo::OnTypeChanged()
 {
     if (markerType == MTIcon)
     {
-        const ParamEntry& cls = Pars >> "CfgMarkers" >> type;
-        icon = GlobLoadTexture(GetPictureName(cls >> "icon"));
-        size = cls >> "size";
+        // an icon type this config lacks (an Arma 3 marker in an older-layout mission) is drawn
+        // as the plain dot rather than failing the mission load
+        const ParamEntry* markers = Pars.FindEntry("CfgMarkers");
+        const ParamEntry* cls = markers && type.GetLength() > 0 ? markers->FindEntry(type) : nullptr;
+        if ((!cls || !cls->IsClass()) && markers)
+            cls = markers->FindEntry("Dot");
+        if (!cls || !cls->IsClass() || !cls->FindEntry("icon") || !cls->FindEntry("size"))
+        {
+            icon = nullptr;
+            size = 0;
+            return;
+        }
+        icon = GlobLoadTexture(GetPictureName((*cls) >> "icon"));
+        size = (*cls) >> "size";
     }
 }
 
@@ -1536,7 +1641,9 @@ LSError ArcadeIntel::Serialize(ParamArchive& ar)
     PARAM_CHECK(ar.Serialize("month", month, 1, 5))
     PARAM_CHECK(ar.Serialize("day", day, 1, 10))
     PARAM_CHECK(ar.Serialize("hour", hour, 1, 7))
-    PARAM_CHECK(ar.Serialize("minute", minute, 1, 30))
+    // Arma 3's editor leaves minute out when it is 0 (Old Man: hour = 18, which OFP's default of 30
+    // turned into a sunset start); OFP's own missions keep OFP's default.
+    PARAM_CHECK(ar.Serialize("minute", minute, 1, Arma1Compat::Generation() == 3 ? 0 : 30))
 
     return LSOK;
 }
@@ -1754,6 +1861,115 @@ void ArcadeTemplate::CheckSynchro()
     nextSyncId = maxSync + 1;
 }
 
+namespace
+{
+int CrewSeats(const RString& vehicle)
+{
+    const VehicleType* type = dynamic_cast<const VehicleType*>(VehicleTypes.New(vehicle));
+    if (!type)
+        return 1;
+    const int seats = (type->HasDriver() ? 1 : 0) + (type->HasCommander() ? 1 : 0) + (type->HasGunner() ? 1 : 0);
+    return seats > 0 ? seats : 0;
+}
+} // namespace
+
+int ArcadeTemplate::SplitOversizedGroups()
+{
+    // Arma 1 lifted the 12-unit group limit; this engine's AIGroup holds a fixed
+    // MAX_UNITS_PER_GROUP. The units that do not fit go, in order, into new groups of
+    // the same side that follow copies of the original waypoints (without their
+    // synchronisations, which stay with the original group).
+    int created = 0;
+    const int n = groups.Size();
+    for (int i = 0; i < n; i++)
+    {
+        int seats = 0;
+        int cut = -1;
+        for (int j = 0; j < groups[i].units.Size(); j++)
+        {
+            seats += CrewSeats(groups[i].units[j].vehicle);
+            if (seats > MAX_UNITS_PER_GROUP)
+            {
+                cut = j;
+                break;
+            }
+        }
+        if (cut <= 0)
+            continue;
+        AutoArray<ArcadeUnitInfo> rest;
+        for (int j = cut; j < groups[i].units.Size(); j++)
+            rest.Add(groups[i].units[j]);
+        groups[i].units.Resize(cut);
+        const TargetSide side = groups[i].side;
+        const AutoArray<ArcadeWaypointInfo> waypoints = groups[i].waypoints;
+        while (rest.Size() > 0)
+        {
+            ArcadeGroupInfo& g = groups.Append();
+            g.side = side;
+            g.waypoints = waypoints;
+            for (int w = 0; w < g.waypoints.Size(); w++)
+                g.waypoints[w].synchronizations.Clear();
+            int used = 0;
+            int take = 0;
+            while (take < rest.Size())
+            {
+                const int s = CrewSeats(rest[take].vehicle);
+                if (take > 0 && used + s > MAX_UNITS_PER_GROUP)
+                    break;
+                used += s;
+                take++;
+            }
+            for (int j = 0; j < take; j++)
+            {
+                g.units.Add(rest[j]);
+                g.units[j].leader = j == 0;
+            }
+            AutoArray<ArcadeUnitInfo> remaining;
+            for (int j = take; j < rest.Size(); j++)
+                remaining.Add(rest[j]);
+            rest = remaining;
+            created++;
+        }
+        LOG_INFO(Mission, "{}: group {} exceeds {} crew seats; units from #{} moved into new groups ({} so far)", Arma1Compat::Label(),
+                 i, MAX_UNITS_PER_GROUP, cut, created);
+    }
+    return created;
+}
+
+bool ArcadeTemplate::PromotePlayableToPlayer()
+{
+    if (FindPlayer())
+        return false;
+    for (int i = 0; i < groups.Size(); i++)
+    {
+        for (int j = 0; j < groups[i].units.Size(); j++)
+        {
+            ArcadeUnitInfo& u = groups[i].units[j];
+            switch (u.player)
+            {
+                case APPlayableD:
+                case APPlayableDG:
+                    u.player = APPlayerDriver;
+                    break;
+                case APPlayableG:
+                    u.player = APPlayerGunner;
+                    break;
+                case APPlayableC:
+                case APPlayableCD:
+                case APPlayableCG:
+                case APPlayableCDG:
+                    u.player = APPlayerCommander;
+                    break;
+                default:
+                    continue;
+            }
+            LOG_INFO(Mission, "{}: no player unit; playable '{}' in group {} plays", Arma1Compat::Label(), (const char*)u.vehicle, i);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ArcadeTemplate::IsConsistent(Display* disp, bool multiplayer)
 {
     int nPlayers1 = 0;
@@ -1825,6 +2041,8 @@ bool ArcadeTemplate::IsConsistent(Display* disp, bool multiplayer)
         AI_ERROR(nUnits > 0);
         if (nUnits > MAX_UNITS_PER_GROUP)
         {
+            LOG_WARN(Mission, "Mission rejected: group {} needs {} crew seats (limit {})", i, nUnits,
+                     MAX_UNITS_PER_GROUP);
             if (disp)
             {
                 char buffer[256];
@@ -1839,6 +2057,7 @@ bool ArcadeTemplate::IsConsistent(Display* disp, bool multiplayer)
 #if !_ENABLE_CHEATS
     if (!multiplayer && nPlayers1 == 0)
     {
+        LOG_WARN(Mission, "Mission rejected: no player unit");
         if (disp)
         {
             disp->CreateMsgBox(MB_BUTTON_OK, LocalizeString(IDS_MSG_NO_PLAYER));
@@ -1850,6 +2069,7 @@ bool ArcadeTemplate::IsConsistent(Display* disp, bool multiplayer)
     if (nWestGroups > MaxGroups || nEastGroups > MaxGroups || nGuerrilaGroups > MaxGroups ||
         nCivilianGroups > MaxGroups || nLogicGroups > MaxGroups)
     {
+        LOG_WARN(Mission, "Mission rejected: more than {} groups on one side", MaxGroups);
         if (disp)
         {
             char buffer[256];
@@ -2011,6 +2231,7 @@ LSError ArcadeTemplate::Serialize(ParamArchive& ar)
         addOns.Resize(0);
         missingAddOns.Resize(0);
         PARAM_CHECK(ar.SerializeArray("addOns", addOns, 1))
+        Arma1Compat::FilterMissionAddons(addOns); // identity unless --arma1
         CheckPatch(addOns, missingAddOns);
         if (missingAddOns.Size() > 0)
         {
@@ -2048,6 +2269,14 @@ LSError ArcadeTemplate::Serialize(ParamArchive& ar)
         AI_ERROR(params);
         nextSyncId = params->nextSyncId;
         nextVehId = params->nextVehId;
+        // A unit whose class stops its archive early (an Arma 1/2 entry this game reads
+        // differently) never reaches the id bookkeeping; count every id actually loaded so
+        // Compact does not index past its table.
+        for (int i = 0; i < emptyVehicles.Size(); i++)
+            saturateMax(nextVehId, emptyVehicles[i].id + 1);
+        for (int i = 0; i < groups.Size(); i++)
+            for (int j = 0; j < groups[i].units.Size(); j++)
+                saturateMax(nextVehId, groups[i].units[j].id + 1);
         CheckSynchro(); // remove invalid synchronizations
         Compact();
     }

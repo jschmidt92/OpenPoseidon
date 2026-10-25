@@ -346,7 +346,7 @@ impl BreakersGpu {
             module: &module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         let spray_update = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tw_spray_update"),
@@ -354,7 +354,7 @@ impl BreakersGpu {
             module: &module,
             entry_point: Some("spray_update"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         let (ids, index) = lip_mesh(MAX_STATIONS);
@@ -381,11 +381,11 @@ impl BreakersGpu {
                 module: shader,
                 entry_point: Some("vs_lip"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 16,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
             },
             // side: 'double'
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
@@ -413,7 +413,7 @@ impl BreakersGpu {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         let lip_mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tw_brk_lip_mask"),
@@ -422,11 +422,11 @@ impl BreakersGpu {
                 module: shader,
                 entry_point: Some("vs_lip"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 16,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attrs,
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None,
@@ -438,7 +438,7 @@ impl BreakersGpu {
                 targets: &[Some(super::spray::mask_target())],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         Self {
             stations,

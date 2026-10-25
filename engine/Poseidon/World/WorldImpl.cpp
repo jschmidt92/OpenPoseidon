@@ -1,4 +1,9 @@
+#include <Poseidon/World/Simulation/DynamicSimulation.hpp>
+#include <Poseidon/World/Terrain/CraterField.hpp>
+#include <Poseidon/World/Effects/BuildingBreach.hpp>
 #include <Poseidon/Core/Global.hpp>
+#include <cstdlib>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 hooks, empty unless POSEIDON_DIAG
 #include <Poseidon/World/Weather/SnowField.hpp>
 #include <Poseidon/World/Weather/MudField.hpp>
@@ -20,11 +25,14 @@
 #include <Poseidon/IO/ParamFileExt.hpp>
 #include <Poseidon/UI/UIActiveDisplay.hpp>
 #include <Poseidon/UI/OptionsUICommon.hpp>
+#include <Poseidon/AI/AIHunt.hpp> // AI-XRAY-006: end look-outs before a save
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/AI/AICostAccum.hpp> // PERF-014: the AI stage's per-bucket accumulator
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/Dev/Diag/DiagPause.hpp>
 #include <Poseidon/World/Effects/SmokeWorldQuery.hpp> // IndoorRoomAt/IndoorClearanceAt: the SERoom producer
+#include <Poseidon/UI/Arma3Menu.hpp>
+#include <Poseidon/World/EnvSoundRegions.hpp>           // OFP Fusion: ambient loops per island
 #include <algorithm>
 #include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
@@ -154,10 +162,12 @@ using namespace Dev;
 #include <Poseidon/UI/Locale/StringtableExt.hpp>
 
 #include <Poseidon/Core/resincl.hpp>
+#include <Poseidon/World/SeaSoundscape.hpp>
 
 namespace Poseidon
 {
 bool StartAutoTest();
+bool StartMissionWithBriefing();
 bool ProcessFullName(RString);
 } // namespace Poseidon
 
@@ -184,21 +194,37 @@ const float PreferredGridSizeMP = 25;
 
 bool World::IsDisplayEnabled() const
 {
+    // POSEIDON_DIAG_DISPLAY=1: every 5 s, why the world is not drawn (a black screen with the game
+    // running behind it), and which display is on top.
+    static const bool diag = std::getenv("POSEIDON_DIAG_DISPLAY") != nullptr;
+    const auto off = [&](const char* why)
+    {
+        static DWORD last = 0;
+        if (diag && GetTickCount() - last > 5000)
+        {
+            last = GetTickCount();
+            const ControlsContainer* top = dynamic_cast<const ControlsContainer*>(Options());
+            while (top && top->Child())
+                top = top->Child();
+            LOG_INFO(Core, "Display off: {} (top display idd {})", why, top ? top->IDD() : -1);
+        }
+        return false;
+    };
     if (ENGINE_CONFIG.landEditor)
     {
         return true;
     }
     if (_noDisplay)
     {
-        return false;
+        return off("_noDisplay");
     }
     if (_showMap && _map && !_map->IsDisplayEnabled())
     {
-        return false;
+        return off("map open, map display disabled");
     }
     if (GetGProgress().Active())
     {
-        return false;
+        return off("progress splash active");
     }
     // No menu attached → display is always on (viewer / dedicated /
     // editor paths skip CreateMainOptions, so `_options == nullptr`
@@ -207,7 +233,9 @@ bool World::IsDisplayEnabled() const
     {
         return true;
     }
-    return _options->IsDisplayEnabled();
+    if (!_options->IsDisplayEnabled())
+        return off("top display has enableDisplay = 0");
+    return true;
 }
 
 bool World::IsSimulationEnabled() const
@@ -763,7 +791,7 @@ void World::SimulateCloudlets(float deltaT)
     if (GLandscape)
     {
         GMud().Advance(deltaT, UniformWettingDensity(GLandscape->GetRainDensity(),
-            GRain.EffectiveDensity(), GRain.Params().snowflakes));
+            GRain.EffectiveDensity(), GRain.Params().snowflakes), _actualOvercast);
         GSand().Advance(deltaT, UniformWettingDensity(GLandscape->GetRainDensity(),
             GRain.EffectiveDensity(), GRain.Params().snowflakes));
         softCost.Stop();
@@ -1129,6 +1157,7 @@ void World::SimulateCloudlets(float deltaT)
 void World::SimulateAllVehicles(float deltaT, float noAccDeltaT, Entity* cameraVehicle)
 {
     SimVehCost::Costs().ticks++; // PERF-023
+    DynSim::Update(*this);
     float farValidFor = 1.5;
     {
         SimVehCost::ScopedStage stage(SimVehCost::Stage::Importance);
@@ -1413,6 +1442,10 @@ void World::PerformSound(Entity* inside, float deltaT)
     float canHear = 1 - camHeight * 1.0 / 200;
     saturate(canHear, 0, 1);
     float vCoef = 0.5 * canHear;
+    // Arma 3's own menu covers the screen: the empty island behind it is not heard (its sea was)
+    const bool menuBackdrop = _mode == GModeIntro && Arma3Menu::Active();
+    if (menuBackdrop)
+        vCoef = 0;
 
     if (stricmp(EnvSoundPars[5].name, "SOUND\\$DEFAULT$.WSS") != 0)
     {
@@ -1447,7 +1480,7 @@ void World::PerformSound(Entity* inside, float deltaT)
     v[4] = 0;
     const float thold = 0.1;
     float rain = _scene.GetLandscape()->GetRainDensity() - thold;
-    if (rain >= 0)
+    if (rain >= 0 && vCoef > 0)
     {
         float coef = rain * (1 / (1 - thold));
         v[0] *= 1 - coef;
@@ -1471,17 +1504,61 @@ void World::PerformSound(Entity* inside, float deltaT)
             }
         }
     }
-    const char* ss[5];
     bool night = _scene.MainLight()->NightEffect() > 0.5;
+    // OFP Fusion: on a world of several islands each plays its own loops (EnvSoundRegions.hpp), two crossfaded over
+    // the water between them; one file from two slots or two regions is one sound at the summed volume. Slot 5 (a mission's
+    // override) stays the world's.
+    const EnvSoundSet* regionSets[2];
+    float regionWeights[2];
+    const int regions = EnvSoundRegionsAt(camPos.X(), camPos.Z(), regionSets, regionWeights);
+    const char* envNames[2 * 5];
+    float envVols[2 * 5];
+    int envCount = 0;
+    auto addEnv = [&](const char* name, float vol)
+    {
+        if (!name || !*name || vol <= 0)
+        {
+            return;
+        }
+        for (int j = 0; j < envCount; j++)
+        {
+            if (!stricmp(envNames[j], name))
+            {
+                envVols[j] += vol;
+                return;
+            }
+        }
+        envNames[envCount] = name;
+        envVols[envCount++] = vol;
+    };
     for (i = 0; i < 5; i++)
     {
-        ss[i] = MapWaveSound(night, s[i], v[i]);
+        if (regions == 0)
+        {
+            // a single-island world: as it always was
+            const char* name = MapWaveSound(night, s[i], v[i]);
+            GSoundScene->SetEnvSound(name, v[i]);
+            continue;
+        }
+        if (s[i] < 0 || s[i] >= EnvSoundSet::Count)
+        {
+            const char* name = MapWaveSound(night, s[i], v[i]);
+            addEnv(name, v[i]);
+            continue;
+        }
+        for (int r = 0; r < regions; r++)
+        {
+            const SoundPars& pars = night ? regionSets[r]->night[s[i]] : regionSets[r]->day[s[i]];
+            addEnv(pars.name, v[i] * pars.vol * regionWeights[r]);
+        }
     }
-    GSoundScene->SetEnvSound(ss[0], v[0]);
-    GSoundScene->SetEnvSound(ss[1], v[1]);
-    GSoundScene->SetEnvSound(ss[2], v[2]);
-    GSoundScene->SetEnvSound(ss[3], v[3]);
-    GSoundScene->SetEnvSound(ss[4], v[4]);
+    for (i = 0; i < envCount; i++)
+    {
+        GSoundScene->SetEnvSound(envNames[i], envVols[i]);
+    }
+    // (OP) Tidewater's surf and distant-surf bed (@OP_TidewaterWildlife; silent without it)
+    if (!menuBackdrop)
+        UpdateSeaSoundscape(camPos, 0.0f);
     GSoundScene->AdvanceEnvSounds();
 #endif
 }
@@ -1523,6 +1600,22 @@ void World::AdjustSubdivisionGrid(float gridSize)
     LOG_DEBUG(World, "Terrain subdivision wanted: {} ({:.3f})", coefLogInt, coefLog);
     int currentLog = TerrainRangeLog - LandRangeLog;
     int terrainChange = coefLogInt - currentLog;
+    // A native Enfusion world arrives at its own terrain grid (Everon: 3.125 m, which matches
+    // Reforger's GetSurfaceY to 5 mm), and everything placed at load was fitted to THAT surface:
+    // the road strips are draped on it, terrain-relative objects stand on it. Coarsening it to
+    // the Terrain Detail tier afterwards (Ultra = 6.25 m) lifted convex cells over the roads --
+    // "streets partly in the ground" -- and sank or floated what stood on them. Finer stays
+    // allowed. POSEIDON_NATIVE_TERRAIN_KEEP=0 restores the tier's coarser grid.
+    static const bool keepNative = [] {
+        const char* value = std::getenv("POSEIDON_NATIVE_TERRAIN_KEEP");
+        return !(value && value[0] == '0');
+    }();
+    if (terrainChange < 0 && keepNative && GLandscape && GLandscape->GetEnfusionSurfaceCount() > 0)
+    {
+        LOG_INFO(World, "Terrain grid: native world keeps its {} m grid (Terrain Detail asked for {} m; "
+                 "POSEIDON_NATIVE_TERRAIN_KEEP=0 = coarsen)", LandGrid / static_cast<float>(1 << currentLog), gridSize);
+        terrainChange = 0;
+    }
     if (requestedLog != coefLogInt && terrainChange != 0)
         LOG_INFO(World, "Terrain refinement capped for {} land cells: requested {}m, effective {}m",
                  LandRange, gridSize, LandGrid / static_cast<float>(1 << coefLogInt));
@@ -1664,6 +1757,13 @@ void World::SwitchLandscape(const char* name)
     else
     {
         land->ResetState();
+        // Same island again (mission restart, editor preview, next mission):
+        // wheel ruts and sand tracks belong to the previous mission, so clear
+        // them like a fresh island load does (InitLandscape).
+        GMud().Reset();
+        GSand().Reset();
+        GCraters().Reset();
+        BuildingBreach::Reset();
         Reset();
         land->FlushCache();
         if (!_map)
@@ -1975,6 +2075,34 @@ RString GetBaseSubdirectory();
 RString GetCampaignSaveDirectory(RString campaign);
 bool ParseMission(bool);
 void StartCampaign(RString, Display*);
+bool StartCampaignAt(RString, RString, Display*);
+void SetCampaign(RString name);
+
+// --arma1-mission naming a mission of an Arma 1 campaign ("campaigns\\ca\\missions\\
+// m09convoyattack.sara"): start that campaign AT this mission, so intro, briefing,
+// debriefing and the following missions run as in the campaign.
+static bool StartArma1CampaignMission(const char* missionFile)
+{
+    // "campaigns/ca/" (Arma 1) or "ca/missions/campaign/" (Arma 2, inside its archive)
+    const std::string base = Arma1Compat::CampaignBaseForMission(missionFile);
+    const std::string campaign = base.empty() ? std::string() : Arma1Compat::CampaignName(base);
+    if (campaign.empty())
+        return false;
+    std::string file = missionFile;
+    std::replace(file.begin(), file.end(), '\\', '/');
+    const size_t end = file.rfind('/');
+    if (end == std::string::npos || end == 0)
+        return false;
+    const size_t start = file.rfind('/', end - 1);
+    const std::string templ = start == std::string::npos ? file.substr(0, end) : file.substr(start + 1, end - start - 1);
+    LOG_INFO(Core, "{}: '{}' is mission '{}' of campaign '{}'", Arma1Compat::Label(), missionFile, templ, campaign);
+    if (StartCampaignAt(RString(campaign.c_str()), RString(templ.c_str()), nullptr))
+        return true;
+    // not in the campaign's flow: undo the campaign selection, play the mission alone
+    SetCampaign(RString());
+    ProcessFullName(RString(missionFile));
+    return false;
+}
 void OpenEditor();
 } // namespace Poseidon
 
@@ -2025,6 +2153,11 @@ LSError World::Save(const char* name, int message) const
 bool World::LoadBin(const char* name, int message)
 {
     LOG_DEBUG(World, "LoadBin: Start - Total allocated: {} MB", Foundation::MemoryUsed() / (1024 * 1024));
+    // A mission retry loads the start-of-mission autosave instead of switching the landscape, and
+    // never reached the resets there: breached houses kept their holes and craters stayed (owner,
+    // 2026-10-19: "when i reset the map the holes are there"). Neither is in the save.
+    GCraters().Reset();
+    BuildingBreach::Reset();
     LSError err;
     {
         GDebugger.NextAliveExpected(15 * 60 * 1000);
@@ -2133,6 +2266,7 @@ LSError World::Serialize(ParamArchive& ar, int message)
     PARAM_CHECK(ar.CheckMaxVersion(WorldSerializeVersion))
     if (ar.IsSaving())
     {
+        Hunt::EndAllPeeks(); // AI-XRAY-006: no soldier saved half-way through a look-out
         ProgressReset();
         ProgressClear(false);
         ProgressStart(LocalizeString(message));
@@ -2718,6 +2852,21 @@ void World::StartIntro()
     CurrentBattle = "";
     CurrentMission = "";
 
+    // --arma1-campaign: the campaign archive is mounted as campaigns\<name>, so the
+    // stock campaign flow (battles, missions, ends, saves) runs it unchanged.
+    if (const std::string& a1Campaign = AppConfig::Instance().GetArma1Campaign();
+        !a1Campaign.empty() && Arma1Compat::Active())
+    {
+        const RString description = GetCampaignDirectory(RString(a1Campaign.c_str())) + RString("description.ext");
+        if (QIFStreamB::FileExist(description))
+        {
+            LOG_INFO(Core, "Arma 1 campaign: {}", a1Campaign);
+            StartCampaign(RString(a1Campaign.c_str()), nullptr);
+            return;
+        }
+        LOG_ERROR(Core, "Arma 1 campaign '{}' not found ({} missing)", a1Campaign, (const char*)description);
+    }
+
     const char* ext = strrchr(LoadFile, '.');
     if (ext && QIFStreamB::FileExist(LoadFile))
     {
@@ -2757,12 +2906,24 @@ void World::StartIntro()
                             LOG_ERROR(Core, "StartAutoTest error latch: {}",
                                       (const char*)GetMaxErrorMessage());
                         }
-                        if (AppConfig::Instance().IsMissionSmokeCheck())
+                        if (AppConfig::Instance().IsMissionSmokeCheck() ||
+                            AppConfig::Instance().GetArma1TestSeconds() > 0.0f)
                         {
                             LOG_ERROR(Core, "Mission smoke check failed: StartAutoTest could not boot '{}'", LoadFile);
                             GApp->m_exitCode = 1;
                             GApp->m_closeRequest = true;
                         }
+                    }
+                }
+                else if (!AppConfig::Instance().GetArma1Mission().empty() && StartArma1CampaignMission(LoadFile))
+                {
+                    // a campaign mission: played inside its campaign, which then goes on
+                }
+                else if (!AppConfig::Instance().GetArma1Mission().empty())
+                {
+                    if (!StartMissionWithBriefing())
+                    {
+                        LOG_ERROR(Core, "Arma 1 mission '{}' could not be started", LoadFile);
                     }
                 }
                 else

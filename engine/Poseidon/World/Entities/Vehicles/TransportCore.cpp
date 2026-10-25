@@ -8,6 +8,7 @@
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 #include <Random/randomGen.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
 #include <Poseidon/Dev/Diag/DiagModes.hpp>
@@ -68,9 +69,10 @@ void Transport::PlaceOnSurface(Matrix4& trans)
     Matrix3 orient = trans.Orientation();
 
     float dx, dz;
-    pos[1] = GLandscape->RoadSurfaceYAboveWater(pos, &dx, &dz);
+    // Sinkhole W5: searched from no lower than the drawn terrain (Landscape::SurfacePlacementProbe)
+    pos[1] = GLandscape->RoadSurfaceYAboveWater(GLandscape->SurfacePlacementProbe(pos), &dx, &dz);
 
-    if (!Type()->HasDriver())
+    if (!Type()->HasDriver() && GetShape()->AnimationOrigin().SquareSize() <= 1e-8f)
     {
         pos += orient * GetShape()->BoundingCenter();
     }
@@ -1751,6 +1753,27 @@ void Transport::Refuel(float ammount)
 
 void Transport::Simulate(float deltaT, SimulationImportance prec)
 {
+    // Whole World: vehicles spawn at the fixture's height and the streamed ground arrives later (and can be
+    // replaced by a finer patch); set one found below the ground back onto it, as Man::Simulate does.
+    if (EarthStreaming::Enabled() && IsInLandscape() && !IsDammageDestroyed())
+    {
+        if (EarthStreaming::QueryGround(Position().X(), Position().Z()) && GLandscape)
+        {
+            // the sea bed, not the 0 m the elevation tiles store for the open sea: a boat afloat there has its
+            // hull below that "ground" and was lifted onto the water's surface every few frames
+            const float floorY = GLandscape->SeaBedY(Position().X(), Position().Z());
+            const float bottom = GetShape() ? -GetShape()->Min().Y() : 1.0f;
+            if (Position().Y() - bottom < floorY - 0.5f)
+            {
+                Matrix4 transform = Transform();
+                Vector3 position = Position();
+                position[1] = floorY + bottom + 0.2f;
+                transform.SetPosition(position);
+                Move(transform);
+                _speed = VZero;
+            }
+        }
+    }
     // turn in / turn out
     const float turnInOutSpeed = 1.0;
     if (_commanderHiddenWanted > _commanderHidden)
@@ -1837,7 +1860,10 @@ void Transport::Simulate(float deltaT, SimulationImportance prec)
 
     if (!CommanderUnit() || CommanderUnit()->IsInCargo())
     {
-        _pilotLight = false;
+        // nobody at the controls: OFP switches the lights off -- a parked car goes dark. A boat keeps hers as they
+        // were left (LightsStayUnmanned).
+        if (!LightsStayUnmanned())
+            _pilotLight = false;
     }
     else if (CommanderUnit()->HasAI())
     {
@@ -1876,6 +1902,11 @@ void Transport::Simulate(float deltaT, SimulationImportance prec)
                 GLOB_SCENE->AddLight(light);
             }
             _markersOn = Glob.time - GRandGen.RandomValue();
+            static const bool diag = std::getenv("POSEIDON_BOAT_DIAG") != nullptr;
+            if (diag)
+                LOG_INFO(World, "{}: marker lights on ({} steady, {} blinking), first brightness {}", (const char*)GetDebugName(),
+                         _markers.Size(), _markersBlink.Size(),
+                         GetType()->_lights.Size() > 0 ? GetType()->_lights[0].brightness : -1.0f);
         }
     }
     else
@@ -2292,6 +2323,16 @@ void Transport::DrawCameraCockpit()
     GEngine->Draw2D(mip, color, Rect2DAbs(0, 0, w, h));
 }
 
+// Where a crew member's model goes relative to his seat proxy, which places his SOURCE
+// origin. OFP/CWA models are drawn around their bounding centre; an Arma ODOL man is
+// stored around the binariser's centre instead and records where his source origin lies
+// in those coordinates (LODShape::AnimationOrigin, zero for OFP models) -- without it an
+// Arma 1 soldier sat a whole centre (~0.9 m) below his seat, under the HMMWV (a1cargo).
+static Vector3 CrewSeatOffset(const LODShapeWithShadow* manShape)
+{
+    return manShape->BoundingCenter() - manShape->AnimationOrigin();
+}
+
 void Transport::DrawCrewMember(int level, ClipFlags clipFlags, const Matrix4& transform, const Matrix4& invTransform,
                                float dist2, float z2, const LightList& lights, const ManProxy& proxy, Person* man,
                                bool hideWeapons)
@@ -2302,7 +2343,7 @@ void Transport::DrawCrewMember(int level, ClipFlags clipFlags, const Matrix4& tr
 
     AnimateManProxyMatrix(level, proxy, proxyTransform);
 
-    proxyTransform.SetPosition(proxyTransform.FastTransform(manShape->BoundingCenter()));
+    proxyTransform.SetPosition(proxyTransform.FastTransform(CrewSeatOffset(manShape)));
     Matrix4Val pTransform = transform * proxyTransform;
 
     int pLevel;
@@ -2321,6 +2362,15 @@ void Transport::DrawCrewMember(int level, ClipFlags clipFlags, const Matrix4& tr
     if (insidePlayer)
     {
         pLevel = 0;
+        // An Arma man seen from his own eyes is drawn in his first-person LOD (no head, no
+        // helmet), as on foot: LOD 0 put the inside of his own helmet in front of the camera
+        // of every Arma 1 pilot, driver and gunner. OFP men keep LOD 0 with the head hidden.
+        if (manShape->AnimationOrigin().SquareSize() > 1e-8f)
+        {
+            const int inside = man->InsideLOD(camType);
+            if (inside >= 0 && inside < manShape->NLevels())
+                pLevel = inside;
+        }
     }
     else
     {
@@ -2357,7 +2407,7 @@ int Transport::GetCrewMemberComplexity(int level, const FrameBase& pos, float di
 
     AnimateManProxyMatrix(level, proxy, proxyTransform);
 
-    proxyTransform.SetPosition(proxyTransform.FastTransform(manShape->BoundingCenter()));
+    proxyTransform.SetPosition(proxyTransform.FastTransform(CrewSeatOffset(manShape)));
     Matrix4Val pTransform = pos.Transform() * proxyTransform;
 
     int pLevel;
@@ -2513,7 +2563,7 @@ Object* Transport::GetProxy(LODShapeWithShadow*& shape, int level, Matrix4& tran
 
     AnimateManProxyMatrix(level, *proxy, proxyTransform);
 
-    proxyTransform.SetPosition(proxyTransform.FastTransform(manShape->BoundingCenter()));
+    proxyTransform.SetPosition(proxyTransform.FastTransform(CrewSeatOffset(manShape)));
     transform = parentPos.Transform() * proxyTransform;
     invTransform = transform.InverseScaled();
 
@@ -2872,7 +2922,7 @@ bool Transport::GetProxyCamera(Matrix4& transf, CameraType camType) const
     LODShapeWithShadow* manShape = man->GetShape();
     transf = proxy->transform;
     Vector3 pos = man->GetPilotPosition(camType);
-    transf.SetPosition(transf.FastTransform(manShape->BoundingCenter()));
+    transf.SetPosition(transf.FastTransform(CrewSeatOffset(manShape)));
     transf.SetPosition(transf.FastTransform(pos));
     AnimateMatrix(transf, level, proxy->selection);
     // MAT-053 diagnostic (temporary): the bridged-vehicle interior camera comes through

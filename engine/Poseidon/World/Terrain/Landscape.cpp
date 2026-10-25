@@ -1,3 +1,5 @@
+#include <Poseidon/World/Terrain/CraterField.hpp>
+#include <chrono>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
@@ -6,6 +8,8 @@
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthFreeFlight.hpp>
 #include <Poseidon/World/Terrain/SimulationResidencyState.hpp>
 #include <Poseidon/World/Scene/MapThings.hpp>
 #include <Poseidon/World/Scene/Thing.hpp>
@@ -27,6 +31,7 @@
 
 #include <Poseidon/Core/TaskPool.hpp>
 
+#include <algorithm>
 #include <vector>
 #include <limits.h>
 #include <stdint.h>
@@ -72,7 +77,14 @@ void Landscape::Init()
     // Reforger one would otherwise inherit its surface names and grow Everon's clutter
     // on Malden. The native loader refills this immediately after calling Init().
     _enfusionSurfaces.Resize(0);
+    _enfusionSurfaceMap.clear();
+    _enfusionSurfaceEdge = 0;
+    _enfusionTilePrefix.clear();
+    _enfusionTilesX = 0;
     _enfusionRoadCells.clear(); // same hazard: Everon's roads would clear Malden's clutter
+    _enfusionRoadSegments.clear();
+    _grassFootprints.clear();
+    _grassFootprintKeys.clear();
     const ParamEntry& sky = Remaster >> "CfgLandscapeSky";
     RStringB skyName = sky >> "sky" >> "model";
     RStringB starsName = sky >> "stars" >> "model";
@@ -290,6 +302,8 @@ void Landscape::Init()
     _modernLogicalOnlyObjects.clear();
     _modernObjectPlacements.clear();
     _modernObjectCells.clear();
+    _enfusionDoors.Clear();
+    _enfusionGlass.Clear();
     _modernObjectModels.clear();
     _modernObjectCellActive.clear();
     _modernObjectCellDesired.clear();
@@ -792,6 +806,8 @@ Texture* Landscape::SkyTexture()
 
 void Landscape::Simulate(float deltaT)
 {
+    // RFG-157: native Enfusion doors that are swinging.
+    _enfusionDoors.Simulate(deltaT, *this);
     // simulate weather changes
     _weather.MoveClouds(deltaT);
     // simulate tide
@@ -1619,6 +1635,12 @@ float Landscape::CalculateBump(float xC, float zC, Texture* texture, float bumpy
 float Landscape::BumpySurfaceY(float xC, float zC, float& rdX, float& rdY, Texture*& texture, float bumpy,
                                float& bump) const
 {
+    if (EarthStreaming::Enabled())
+    {
+        bump = 0;
+        texture = nullptr;
+        return EarthStreaming::GroundHeight(xC, zC, &rdX, &rdY);
+    }
     // fine rectangles are not used - use rough instead
     // calculate surface level on given coordinates
     float xRel = xC * _invTerrainGrid;
@@ -1672,14 +1694,22 @@ float Landscape::BumpySurfaceY(float xC, float zC, float& rdX, float& rdY, Textu
     texture = rTexture;
     auto mudGradient = GMud().HeightGradientAt(xC, zC);
     const auto sandGradient = GSand().HeightGradientAt(xC, zC);
-    mudGradient[0] += sandGradient[0]; mudGradient[1] += sandGradient[1];
+    const auto craterGradient = GCraters().HeightGradientAt(xC, zC);
+    mudGradient[0] += sandGradient[0] + craterGradient[0]; mudGradient[1] += sandGradient[1] + craterGradient[1];
     rdX += mudGradient[0];
     rdY += mudGradient[1];
-    return y + GMud().HeightOffsetAt(xC, zC) + GSand().HeightOffsetAt(xC, zC);
+    return y + GMud().HeightOffsetAt(xC, zC) + GSand().HeightOffsetAt(xC, zC) + GCraters().HeightOffsetAt(xC, zC);
 }
 
 void Landscape::SurfacePlane(Plane& plane, float xC, float zC) const
 {
+    if (EarthStreaming::Enabled())
+    {
+        float dx, dz;
+        const float y = EarthStreaming::GroundHeight(xC, zC, &dx, &dz);
+        plane = Plane(Vector3(-dx, 1, -dz), Vector3(xC, y, zC));
+        return;
+    }
     // calculate surface level on given coordinates
     float xRel = xC * _invTerrainGrid;
     float zRel = zC * _invTerrainGrid;
@@ -1727,8 +1757,9 @@ void Landscape::SurfacePlane(Plane& plane, float xC, float zC) const
     Vector3 point((x + 1) * _terrainGrid, y01, z * _terrainGrid);
     auto mudGradient = GMud().HeightGradientAt(xC, zC);
     const auto sandGradient = GSand().HeightGradientAt(xC, zC);
-    mudGradient[0] += sandGradient[0]; mudGradient[1] += sandGradient[1];
-    const float mudHeight = GMud().HeightOffsetAt(xC, zC) + GSand().HeightOffsetAt(xC, zC);
+    const auto craterGradient = GCraters().HeightGradientAt(xC, zC);
+    mudGradient[0] += sandGradient[0] + craterGradient[0]; mudGradient[1] += sandGradient[1] + craterGradient[1];
+    const float mudHeight = GMud().HeightOffsetAt(xC, zC) + GSand().HeightOffsetAt(xC, zC) + GCraters().HeightOffsetAt(xC, zC);
     if (mudHeight != 0 || mudGradient[0] != 0 || mudGradient[1] != 0)
     {
         normal[0] -= mudGradient[0];
@@ -1742,6 +1773,7 @@ void Landscape::SurfacePlane(Plane& plane, float xC, float zC) const
 
 float Landscape::SurfaceY(float x, float z) const
 {
+    if (EarthStreaming::Enabled()) return EarthStreaming::GroundHeight(x, z);
     // code equivalent to
     // return SurfaceY(x,z,nullptr,nullptr,nullptr);
     // as this case is quite common, it is optimized
@@ -1784,19 +1816,29 @@ float Landscape::SurfaceY(float x, float z) const
     { // triangle 00,01,10
         float d1000 = y10 - y00;
         float d0100 = y01 - y00;
-        return y00 + d1000 * zIn + d0100 * xIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z);
+        return y00 + d1000 * zIn + d0100 * xIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z) + GCraters().HeightOffsetAt(x, z);
     }
     else
     {
         // triangle 01,10,11
         float d1011 = y10 - y11;
         float d0111 = y01 - y11;
-        return y10 + d0111 - d1011 * xIn - d0111 * zIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z);
+        return y10 + d0111 - d1011 * xIn - d0111 * zIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z) + GCraters().HeightOffsetAt(x, z);
     }
 }
 
 float Landscape::SurfaceY(float x, float z, float* rdX, float* rdY, Texture** texture) const
 {
+    if (rdX)
+        *rdX = 0;
+    if (rdY)
+        *rdY = 0;
+
+    if (EarthStreaming::Enabled())
+    {
+        if (texture) *texture = nullptr;
+        return EarthStreaming::GroundHeight(x, z, rdX, rdY);
+    }
     // fine rectangles are not used - use rough instead
     // calculate surface level on given coordinates
     float xRel = x * _invTerrainGrid;
@@ -1844,10 +1886,11 @@ float Landscape::SurfaceY(float x, float z, float* rdX, float* rdY, Texture** te
             *rdY = d1000 * _invTerrainGrid;
             auto mudGradient = GMud().HeightGradientAt(x, z);
             const auto sandGradient = GSand().HeightGradientAt(x, z);
-            mudGradient[0] += sandGradient[0]; mudGradient[1] += sandGradient[1];
+            const auto craterGradient = GCraters().HeightGradientAt(x, z);
+            mudGradient[0] += sandGradient[0] + craterGradient[0]; mudGradient[1] += sandGradient[1] + craterGradient[1];
             *rdX += mudGradient[0]; *rdY += mudGradient[1];
         }
-        return y00 + d1000 * zIn + d0100 * xIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z);
+        return y00 + d1000 * zIn + d0100 * xIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z) + GCraters().HeightOffsetAt(x, z);
     }
     else
     {
@@ -1860,15 +1903,17 @@ float Landscape::SurfaceY(float x, float z, float* rdX, float* rdY, Texture** te
             *rdY = d0111 * -_invTerrainGrid;
             auto mudGradient = GMud().HeightGradientAt(x, z);
             const auto sandGradient = GSand().HeightGradientAt(x, z);
-            mudGradient[0] += sandGradient[0]; mudGradient[1] += sandGradient[1];
+            const auto craterGradient = GCraters().HeightGradientAt(x, z);
+            mudGradient[0] += sandGradient[0] + craterGradient[0]; mudGradient[1] += sandGradient[1] + craterGradient[1];
             *rdX += mudGradient[0]; *rdY += mudGradient[1];
         }
-        return y10 + d0111 - d1011 * xIn - d0111 * zIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z);
+        return y10 + d0111 - d1011 * xIn - d0111 * zIn + GMud().HeightOffsetAt(x, z) + GSand().HeightOffsetAt(x, z) + GCraters().HeightOffsetAt(x, z);
     }
 }
 
 float Landscape::RoadSurfaceY(float xC, float zC, float* dX, float* dZ, Texture** texture) const
 {
+    if (EarthStreaming::Enabled()) return SurfaceY(xC, zC, dX, dZ, texture);
     Texture* surfTexture = nullptr;
     float sdX, sdZ;
     float landY = SurfaceY(xC, zC, &sdX, &sdZ, &surfTexture);
@@ -2031,6 +2076,11 @@ float Landscape::RoadSurfaceY(float xC, float zC, float* dX, float* dZ, Texture*
 
 float Landscape::RoadSurfaceY(Vector3Par pos, float* dX, float* dZ, Texture** texture, Object** obj) const
 {
+    if (EarthStreaming::Enabled())
+    {
+        if (obj) *obj = nullptr;
+        return SurfaceY(pos.X(), pos.Z(), dX, dZ, texture);
+    }
     Texture* surfTexture = nullptr;
     float sdX, sdZ;
     float landY = SurfaceY(pos.X(), pos.Z(), &sdX, &sdZ, &surfTexture);
@@ -2218,6 +2268,7 @@ float Landscape::RoadSurfaceY(Vector3Par pos, float* dX, float* dZ, Texture** te
 
 float Landscape::RoadSurfaceYAboveWater(Vector3Par pos, float* dX, float* dZ, Texture** texture) const
 {
+    if (EarthStreaming::Enabled()) return RoadSurfaceY(pos, dX, dZ, texture);
     float y = RoadSurfaceY(pos, dX, dZ, texture);
     float minY = GetSeaLevel();
     if (y < minY)
@@ -2235,8 +2286,28 @@ float Landscape::RoadSurfaceYAboveWater(Vector3Par pos, float* dX, float* dZ, Te
     return y;
 }
 
+float Landscape::SeaLevelAt(float x, float z) const
+{
+    if (EarthStreaming::Enabled() && !EarthStreaming::MoonFrameActive())
+        return EarthStreaming::FlightYAtAltitude(x, z, 0.0);
+    return GetSeaLevel();
+}
+
+bool Landscape::SeaAt(float x, float z) const
+{
+    const float sea = SeaLevelAt(x, z);
+    const float ground = SurfaceY(x, z);
+    return ground < sea;
+}
+
+float Landscape::SeaBedY(float x, float z) const
+{
+    return SurfaceY(x, z);
+}
+
 float Landscape::SurfaceYAboveWater(float x, float z) const
 {
+    if (EarthStreaming::Enabled()) return SurfaceY(x, z);
     float y = SurfaceY(x, z, nullptr, nullptr, nullptr);
     float minY = GetSeaLevel();
     if (y < minY)
@@ -2248,6 +2319,7 @@ float Landscape::SurfaceYAboveWater(float x, float z) const
 
 float Landscape::SurfaceYAboveWater(float x, float z, float* rdX, float* rdZ, Texture** texture) const
 {
+    if (EarthStreaming::Enabled()) return SurfaceY(x, z, rdX, rdZ, texture);
     float y = SurfaceY(x, z, rdX, rdZ, texture);
     float minY = GetSeaLevel();
     if (y < minY)
@@ -2267,6 +2339,7 @@ float Landscape::SurfaceYAboveWater(float x, float z, float* rdX, float* rdZ, Te
 
 float Landscape::RoadSurfaceYAboveWater(float xC, float zC, float* dX, float* dZ, Texture** texture) const
 {
+    if (EarthStreaming::Enabled()) return RoadSurfaceY(xC, zC, dX, dZ, texture);
     float y = RoadSurfaceY(xC, zC, dX, dZ, texture);
     float minY = GetSeaLevel();
     if (y < minY)
@@ -2332,6 +2405,31 @@ inline bool IsShape(Object* obj, const char* name)
     return strstr(obj->GetShape()->Name(), name) != nullptr;
 }
 
+// POSEIDON_LOAD_PROFILE=1: where world object creation goes (LoadOptimized logs the totals)
+double GLoadProfileMs[4] = {};
+static bool LoadProfileOn()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("POSEIDON_LOAD_PROFILE");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+struct LoadProfileSpan
+{
+    int slot;
+    std::chrono::steady_clock::time_point began;
+    explicit LoadProfileSpan(int s) : slot(LoadProfileOn() ? s : -1)
+    {
+        if (slot >= 0) began = std::chrono::steady_clock::now();
+    }
+    ~LoadProfileSpan()
+    {
+        if (slot >= 0)
+            GLoadProfileMs[slot] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+    }
+};
+
 void Landscape::AddObject(Object* obj, int* xr, int* zr, bool avoidRecalculation, bool registerVisual)
 {
     int x, z;
@@ -2346,11 +2444,15 @@ void Landscape::AddObject(Object* obj, int* xr, int* zr, bool avoidRecalculation
     }
     // add into corresponding list
     ObjectList& list = _objects(x, z);
-    Verify(list.Add(obj, x, z, avoidRecalculation) >= 0); // <0  -> error
+    {
+        LoadProfileSpan span(2);
+        Verify(list.Add(obj, x, z, avoidRecalculation) >= 0); // <0  -> error
+    }
     // GPU-driven rendering (docs/gpu-culling-and-depth-plan.md Stage 3b): let a GPU-driven
     // backend register this object into its retained scene. No-op unless WGR_GPU_DRIVEN is on.
     if (GEngine && registerVisual)
     {
+        LoadProfileSpan span(3);
         GEngine->SceneObjectCreated(obj);
     }
 #ifdef LOG_OBJ_SHAPE
@@ -3012,7 +3114,11 @@ Object* Landscape::ObjectCreate(int id, const char* name, const Matrix4& transfo
 {
     const ShapeBank::CpuOnlyLoadScope cpuOnly(!registerVisual);
     // create object based on Class hint in LOD 0
-    Ref<LODShapeWithShadow> shape = Shapes.New(name, false, true);
+    Ref<LODShapeWithShadow> shape;
+    {
+        LoadProfileSpan span(0);
+        shape = Shapes.New(name, false, true);
+    }
     return ObjectCreateFromShape(id, shape, name, transform, x, z, avoidRecalculation,
                                  preserveAuthoredElevation, registerVisual);
 }
@@ -3034,7 +3140,11 @@ Object* Landscape::ObjectCreateFromShape(int id, LODShapeWithShadow* shape, cons
                                        bool preserveAuthoredElevation, bool registerVisual)
 {
     const ShapeBank::CpuOnlyLoadScope cpuOnly(!registerVisual);
-    Object* obj = NewObject(shape, id);
+    Object* obj;
+    {
+        LoadProfileSpan span(1);
+        obj = NewObject(shape, id);
+    }
     obj->SetVisualResident(registerVisual);
 
     if (obj->GetType() != Primary && obj->GetType() != Network)
@@ -3052,6 +3162,8 @@ Object* Landscape::ObjectCreateFromShape(int id, LODShapeWithShadow* shape, cons
                                                         obj->GetType() == Network,
                                                         (shape->GetOrHints() & ClipLandKeep) != 0);
 
+    // RFG-157: a part of an open (or swinging) native door comes back at its door's angle.
+    _enfusionDoors.AdjustCreateTransform(id, nTransform);
     obj->SetTransform(nTransform);
 
 #if 1
@@ -3283,10 +3395,20 @@ void ObjectListFull::ChangeNonStaticCount(int val)
     PoseidonAssert(CountNonStatic() == _nNonStatic);
 }
 
+// One static object's XZ reach from the cell centre: see _staticReachXZ.
+static inline float StaticReachXZTerm(const Object* obj, Vector3Par center)
+{
+    const float dx = obj->Position().X() - center.X();
+    const float dz = obj->Position().Z() - center.Z();
+    return std::sqrt(dx * dx + dz * dz) + 2 * obj->GetRadius();
+}
+
 void ObjectListFull::StaticChanged() // recalculate what is neccessary
 {
     // recalculate bounding sphere
     _bRadius = 50;
+    _staticReach = 0;
+    _staticReachXZ = 0;
     for (int i = 0; i < Size(); i++)
     {
         Object* obj = Get(i);
@@ -3294,8 +3416,11 @@ void ObjectListFull::StaticChanged() // recalculate what is neccessary
         {
             continue;
         }
-        float dist = obj->Position().Distance(_bCenter) + obj->GetRadius();
+        const float centre = obj->Position().Distance(_bCenter);
+        float dist = centre + obj->GetRadius();
         saturateMax(_bRadius, dist);
+        saturateMax(_staticReach, centre + 2 * obj->GetRadius());
+        saturateMax(_staticReachXZ, StaticReachXZTerm(obj, _bCenter));
     }
     // assume center is not changed
 }
@@ -3334,6 +3459,8 @@ int ObjectListFull::Add(Object* object, bool avoidRecalculation)
 {
     int index = base::Add(object);
     if (object->GetType() != TypeTempVehicle) _visibilityObjects.Add(object);
+    if (object->GetIPaths())
+        _pathObjects.push_back(object);
     LODShape* shape = object->GetShape();
     if (shape && shape->FindRoadwayLevel() >= 0)
     {
@@ -3341,6 +3468,10 @@ int ObjectListFull::Add(Object* object, bool avoidRecalculation)
     }
     if (object->Static())
     {
+        // Folded in whatever avoidRecalculation says: one distance, and a line query that
+        // trusted a stale reach would lose a hit rather than merely cull too little.
+        saturateMax(_staticReach, object->Position().Distance(_bCenter) + 2 * object->GetRadius());
+        saturateMax(_staticReachXZ, StaticReachXZTerm(object, _bCenter));
         if (!avoidRecalculation)
         {
             // A bounding sphere only ever grows on insertion, so the full O(n) rescan
@@ -3426,6 +3557,12 @@ void ObjectListFull::Delete(int index)
             if (_visibilityObjects[i] == obj) { _visibilityObjects.Delete(i); break; }
         }
     }
+    if (obj->GetIPaths())
+    {
+        const auto found = std::find(_pathObjects.begin(), _pathObjects.end(), obj);
+        if (found != _pathObjects.end())
+            _pathObjects.erase(found);
+    }
     // Release the owning cell reference only after its non-owning mirrors no
     // longer contain the pointer. A static map object can be owned solely by
     // the landscape index at teardown.
@@ -3450,17 +3587,21 @@ void ObjectListFull::Delete(int index)
 void ObjectListFull::Clear()
 {
     _visibilityObjects.Clear();
+    _pathObjects.clear();
     base::Clear();
     _typeVehicles.Clear();
     _roadwayObjects.Clear();
     _nNonStatic = 0;
     _nTypeVehicle = 0;
+    _staticReach = 0;
+    _staticReachXZ = 0;
     // Same rescan as ChangeNonStaticCount - debug-only self-check. (After base::Clear()
     // the list is empty, so the scan can only ever agree.)
     PoseidonAssert(CountNonStatic() == _nNonStatic);
 }
 
-ObjectListFull::ObjectListFull(int x, int z) : _bRadius(1e10), _nNonStatic(0), _nTypeVehicle(0)
+ObjectListFull::ObjectListFull(int x, int z)
+    : _bRadius(1e10), _staticReach(0), _staticReachXZ(0), _nNonStatic(0), _nTypeVehicle(0)
 {
     SetBSphere(x, z);
 }

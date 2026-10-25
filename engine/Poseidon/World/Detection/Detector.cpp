@@ -1261,6 +1261,7 @@ void Detector::Scan()
         GameState* gstate = GWorld->GetGameState();
         gstate->VarSet("this", active, true);
         gstate->VarSet("thisList", GetGameValue(), true);
+        gstate->VarSet("thisTrigger", GameValueExt(this), true); // Arma 2/3
         active = gstate->EvaluateBool(_expCond);
     }
 
@@ -1302,6 +1303,7 @@ void Detector::DoActivate()
     {
         GameState* gstate = GWorld->GetGameState();
         gstate->VarSet("this", true, true);
+        gstate->VarSet("thisTrigger", GameValueExt(this), true);
         if (!gstate->EvaluateBool(_expCond))
         {
             return;
@@ -1334,6 +1336,7 @@ void Detector::OnActivate(Object* obj)
 
     GameState* gstate = GWorld->GetGameState();
     gstate->VarSet("thisList", GetGameValue(), true);
+    gstate->VarSet("thisTrigger", GameValueExt(this), true);
     gstate->Execute(_expActiv);
 
     if (_action == ASTSwitch)
@@ -1512,6 +1515,7 @@ void Detector::OnActivate(Object* obj)
 void Detector::OnDesactivate()
 {
     GameState* gstate = GWorld->GetGameState();
+    gstate->VarSet("thisTrigger", GameValueExt(this), true);
     gstate->Execute(_expDesactiv);
 
     _active = false;
@@ -1542,7 +1546,10 @@ namespace Poseidon
 
 Flag::Flag(EntityType* name, int id) : base(name->GetShape(), name, id)
 {
-    _fabric.Init(_shape, "latka", nullptr);
+    // A flag proxy whose type has no shape (an Arma 2 model this game could not load)
+    // simply has no fabric to animate.
+    if (_shape)
+        _fabric.Init(_shape, "latka", nullptr);
 
     const float prec = 0.1;
     _simulationSkipped = GRandGen.RandomValue() * prec;
@@ -1551,8 +1558,8 @@ Flag::Flag(EntityType* name, int id) : base(name->GetShape(), name, id)
 
 void Flag::Init(Matrix4Par pos)
 {
-    Shape* shape = _shape->Level(0);
-    int selIndex = _fabric.GetSelection(0);
+    Shape* shape = _shape ? _shape->Level(0) : nullptr;
+    int selIndex = shape ? _fabric.GetSelection(0) : -1;
     if (selIndex >= 0)
     {
         const NamedSelection& sel = shape->NamedSel(selIndex);

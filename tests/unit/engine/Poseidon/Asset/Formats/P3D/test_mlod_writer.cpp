@@ -4,6 +4,8 @@
 #include <Poseidon/Asset/Formats/P3D/MLODLoader.hpp>
 #include <Poseidon/Asset/Formats/P3D/MLODWriter.hpp>
 #include <Poseidon/World/Model/Model.hpp>
+#include <Poseidon/World/Model/ModelBlob.hpp>
+#include <Poseidon/Asset/Formats/Enfusion/XobTangentFrame.hpp>
 
 #include "../../../test_fixtures.hpp"
 
@@ -492,4 +494,169 @@ TEST_CASE("MLODWriter: rejects selections and mass the reader would misread", "[
         model.lods[1].mass = {1.0f, 2.0f};
         REQUIRE_THROWS_WITH(MLODWriter::writeToBuffer(model), Catch::Matchers::ContainsSubstring("mass"));
     }
+}
+
+TEST_CASE("Authored UV0 tangent sidecar preserves seams winding and cache provenance", "[mlod][writer][tangents]")
+{
+    using namespace Poseidon::Asset::Formats;
+    MLODW::WriteModel source;
+    MLODW::WriteLod lod;
+    for (const auto& p : {Poseidon::Model::Vector3{0,0,0}, {1,0,0}, {0,1,0}})
+    {
+        lod.points.push_back({{p.x,p.y,p.z},0});
+        lod.normals.push_back({0,0,-1});
+    }
+    MLODW::WriteFace face;
+    face.vertexCount = 3;
+    for (int c=0;c<3;++c) { face.vertices[c].point=c; face.vertices[c].normal=c; }
+    lod.faces = {face,face};
+    source.lods.push_back(lod);
+    Enfusion::XobPart part;
+    part.renderSource={0,1,2};
+    part.tangents={{1,0,0},{1,0,0},{1,0,0}};
+    part.bitangents={{0,1,0},{0,1,0},{0,1,0}};
+    source.tangentFrames.resize(1);
+    source.tangentFrames[0].resize(2);
+    for (int f=0;f<2;++f) for (int c=0;c<3;++c)
+        source.tangentFrames[0][f][c]=Enfusion::XobCornerTangentFrame(part,c,c,0);
+    source.tangentFrames[0][1][0].tangent={1,0,.25f};
+    const auto bytes=MLODWriter::writeToBuffer(source);
+    auto legacy=MLODLoader::loadFromBuffer(bytes.data(),int(bytes.size()),"owned.xob");
+    REQUIRE(legacy.lodLevels[0].mesh.vertices.size()==3);
+    for (const auto& v : legacy.lodLevels[0].mesh.vertices) REQUIRE_FALSE(v.hasTangentFrame);
+    auto authored=MLODLoader::loadFromBuffer(bytes.data(),int(bytes.size()),"owned.xob",&source.tangentFrames);
+    auto& mesh=authored.lodLevels[0].mesh;
+    REQUIRE(mesh.vertices.size()==4); // tangent-only seam must not merge
+    REQUIRE(mesh.vertices[mesh.triangles[0].indices[1]].tangent.z==0.f); // loader reverses0/1
+    REQUIRE(mesh.vertices[mesh.triangles[1].indices[1]].tangent.z==.25f);
+    for (const auto& v : mesh.vertices) REQUIRE(v.hasTangentFrame);
+    Enfusion::MarkXobAuthoredTangentProducer(authored);
+    REQUIRE(authored.sourceFormat=="MLOD"); // container still enters modern adapter/streaming
+    REQUIRE(authored.metadata.at(Enfusion::kXobTangentProducerKey)==Enfusion::kXobTangentProducer);
+    const auto blob=Poseidon::ModelBlob::Serialize(authored);
+    Poseidon::Model::Model restored;
+    REQUIRE(Poseidon::ModelBlob::Deserialize(blob.data(),blob.size(),restored));
+    REQUIRE(restored.sourceFormat=="MLOD");
+    REQUIRE(restored.metadata.at(Enfusion::kXobTangentProducerKey)==Enfusion::kXobTangentProducer);
+    REQUIRE(Poseidon::ModelBlob::Serialize(restored)==blob);
+    REQUIRE(Enfusion::HasXobAuthoredTangentFrame(restored,restored.lodLevels[0].mesh));
+    auto brokenV1=restored;
+    brokenV1.sourceFormat="XOB_TSPACE_UV0_V1";
+    brokenV1.metadata.clear();
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentFrame(brokenV1,brokenV1.lodLevels[0].mesh));
+    auto staleMetadata=restored;
+    staleMetadata.metadata[Enfusion::kXobTangentProducerKey]="XOB_TSPACE_UV0_V1";
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentFrame(staleMetadata,staleMetadata.lodLevels[0].mesh));
+    restored.lodLevels[0].mesh.vertices[0].normal={0,0,0};
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentFrame(restored,restored.lodLevels[0].mesh));
+    const auto oldBlob=Poseidon::ModelBlob::Serialize(legacy);
+    REQUIRE(Poseidon::ModelBlob::Deserialize(oldBlob.data(),oldBlob.size(),restored));
+    REQUIRE(restored.sourceFormat=="MLOD");
+    REQUIRE(restored.metadata.find(Enfusion::kXobTangentProducerKey)==restored.metadata.end());
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentFrame(restored,restored.lodLevels[0].mesh));
+    REQUIRE_FALSE(Enfusion::XobCornerTangentFrame(part,0,1,0).supplied); // source mapping
+    REQUIRE_FALSE(Enfusion::XobCornerTangentFrame(part,3,0,0).supplied); // bounds
+    REQUIRE_FALSE(Enfusion::XobCornerTangentFrame(part,0,0,1).supplied); // experimental packing
+    part.skinned=true;
+    REQUIRE_FALSE(Enfusion::XobCornerTangentFrame(part,0,0,0).supplied);
+    part.skinned=false; part.bitangents[0]={1,0,0};
+    REQUIRE_FALSE(Enfusion::XobCornerTangentFrame(part,0,0,0).supplied); // parallel axes
+    source.tangentFrames[0][1][0].supplied=false;
+    auto partial=MLODLoader::loadFromBuffer(bytes.data(),int(bytes.size()),"owned.xob",&source.tangentFrames);
+    REQUIRE(partial.lodLevels[0].mesh.vertices.size()==4); // missing corner cannot merge with authored seam
+    size_t supplied=0;
+    for (const auto& v : partial.lodLevels[0].mesh.vertices) supplied+=v.hasTangentFrame?1:0;
+    REQUIRE(supplied==3);
+    Enfusion::MarkXobAuthoredTangentProducer(partial);
+    REQUIRE(Enfusion::HasXobAuthoredTangentProducer(partial));
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentFrame(partial,partial.lodLevels[0].mesh));
+    const auto partialBlob=Poseidon::ModelBlob::Serialize(partial);
+    Poseidon::Model::Model partialRestored;
+    REQUIRE(Poseidon::ModelBlob::Deserialize(partialBlob.data(),partialBlob.size(),partialRestored));
+    REQUIRE(Poseidon::ModelBlob::Serialize(partialRestored)==partialBlob);
+    auto staleV2=partial;
+    staleV2.metadata[Enfusion::kXobTangentProducerKey]="XOB_TSPACE_UV0_V2";
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentProducer(staleV2));
+    auto staleV3=partial;
+    staleV3.metadata[Enfusion::kXobTangentProducerKey]="XOB_TSPACE_UV0_V3";
+    REQUIRE_FALSE(Enfusion::HasXobAuthoredTangentProducer(staleV3));
+    // Two triangle streams with different triangle order and cyclic corner order.
+    Enfusion::XobPart reordered;
+    reordered.positions.resize(4);
+    reordered.indices={0,1,2, 0,2,3};
+    reordered.renderSource={0,1,2,0,2,3};
+    reordered.renderIndices={4,5,3, 1,2,0};
+    const auto corners=Enfusion::XobAuthoredRenderCornerMap(reordered);
+    REQUIRE(corners==std::vector<uint32_t>{0,1,2,3,4,5});
+    auto reversed=reordered;
+    std::swap(reversed.renderIndices[0],reversed.renderIndices[1]);
+    REQUIRE(Enfusion::XobAuthoredRenderCornerMap(reversed).empty()); // reversed winding is different
+    auto missing=reordered;
+    missing.renderIndices.resize(3);
+    REQUIRE(Enfusion::XobAuthoredRenderCornerMap(missing).empty());
+    auto duplicate=reordered;
+    duplicate.indices={0,1,2, 0,1,2};
+    duplicate.renderSource={0,1,2,0,1,2};
+    duplicate.renderIndices={0,1,2,3,4,5};
+    duplicate.tangents={{1,0,0},{1,0,0},{1,0,0},{0,1,0},{0,1,0},{0,1,0}};
+    duplicate.bitangents={{0,1,0},{0,1,0},{0,1,0},{1,0,0},{1,0,0},{1,0,0}};
+    const auto ambiguous=Enfusion::XobAuthoredRenderCornerMap(duplicate);
+    REQUIRE(ambiguous.size()==6);
+    for (uint32_t corner : ambiguous) REQUIRE(corner==UINT32_MAX); // cannot assign the seam arbitrarily
+    auto wrongMultiplicity=duplicate;
+    wrongMultiplicity.indices=reordered.indices;
+    REQUIRE(Enfusion::XobAuthoredRenderCornerMap(wrongMultiplicity).empty());
+    auto invalidIndex=reordered;
+    invalidIndex.renderIndices[0]=99;
+    REQUIRE(Enfusion::XobAuthoredRenderCornerMap(invalidIndex).empty());
+    auto degenerate=reordered;
+    degenerate.indices={0,0,1};degenerate.renderSource={0,0,1};degenerate.renderIndices={0,1,2};
+    const auto degenerateCorners=Enfusion::XobAuthoredRenderCornerMap(degenerate);
+    REQUIRE(degenerateCorners.size()==3);
+    for (uint32_t corner : degenerateCorners) REQUIRE(corner==UINT32_MAX);
+    source.tangentFrames[0].pop_back();
+    auto mismatch=MLODLoader::loadFromBuffer(bytes.data(),int(bytes.size()),"owned.xob",&source.tangentFrames);
+    for (const auto& v : mismatch.lodLevels[0].mesh.vertices) REQUIRE_FALSE(v.hasTangentFrame);
+}
+
+// WGPU-020: a loose point that a named selection holds survives in a visual LOD.
+//
+// The steering-wheel axis (`osaVolantZac`/`osaVolantKon`) is read from the pilot view LOD,
+// where it is a pair of points no face uses. The reader used to keep only face corners in
+// visual and geometry LODs, so the selection came out empty; the legacy SP3X loader keeps
+// every point. A loose point outside every selection is still dropped.
+TEST_CASE("MLOD loader: a selected loose point in a visual LOD becomes a vertex", "[mlod][writer][wgpu-020]")
+{
+    MLODW::WriteModel model = buildTestModel();
+    MLODW::WriteLod& visual = model.lods[0];
+    const Poseidon::Asset::Formats::Vector3 axisPoint{0.5f, 1.0f, -2.0f};
+    const Poseidon::Asset::Formats::Vector3 strayPoint{9.0f, 9.0f, 9.0f};
+    visual.points.push_back({axisPoint, 0});  // point 6: in a selection, no face
+    visual.points.push_back({strayPoint, 0}); // point 7: in nothing, no face
+    MLODW::WriteNamedSelection axis;
+    axis.name = "osaVolantZac";
+    axis.points = {6};
+    visual.selections.push_back(axis);
+
+    const std::vector<char> bytes = MLODWriter::writeToBuffer(model);
+    const auto loaded = MLODLoader::loadFromBuffer(bytes.data(), static_cast<int>(bytes.size()), "memory");
+    const auto& mesh = loaded.lodLevels[0].mesh;
+
+    // Six face corners plus the selected axis point; the stray point is not kept.
+    REQUIRE(mesh.vertices.size() == 7);
+    REQUIRE(mesh.triangles.size() == 1);
+    REQUIRE(mesh.quads.size() == 1);
+
+    const Poseidon::Model::NamedSelection* found = nullptr;
+    for (const auto& selection : mesh.selections)
+        if (selection.name == "osaVolantZac")
+            found = &selection;
+    REQUIRE(found != nullptr);
+    REQUIRE(found->vertexIndices.size() == 1);
+    const auto& vertex = mesh.vertices[found->vertexIndices[0]];
+    REQUIRE(vertex.position.x == axisPoint.x);
+    REQUIRE(vertex.position.y == axisPoint.y);
+    REQUIRE(vertex.position.z == axisPoint.z);
+    for (const auto& v : mesh.vertices)
+        REQUIRE_FALSE(v.position.x == strayPoint.x);
 }

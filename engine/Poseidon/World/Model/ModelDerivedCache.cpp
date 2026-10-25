@@ -6,6 +6,7 @@
 #include <Poseidon/IO/Streams/QBStream.hpp>
 #include <Poseidon/World/Model/Model.hpp>
 #include <Poseidon/World/Model/ModelBlob.hpp>
+#include <Poseidon/Asset/Formats/Enfusion/XobTangentFrame.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -20,7 +21,7 @@ namespace
 // -- by hand, deliberately -- whenever their output changes for input that did
 // not. It is NOT a build stamp: a rebuild that changes nothing must not
 // invalidate every cache in existence.
-constexpr int kModelProducerVersion = 1;
+constexpr int kModelProducerVersion = 2; // 2: ODOL 40 bounding centre in metadata
 
 // 512 MiB, sized against the measured corpus rather than picked round.
 //
@@ -137,6 +138,10 @@ Asset::Cache::DerivedAssetKey ModelDerivedCache::MakeKey(const std::string& virt
     key.AddInput("model", Asset::VirtualPath::Parse(virtualPath), contentSha);
     key.AddOption("modelProducer", std::to_string(kModelProducerVersion));
     key.AddOption("blobFormat", std::to_string(ModelBlob::kFormatVersion));
+    // Opt-in imports retain a different, versioned corner basis. Old blobs lack
+    // producer provenance and must not be reused for this configuration.
+    if (Asset::Formats::Enfusion::XobAuthoredTangentPreviewEnabled())
+        key.AddOption("authoredUv0TangentProducer", "4");
     return key;
 }
 

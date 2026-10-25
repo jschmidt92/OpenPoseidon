@@ -78,8 +78,8 @@ fn ground_mesh_actual_fragment_helper_and_both_routes_compose() {
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&composer)));
     }
     let retained = include_str!("../gfx3d/gpu_driven.wgsl");
-    assert!(retained.contains("(in.surface_receivers & 1u) != 0u"));
-    assert!(retained.contains("(in.surface_receivers & 2u) == 0u"));
+    assert!(retained.contains("(retained_surface_receivers(in) & 1u) != 0u"));
+    assert!(retained.contains("(retained_surface_receivers(in) & 2u) == 0u"));
     assert!(!retained.contains("@location(15)"));
 }
 
@@ -254,7 +254,7 @@ fn ground_mesh_gpu_proves_each_fragment_triangle_side_and_valid_heightmap() {
         });
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receive.recv().unwrap().unwrap();
-        let bytes = slice.get_mapped_range();
+        let bytes = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
         let values = bytemuck::cast_slice::<u8, f32>(&bytes);
         let expected = if case == 0 {
             [

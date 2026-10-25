@@ -25,6 +25,7 @@
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Foundation/Platform/AppConfig.hpp>
 #include <Poseidon/Core/Global.hpp>
+#include <Poseidon/AI/AICenter.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <Poseidon/Foundation/Common/Filenames.hpp>
 #include <Poseidon/Foundation/Common/Win.h>
@@ -32,7 +33,10 @@
 #include <Poseidon/Core/Profile/ProfileManager.hpp>
 #include <Poseidon/UI/Settings/GameSettingsConfig.hpp>
 #include <Poseidon/Foundation/Platform/GamePaths.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/IO/Filesystem/Utf8Paths.hpp>
+#include <cstdlib>
 #include <filesystem>
 #include <limits.h>
 #include <stdio.h>
@@ -931,6 +935,131 @@ void DisplayMission::OnSimulate(EntityAI* vehicle)
     _compass->ShowCtrl(GWorld->HasCompass());
     _watch->ShowCtrl(GWorld->HasWatch());
 
+    // --arma1-test-seconds: play the mission for N wall-clock seconds, then leave.
+    if (const float testSeconds = AppConfig::Instance().GetArma1TestSeconds(); testSeconds > 0.0f)
+    {
+        static DWORD testStart = 0;
+        const DWORD now = Poseidon::Foundation::GlobalTickCount();
+        if (testStart == 0)
+        {
+            testStart = now;
+            LOG_INFO(Core, "ARMA1-TEST mission runtime entered ({}.{})", (const char*)Glob.header.filename,
+                     (const char*)Glob.header.worldname);
+            Poseidon::Arma1Compat::LogAssetCensus();
+            Poseidon::Arma1Compat::LogUnitMotion(true);
+        }
+        else if (now - testStart >= static_cast<DWORD>(testSeconds * 1000.0f))
+        {
+            // where the player ended up: a player standing in the sea or under the ground is a
+            // failed placement even when the mission ran
+            if (const Object* who = GWorld->GetRealPlayer(); who && GLandscape)
+            {
+                const Vector3 p = who->Position();
+                const Object* in = GWorld->CameraOn();
+                LOG_INFO(Core, "ARMA1-TEST player at {:.1f} {:.1f}, {:.2f} m (ground {:.2f} m, sea level 0){}", p.X(),
+                         p.Z(), p.Y(), GLandscape->SurfaceY(p.X(), p.Z()),
+                         in && in != who ? " in a vehicle" : "");
+            }
+            Poseidon::Arma1Compat::LogUnitMotion(false);
+            Poseidon::Arma1Compat::LogSoundCensus();
+            Poseidon::Arma1Compat::LogScriptProbe();
+            LOG_INFO(Core, "ARMA1-TEST PASS ({}.{}) played {} s", (const char*)Glob.header.filename,
+                     (const char*)Glob.header.worldname, testSeconds);
+            testStart = 0xFFFFFFFF;
+            GApp->m_exitCode = 0;
+            GApp->m_closeRequest = true;
+        }
+        if (testStart != 0 && testStart != 0xFFFFFFFF)
+        {
+            // OP_A2_SHOT=<path prefix>: the player's view at 8 s, then the player from
+            // outside (third person) at 14 s, to check the models without anyone watching.
+            static const std::string shot = [] {
+                const char* e = std::getenv("OP_A2_SHOT");
+                return std::string(e ? e : "");
+            }();
+            static int shotStep = 0;
+            static bool faceShot = false;
+            const DWORD played = now - testStart;
+            if (!shot.empty() && GEngine && GWorld)
+            {
+                if (shotStep == 0 && played >= 8000)
+                {
+                    GEngine->Screenshot((shot + "_1st.png").c_str());
+                    Poseidon::Arma1Compat::LogPlayerSurroundings();
+                    shotStep = 1;
+                }
+                else if (shotStep == 1 && played >= 10000)
+                {
+                    if (Object* on = GWorld->CameraOn())
+                        GWorld->SwitchCameraTo(on, CamExternal);
+                    shotStep = 2;
+                }
+                else if (shotStep == 2 && played >= 14000)
+                {
+                    GEngine->Screenshot((shot + "_3rd.png").c_str());
+                    shotStep = 3;
+                }
+                // ... and through the weapon's optics (the aiming view) at 19 s
+                else if (shotStep == 3 && played >= 16000)
+                {
+                    if (Object* on = GWorld->CameraOn())
+                        GWorld->SwitchCameraTo(on, CamGunner);
+                    shotStep = 4;
+                }
+                else if (shotStep == 4 && played >= 19000)
+                {
+                    // the aiming view is only granted while the weapon offers optics
+                    // (World::SimulateCamera drops CamGunner otherwise): say which
+                    {
+                        EntityAI* ai = dyn_cast<EntityAI>(GWorld->CameraOn());
+                        Person* player = GWorld->PlayerOn();
+                        LODShapeWithShadow* optics = ai && player ? ai->GetOpticsModel(player) : nullptr;
+                        const Camera* cam = GScene ? GScene->GetCamera() : nullptr;
+                        const Vector3 cp = cam ? cam->Position() : VZero;
+                        const Vector3 cd = cam ? cam->Direction() : VZero;
+                        const Vector3 pp = ai ? ai->Position() : VZero;
+                        LOG_INFO(Mission,
+                                 "Arma 2: optics shot: camera type {}, optics model {}, 3D sights {}, camera "
+                                 "{:.2f},{:.2f},{:.2f} (from the soldier {:.2f},{:.2f},{:.2f}) looking {:.2f},{:.2f},{:.2f}",
+                                 static_cast<int>(GWorld->GetCameraType()),
+                                 optics ? (const char*)optics->GetName() : "(none)",
+                                 ai && player && ai->LooksThroughSights(player) ? "yes" : "no", cp.X(), cp.Y(), cp.Z(),
+                                 cp.X() - pp.X(), cp.Y() - pp.Y(), cp.Z() - pp.Z(), cd.X(), cd.Y(), cd.Z());
+                    }
+                    GEngine->Screenshot((shot + "_optic.png").c_str());
+                    shotStep = 5;
+                }
+                // back to first person a little later: the screenshot is written from a
+                // later frame, and switching in the same tick captured the first-person
+                // view instead of the optics (run 19)
+                else if (shotStep == 5 && played >= 21000)
+                {
+                    if (Object* on = GWorld->CameraOn())
+                        GWorld->SwitchCameraTo(on, CamInternal);
+                    shotStep = 6;
+                }
+                // ... and the faces, from 0.9 m in front: the player's man at 23.5 s, the man
+                // nearest him at 26.5 s (identity, face texture), the normal view at 27 s
+                else if ((shotStep == 6 && played >= 22000) || (shotStep == 8 && played >= 25000))
+                {
+                    faceShot = Poseidon::Arma1Compat::AimFaceCamera(shotStep == 6 ? 0 : 1);
+                    shotStep++;
+                }
+                else if ((shotStep == 7 && played >= 23500) || (shotStep == 9 && played >= 26500))
+                {
+                    if (faceShot)
+                        GEngine->Screenshot((shot + (shotStep == 7 ? "_face.png" : "_face2.png")).c_str());
+                    shotStep++;
+                }
+                else if (shotStep == 10 && played >= 27000)
+                {
+                    Poseidon::Arma1Compat::EndFaceCamera();
+                    shotStep = 11;
+                }
+            }
+        }
+    }
+
     if (AppConfig::Instance().IsMissionSmokeCheck() && !_missionSmokeReported)
     {
         std::string missionName =
@@ -982,6 +1111,8 @@ void DisplayMission::OnSimulate(EntityAI* vehicle)
             {
                 if (AutoTest)
                 {
+                    LOG_INFO(Core, "AUTO-TEST mission ended: player killed ({}.{})", (const char*)Glob.header.filename,
+                             (const char*)Glob.header.worldname);
                     GWorld->DestroyMap(IDC_OK);
                     Exit(IDC_MAIN_QUIT);
                 }
@@ -1009,8 +1140,20 @@ void DisplayMission::OnSimulate(EntityAI* vehicle)
         // end mission
         //		GStats.Update();
         GWorld->DestroyMap(IDC_OK);
+        // Arma 2 ends a mission's scripts with the mission. Here they ran on through the
+        // debriefing and outro into the next campaign mission's intro, until its world was
+        // cleaned up: CE4's UAV module loop reported 424 script errors against CE5A's fresh
+        // state. CWA missions keep their scripts as before.
+        if (Arma1Compat::Generation() == 2)
+        {
+            const int ended = GWorld->TerminateAllScripts();
+            if (ended > 0)
+                LOG_INFO(Mission, "Arma 2: mission ended, {} script(s) ended with it", ended);
+        }
         if (AutoTest)
         {
+            LOG_INFO(Core, "AUTO-TEST mission ended: end mode {} ({}.{})", static_cast<int>(GWorld->GetEndMode()),
+                     (const char*)Glob.header.filename, (const char*)Glob.header.worldname);
             Exit(IDC_MAIN_QUIT);
         }
         else
@@ -1051,13 +1194,25 @@ void DisplayMission::OnSimulate(EntityAI* vehicle)
             static const SDL_Scancode numberKeys[] = {
                 SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_3, SDL_SCANCODE_4, SDL_SCANCODE_5,
                 SDL_SCANCODE_6, SDL_SCANCODE_7, SDL_SCANCODE_8, SDL_SCANCODE_9, SDL_SCANCODE_0};
-            for (int slot = 0; slot < 10; ++slot)
+            Person* player = GWorld->PlayerOn();
+            if (!player)
+                player = GWorld->GetRealPlayer();
+            // PIM-HOTKEY-MENU (tester report 2026-10-22): a squad leader with a rifle on 1 and
+            // grenades on 3 pressed 1 (Move) and 3 (Open fire) and got a weapon switch instead -
+            // the hotkey consumed the key before the command menu, whose items are matched by
+            // number key even before it is drawn. While the player commands anyone, the plain
+            // number keys are the command menu's and the hotkeys are Shift+number (Turbo only
+            // matters while moving). Everyone else keeps the plain number keys; Shift+number
+            // works for them too.
+            AIUnit* brain = player ? player->Brain() : nullptr;
+            AIGroup* group = brain ? brain->GetGroup() : nullptr;
+            const bool commands = brain && group && brain->IsGroupLeader() && group->NUnits() > 1;
+            const bool shift = input.IsKeyDown(SDL_SCANCODE_LSHIFT) || input.IsKeyDown(SDL_SCANCODE_RSHIFT);
+            const bool menuOpen = GWorld->UI() && GWorld->UI()->IsCommandMenuOpen();
+            for (int slot = 0; slot < 10 && (shift || (!commands && !menuOpen)); ++slot)
             {
                 if (GetWeaponHotkey(slot).GetLength() == 0 || !input.GetKeyToDo(numberKeys[slot]))
                     continue;
-                Person* player = GWorld->PlayerOn();
-                if (!player)
-                    player = GWorld->GetRealPlayer();
                 ApplyWeaponHotkey(player, slot);
                 break;
             }
@@ -1287,6 +1442,29 @@ void DisplayCutscene::OnSimulate(EntityAI* vehicle)
 void DisplayIntro::OnSimulate(EntityAI* vehicle)
 {
     DisplayCutscene::OnSimulate(vehicle);
+
+    // --arma1-test-seconds on a mission that has only an intro (an Arma 3 scene: Eden's
+    // ScenarioData with an Intro and no Mission). DisplayMission keeps the timer for real
+    // missions; without this one the run never ended and the harness timed out.
+    if (const float testSeconds = AppConfig::Instance().GetArma1TestSeconds(); testSeconds > 0.0f)
+    {
+        static DWORD introTestStart = 0;
+        const DWORD now = Poseidon::Foundation::GlobalTickCount();
+        if (introTestStart == 0)
+        {
+            introTestStart = now;
+            LOG_INFO(Core, "ARMA1-TEST intro runtime entered ({}.{}) -- the mission has only an intro",
+                     (const char*)Glob.header.filename, (const char*)Glob.header.worldname);
+        }
+        else if (introTestStart != 0xFFFFFFFF && now - introTestStart >= static_cast<DWORD>(testSeconds * 1000.0f))
+        {
+            LOG_INFO(Core, "ARMA1-TEST PASS ({}.{}) played {} s (intro only)", (const char*)Glob.header.filename,
+                     (const char*)Glob.header.worldname, testSeconds);
+            introTestStart = 0xFFFFFFFF;
+            GApp->m_exitCode = 0;
+            GApp->m_closeRequest = true;
+        }
+    }
 
     if (AppConfig::Instance().IsMissionSmokeCheck() && !_missionSmokeReported)
     {
@@ -1578,16 +1756,16 @@ DisplayMissionEnd::DisplayMissionEnd(ControlsContainer* parent /*, bool editor*/
     _quotation = toIntFloor(quotations * GRandGen.RandomValue());
     Load("RscDisplayMissionEnd");
 
-    GetCtrl(IDC_ME_LOAD)->ShowCtrl(false);
-    GetCtrl(IDC_ME_RETRY)->ShowCtrl(false);
+    if (IControl* ctrl = GetCtrl(IDC_ME_LOAD)) ctrl->ShowCtrl(false);
+    if (IControl* ctrl = GetCtrl(IDC_ME_RETRY)) ctrl->ShowCtrl(false);
     if (GWorld->GetMode() != GModeNetware)
     {
         RString name = GetSaveDirectory() + RString("save.fps");
         if (QIFStream::FileExists(name))
         {
-            GetCtrl(IDC_ME_LOAD)->ShowCtrl(true);
+            if (IControl* ctrl = GetCtrl(IDC_ME_LOAD)) ctrl->ShowCtrl(true);
         }
-        GetCtrl(IDC_ME_RETRY)->ShowCtrl(true);
+        if (IControl* ctrl = GetCtrl(IDC_ME_RETRY)) ctrl->ShowCtrl(true);
     }
     InputSubsystem::Instance().ChangeGameFocus(+1);
 }
@@ -2092,6 +2270,25 @@ void StartMission()
         return;
     }
     options->CreateChild(new DisplayMission(options));
+}
+
+// Plays the mission selected by ProcessFullName the way the single-mission menu
+// does: its intro (if any), then the briefing, then the mission (--arma1-mission).
+bool StartMissionWithBriefing()
+{
+    CurrentTemplate.Clear();
+    if (GWorld->UI())
+    {
+        GWorld->UI()->Init();
+    }
+    GStats.ClearAll();
+    Display* options = dynamic_cast<Display*>(GWorld->Options());
+    if (!options)
+    {
+        return false;
+    }
+    options->CreateChild(new DisplayIntro(options));
+    return true;
 }
 
 bool StartAutoTest()

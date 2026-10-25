@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+// Arma 1 (ArmA Gold) compatibility profile.
+//
+// Plays an original Arma 1 mission straight out of an installed Arma 1 folder:
+// the folder's archives are mounted read-only (nothing is copied into the CWA
+// install or anywhere else), Arma 1 terrains get generated CfgWorlds classes that
+// inherit CWA's Eden, and Arma 1 unit/vehicle classes that CWA does not define are
+// represented by their nearest CWA counterpart, drawn with the Arma 1 model where one
+// exists. Arma 1 configs are read into a private tree (Arma1Config.cpp) and never
+// merged into Pars: gameplay, physics and weapons stay CWA's. Everything here is
+// inert unless the game was started with --arma1.
+
+#include <Poseidon/Foundation/Containers/RStringArray.hpp>
+#include <Poseidon/Foundation/Strings/RString.hpp>
+#include <Poseidon/IO/ParamFile/ParamFile.hpp>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace Poseidon::Arma1Compat
+{
+// True when --arma1, --arma2 or --arma3 named a usable install.
+bool Active();
+
+// The mounted generation: 1 for Arma 1 (--arma1), 2 for Arma 2 / OA (--arma2), 3 for
+// Arma 3 and its DLCs (--arma3); 0 inactive. Everything below serves all three; where a
+// later game lays its data out differently (Dta, the expansion and DLC folders, XML
+// stringtables, binarised animations, the Eden mission layout) the generation decides.
+// "Arma 2 and later" is written Generation() >= 2.
+int Generation();
+
+// "Arma 1" / "Arma 2" / "Arma 3", for log lines.
+const char* Label();
+
+// Mounts <root>\AddOns, <root>\DBE1\AddOns and the campaign archives, data-only.
+// Called from Globals::Init while the file banks are (re)built.
+void MountArchives();
+
+// Generates CfgWorlds classes for the Arma 1 terrains (Sara, SaraLite, Sara_dbe1,
+// Porto) after the CWA config has been loaded. Existing CWA classes are never edited.
+void RegisterWorldClasses();
+
+// Reads the Arma 1 configs (bin + every addon config.bin) into a private tree and
+// the Arma 1 stringtables into a lowest-priority table. Never merged into Pars.
+void LoadConfig();
+
+// The root of the Arma 1 config tree (for script config access), or null when not loaded.
+const ParamEntry* ConfigRoot();
+
+// Arma 1 config class root >> name (CfgRadio, CfgSounds, CfgSFX, ...), or null.
+const ParamEntry* FindConfigClass(const char* root, const char* name);
+
+// A generated CfgVehicles class that keeps `cwaClass`'s simulation but draws the
+// Arma 1 model of `missionClass` (soldiers also get the Arma 1 moves). Returns
+// `cwaClass` when there is no usable Arma 1 model.
+RString Arma1ModelClass(const RString& missionClass, const RString& cwaClass);
+
+// What an Arma 1 proxy model path stands for, from Arma 1's own CfgNonAIVehicles
+// ("\\ca\\weapons\\ak_47_v58_proxy" -> ProxyAK_47_v58_Proxy, simulation "proxyweapon";
+// "...\\uh_60\\pilot" -> ProxyPilot, "proxycrew" at crew position 0). Lower-case
+// simulation; crewPosition 0 driver, 1 gunner, 2 commander, 3 cargo, else -1.
+bool ProxyKind(const char* modelName, std::string& simulation, int& crewPosition);
+
+// A CWA class to carry an Arma 1 class CWA does not define and no alias names:
+// its nearest Arma 1 ancestor CWA has (same simulation, usable scope), else a CWA
+// class of that simulation and side, else any CWA ancestor. Empty when none.
+RString FallbackCwaClass(const RString& a1Name);
+
+// Arma 1: the CWA class to carry an armed Arma 1 car whose name resolved to `cwaClass`.
+// A car whose main gun fires bullets (HMMWV M2, UAZ DShKM, pickups with a PK) on one of
+// CWA's unarmed light cars goes to CWA's JeepMG, so its gunner has a seat and an M2.
+// Grenade launchers, missiles, trucks and every other case keep `cwaClass`.
+// OP_A1_ARMED_CARS=0 turns it off.
+RString Arma1ArmedCarCarrier(const RString& a1Name, const RString& cwaClass);
+
+// Arma 1 vehicles get their own gunner weapons, rebuilt as generated A1v_<weapon> classes on
+// CWA weapons of their kind (rounds, rate of fire, muzzle velocity, sound and name from Arma
+// 1; ammunition CWA's). Cars, boats, tanks (main turret; a cannon keeps its SABOT and HE apart),
+// helicopters and planes (pilot's and gunner's) and static weapons; OP_A1_VEHICLE_WEAPONS=0 turns it off.
+bool Arma1VehicleWeapons();
+
+// Arma 1 vehicles seat their crew in their own crew poses (driverAction, cargoAction[],
+// the turrets' gunnerAction): HMMWV_Cargo01 rather than the CWA carrier's jeep pose mapped
+// to the nearest Arma 1 state. Each such state becomes a vehicle action "ManActA1_<state>".
+// OP_A1_CREW_ACTIONS=0 turns it off (the carrier's actions, mapped as before).
+bool Arma1CrewActions();
+
+// For a vehicle action this file added ("ManActA1_..."), the CWA action of the same seat
+// (driver, gunner, commander, cargo): a man whose moves predate the Arma 1 actions (a CWA
+// soldier in an Arma 1 vehicle) sits in that instead. -1 when none.
+int Arma1CrewActionFallback(int action);
+
+// The mission editor (--arma1): every class Arma 1 lists (scope 2) is generated once, so the
+// unit dialog offers the Arma 1 soldiers, vehicles and objects under "Arma 1 ..." headings.
+void PrepareEditorClasses();
+
+// An Arma 1 binarised config FILE (mission.sqm, description.ext, ...) as config
+// text the engine's parser reads. False when the file is not in Arma 1's layout
+// (OFP/CWA's own binarised files keep their reader). Works without --arma1.
+bool Arma1RapFileToText(const char* fileName, std::string& text);
+
+// Returns the class to spawn for a mission/script class name. Classes CWA defines
+// are returned unchanged; Arma 1-only classes map to a CWA counterpart.
+RString ResolveVehicleClass(const RString& className);
+RString ResolveWeaponClass(const RString& className);
+RString ResolveMagazineClass(const RString& className);
+
+// The class name a script sees for an engine class: a class the import generated
+// ("A1x_SoldierWB", "A1x_M4AIM") is shown under the mission's own name ("M4AIM").
+// Identity for every other name and when no Arma install is active.
+RString ScriptClassName(const RString& engineName);
+
+// The magazine name a script sees on a unit of the generated class `unitClass`: the Arma
+// magazine of that unit's own loadout that the CWA magazine stands for ("M16" on an
+// A1x_SoldierWB -> "30Rnd_556x45_Stanag"). The CWA name for any other unit or magazine.
+RString ScriptMagazineName(const RString& unitClass, const RString& cwaMagazine);
+
+// The text the HUD and the action menu show for a CWA magazine that an entity of class
+// `ownerClass` carries or holds: the displayName of the Arma magazine it stands for (see
+// ScriptMagazineName; for other entities, the Arma magazine first resolved to it). Empty
+// when there is none, or without --arma1/--arma2.
+RString MagazineDisplayName(const RString& ownerClass, const RString& cwaMagazine);
+
+// Whether a weapon or muzzle name a script gives ("M4AIM") names the engine weapon
+// `engineName`: the name itself, the generated A1x_ class of it, or the CWA class it
+// resolves to. Exact (case-insensitive) comparison when no Arma install is active.
+bool ScriptWeaponMatches(const char* engineName, const RString& scriptName);
+
+// Arma 2: the CWA weapon (for a weapon) or magazine (for a magazine) that carries an
+// Arma 2 weapon/magazine class, chosen by its kind (pistol, rifle, machine gun, sniper
+// rifle, launcher, grenade, ...) and the calibre of its ammunition. Empty when the
+// name is no Arma 2 weapon or magazine.
+RString Arma2WeaponFallback(const RString& name);
+
+// For an Arma 2 weapon carried by the CWA weapon cwaWeapon: a generated A1x_<name> class with
+// the Arma 2 model (in the hand, on the ground) on that CWA weapon, which keeps its magazines
+// and ballistics. Returns cwaWeapon when there is no usable model. OP_A2_WEAPON_MODELS=0 turns
+// it off.
+RString Arma2WeaponModelClass(const RString& name, const RString& cwaWeapon);
+// Whether an Arma 2 CfgWeapons class is a hand weapon (rifle, machine gun, pistol,
+// launcher) -- the kind that carries a model of its own in the soldier's hands.
+bool Arma2IsHandWeapon(const RString& name);
+
+// Arma 1 soldiers carry their own weapons with the Arma 1 models (OP_A1_WEAPONS=0: off).
+bool Arma1OwnWeapons();
+
+// An Arma 1 magazine whose round count differs from the CWA magazine that carries it
+// (5Rnd_762x51_M24 on CWA's 20-round M21): a generated A1x_<magazine> class deriving from
+// the CWA magazine with the Arma 1 count and name. Every muzzle that takes the CWA magazine
+// also takes the generated one. Returns cwaMagazine when the counts agree, the name is
+// also an Arma 1 weapon (M136), or without --arma1. OP_A1_MAGAZINES=0 turns it off.
+RString Arma1MagazineClass(const RString& name, const RString& cwaMagazine);
+
+// The magazines generated by Arma1MagazineClass on the CWA magazine `cwaMagazine`.
+std::vector<RString> GeneratedMagazinesFor(const char* cwaMagazine);
+
+// Whether the generated magazine `magazine` (A1x_5Rnd_762x51_M24) fits a muzzle of the
+// weapon class `weaponClass`: for a generated A1x_ weapon, only the magazines its Arma 1
+// weapon lists (the M24 takes no M107 rounds although both ride on CWA's M21); any CWA
+// weapon that takes the carrier magazine takes it too.
+bool GeneratedMagazineFits(const char* weaponClass, const char* magazine);
+// Faces of an Arma 2 man wearing his Arma 2 model (an A1x_ class): Arma 2 keeps them in
+// CfgFaces >> <the class's faceType> (Man, CooperHead, HeadMask1Black, ...), each with a
+// texture for the head's "osobnost" section and the identityTypes it suits.
+// The texture of `face` there, or of that faceType's Default when it has no such face; ""
+// for any other man, or with OP_A2_FACES=0.
+RString Arma2FaceTexture(const char* unitClass, const char* shapeName, const char* face);
+// A face for a man Arma 2 would give a random one: of his faceType, matching one of his
+// class's identityTypes, chosen by `seed`. "" when he is no Arma 2 man (as above).
+RString Arma2RandomFace(const char* unitClass, const char* shapeName, uint32_t seed);
+// Arma 2 voices. The CfgVoice class `speaker` names in the Arma 2 config when it speaks
+// (has directories), else null; its radio protocol's Words; a voice for a man Arma 2 would
+// give a random one (his class's identityTypes, chosen by `seed`; "" when he is no Arma 2
+// man); and the Arma 2 Words entry that says what CWA's radio word file `cwaPath`
+// ("numbers\zero", "isdown", ...) says, or null.
+const ParamEntry* Arma2VoiceClass(const char* speaker);
+const ParamEntry* Arma2VoiceWords(const ParamEntry& voice);
+RString Arma2RandomSpeaker(const char* unitClass, const char* shapeName, uint32_t seed);
+const char* Arma2RadioWord(const char* cwaPath);
+// One of Arma 2's voice pitches (CfgVoice >> variants) by `seed`; 1 without.
+float Arma2VoicePitch(uint32_t seed);
+// The head model an Arma 2 man wears with `face` (CfgFaces >> faceType >> face >> head, then
+// CfgHeads >> head >> model): his body model only carries the "heads\bysta" placeholder
+// where Arma 2 draws it. "" for any other man, or with OP_A2_FACES=0.
+std::string Arma2HeadModel(const char* unitClass, const char* shapeName, const char* face);
+// The model of the backpack an Arma 2 man's class carries (CfgVehicles >> class >> backpack,
+// an Arrowhead pack such as TK_RPG_Backpack_EP1), drawn where his body has the "us_bag"
+// placeholder; skinned to the man's skeleton like the head. "" when none (as above).
+std::string Arma2BackpackModel(const char* unitClass, const char* shapeName);
+
+// The shot sound of the Arma 1 weapon behind the generated weapon class `weaponClass`
+// (A1x_M16A4): the sound[] of the first fire mode of the Arma 1 muzzle at `muzzleIndex` in
+// its muzzles[] (0 the rifle, 1 the M203). Arma 1 keeps a shot sound per weapon; CWA keeps it in the
+// magazine's modes, so every Arma 1 weapon on an M16 round sounded like CWA's M16.
+// nullptr without one, without --arma1, or with OP_A1_WEAPON_SOUNDS=0.
+const ParamEntry* Arma1ShotSound(const char* weaponClass, int muzzleIndex);
+
+// The sight of the Arma 1 muzzle at `muzzleIndex` of the weapon behind `weaponClass`: its 2D
+// modelOptics model when it has one this install ships ("\ca\Weapons\optika_ACOG"), else
+// the memory point its 3D sight looks from (memoryPointCamera, "GL eye"), and its zoom.
+// valid=false without --arma1, for a weapon not A1x_, or with OP_A1_MUZZLE_SIGHTS=0.
+struct Arma1Sight
+{
+    bool valid = false;
+    std::string optics;
+    std::string camera;
+    float zoomInit = -1, zoomMin = -1, zoomMax = -1;
+};
+Arma1Sight Arma1MuzzleSight(const char* weaponClass, int muzzleIndex);
+
+// The generated magazines (A1x_<magazine>) the Arma 1 weapon behind the generated weapon
+// class `weaponClass` lists in its own magazines[] -- what its main muzzle takes whatever
+// CWA carrier they ride on. The M9's 15Rnd_9x19_M9 rides on CWA's Beretta, whose muzzle
+// takes BerettaMag; the G36a's on M16 rounds, which CWA's own G36a does not take. Without
+// this every pistol and both marksman rifles of the play test stayed empty. Empty for
+// anything not A1x_. Only names generated already: building a weapon generates nothing.
+std::vector<RString> ListedGeneratedMagazines(const char* weaponClass);
+
+// Whether `weaponClass`'s Arma 1 weapon lists the generated magazine `magazine` itself.
+bool WeaponListsGeneratedMagazine(const char* weaponClass, const char* magazine);
+
+// The generated magazines (A1x_<magazine>) the Arma 1 weapon behind the generated weapon
+// class `weaponClass` lists in its own magazines[] -- what its main muzzle takes whatever
+// CWA carrier they ride on. The M9's 15Rnd_9x19_M9 rides on CWA's Beretta, whose muzzle
+// takes BerettaMag; the G36a's on M16 rounds, which CWA's own G36a does not take. Without
+// this every pistol and both marksman rifles of the play test stayed empty. Empty for
+// anything not A1x_. Only names generated already: building a weapon generates nothing.
+std::vector<RString> ListedGeneratedMagazines(const char* weaponClass);
+
+// Whether `weaponClass`'s Arma 1 weapon lists the generated magazine `magazine` itself.
+bool WeaponListsGeneratedMagazine(const char* weaponClass, const char* magazine);
+
+// Arma 2: the EventHandlers >> init code of a module (a class derived from Logic, such
+// as FunctionsManager or the first-aid modules) that a mission places; empty otherwise.
+RString Arma2ModuleInit(const RString& className);
+// The code that starts an Arma 2 animal's agent tasks (their FSMs, with _agent = the animal),
+// for the same place as Arma2ModuleInit's (_this = [unit]); "" for any other class.
+RString Arma2AgentTasks(const RString& className);
+
+// Drops Arma 1 addon names (CACharacters, CAWheeled, ...) from a mission's
+// addOns[] so the CWA addon check does not refuse an Arma 1 mission.
+void FilterMissionAddons(FindArrayRStringCI& addOns);
+
+// Arma 1 campaign keys (isKeyActive / activateKey), persisted in the user folder.
+bool IsKeyActive(const char* key);
+void ActivateKey(const char* key);
+
+// Resolves --arma1-mission to a virtual mission.sqm path inside the mounted banks
+// ("campaigns\ca\missions\m09convoyattack.sara\mission.sqm"). Empty on failure,
+// with the reason in `error`.
+std::string ResolveMissionFile(const std::string& spec, std::string& error);
+
+// Every mission.sqm inside the mounted archives, as virtual paths ("ca\\missions\\Scenarios\\
+// SP_EyeForEye.Chernarus\\mission.sqm"). Templates and campaigns included.
+std::vector<std::string> MissionFiles();
+
+// True when the mission directory lies inside a mounted Arma 1 archive.
+bool IsArma1MissionDirectory(const char* missionDirectory);
+// True when `name` (a file name from an Arma config) starts with the top folder of a mounted
+// Arma archive ("a3\anims_f\...", "ca\..."): a path of its own, though written without
+// the leading backslash (Arma 3's binarised configs drop it), which must not be put under
+// CWA's default folder ("anim\", "data\", "sound\").
+bool IsArmaBankPath(const char* name);
+
+// Arma 3 draws a man's head through a placeholder proxy (\a3\characters_f\heads\bysta)
+// that it replaces with the head of the unit's identity. Here: the model of CfgHeads
+// Default_A3 for that proxy, "" for every other proxy.
+RString Arma3HeadForProxy(const char* proxyModel);
+
+// The CfgWorlds class an Arma 1 mission's world name means: "intro" in an Arma 1
+// archive is Arma 1's desert (A1_Intro), not CWA's Intro island.
+RString WorldClassForMission(const RString& world, const char* missionDirectory);
+
+// For a virtual campaign mission path, the campaign base directory
+// ("campaigns/ca/") so the campaign stringtable/description apply. Empty otherwise.
+std::string CampaignBaseForMission(const std::string& missionFile);
+// The campaign name the stock campaign flow uses for a campaign that lives inside an archive
+// (Arma 2: "ca/missions/campaign/" -> "ca_missions_campaign"), registered so that
+// CampaignBase gives the folder back. A base under "campaigns/" (Arma 1) keeps its name.
+std::string CampaignName(const std::string& base);
+// The folder of a campaign CampaignName registered, "" for any other name.
+std::string CampaignBase(const std::string& name);
+
+// The file of a sound an Arma 1/2 config names, where CWA's rule (GetSoundName: "sound\"
+// before a relative name, ".wss" after one without extension) finds none. Arma 2's
+// configs name many sounds by their archive path without the leading backslash, and its
+// Steam release holds .ogg files where the configs still say .wss. "" when nothing is
+// found, or outside --arma1/--arma2.
+RString FindArmaSoundFile(const char* configName);
+// A simulation name without Arma 3's PhysX suffixes: carx -> car, tankx -> tank,
+// helicopterrtd / helicopterx -> helicopter, airplanex -> airplane, shipx / submarinex ->
+// ship. Lower case. Arma 1 / 2 names come back unchanged (lower case).
+std::string SimKind(const std::string& simulation);
+
+// Arma 3: the CWA class that carries an Arma 3 vehicle class, chosen by the class's
+// ancestry in the Arma 3 config (Tank / APC / anti-air, Wheeled_APC_F, Truck_F, Car,
+// Helicopter attack / transport / light, Plane, Ship, StaticWeapon, ParachuteBase) and
+// its side. Empty for anything else (men, things) and outside Arma 3. (Arma3Compat.cpp)
+RString Arma3VehicleCarrier(const RString& className);
+// The looped engine (helicopter: rotor) sound of an Arma 3 vehicle, "\path.wss"; empty if none.
+std::string Arma3EngineSound(const ParamEntry& vehicle, bool helicopter);
+// The shot of an Arma 3 weapon (first fire mode), "\\path.wss"; empty if none.
+std::string Arma3WeaponShotSound(const ParamEntry& weapon);
+// Arma 2: a sound array as `"\\file",volume,pitch` (empty when not installed), and a
+// weapon's shot from its first fire mode in that form.
+std::string Arma2SoundTriple(const ParamEntry* soundArray);
+std::string Arma2WeaponShot(const ParamEntry& weapon);
+// The Arma 3 ambient loop for CWA's EnvSounds slot (0 sea, 1 trees, 2 meadows, 3 hills,
+// 4 rain), "\\path"; empty outside Arma 3 or when the install has none. (Arma3Compat.cpp)
+std::string Arma3EnvSound(int slot, bool night);
+
+// Arma 3: true for animals (Animal_Base_F), which are left out like Arma 2's.
+bool Arma3IsAnimal(const RString& className);
+
+// Arma 3: a mission.sqm as config text the engine's parser reads -- binarised or not,
+// Eden layout or Arma 2 layout (Arma3Eden.hpp). False when the file is no Arma 3
+// mission.sqm that needs it (outside --arma3, other files, plain text the parser reads
+// as it is).
+bool Arma3MissionFileToText(const char* fileName, std::string& text);
+
+// Any binarised config ("\0raP") as config text. False when it is not one.
+bool RapBytesToText(const std::vector<uint8_t>& bytes, std::string& text);
+
+// Logs what every entity of the running mission became: class (A1x_ = the Arma model on a
+// CWA base), model, LOD count, crew and weapons, grouped by kind (Arma2Census.cpp).
+void LogAssetCensus();
+// The player's position and the map models around him (part of the census; logged again
+// at the first test screenshot, once streamed objects have arrived).
+void LogPlayerSurroundings();
+// Test screenshots of faces: a camera 0.9 m in front of the head of the player's man
+// (which = 0) or of the man nearest him (1), until EndFaceCamera. False when there is none.
+bool AimFaceCamera(int which);
+void EndFaceCamera();
+// Test runs: positions of every soldier at the start, and at the end which AI soldiers did
+// not move and what their AI was doing (Arma2Census.cpp).
+void LogUnitMotion(bool atStart);
+// Test runs: the sounds requested, failed and played (Audio/SoundTestLog.hpp).
+void LogSoundCensus();
+// Test runs: script values at the end (Arma 3; more with OP_A3_PROBE).
+void LogScriptProbe();
+} // namespace Poseidon::Arma1Compat

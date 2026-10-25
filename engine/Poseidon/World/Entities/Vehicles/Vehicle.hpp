@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Poseidon/World/Terrain/EarthGravity.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
 #include <Poseidon/Audio/IAudioSystem.hpp>
 #include <Poseidon/Audio/SoundScene.hpp>
@@ -298,6 +299,11 @@ class Entity: public Object
 	// World/Simulation/WaterEntrySplash.hpp). Valid once Simulate has run once.
 	Vector3 _waterSplashPrev = VZero;
 	bool _waterSplashPrevValid = false;
+	// Arma 3: a script's enableSimulation false, and dynamic simulation (marked by
+	// enableDynamicSimulation, frozen while far: World/Simulation/DynamicSimulation.hpp)
+	bool _scriptSimDisabled = false;
+	bool _dynSimEnabled = false;
+	bool _dynSimFrozen = false;
 	AutoArray<AnimationInstance> _animations;
 
 	public:
@@ -311,6 +317,15 @@ class Entity: public Object
 
 	const char *GetName() const {return _type->GetName();}
 	const EntityType *GetNonAIType() const {return _type;}
+
+	// not simulated, nor its group thought for: a script switched it off or it is frozen
+	bool SimulationFrozen() const {return _scriptSimDisabled || _dynSimFrozen;}
+	bool ScriptSimulationDisabled() const {return _scriptSimDisabled;}
+	void SetScriptSimulationDisabled(bool disabled) {_scriptSimDisabled = disabled;}
+	bool DynamicSimulationEnabled() const {return _dynSimEnabled;}
+	void SetDynamicSimulationEnabled(bool enabled) {_dynSimEnabled = enabled; _dynSimFrozen = _dynSimFrozen && enabled;}
+	bool DynamicSimulationFrozen() const {return _dynSimFrozen;}
+	void SetDynamicSimulationFrozen(bool frozen) {_dynSimFrozen = frozen;}
 
 	const EntityType *GetVehicleType() const override {return _type;}
 
@@ -538,7 +553,8 @@ class AttachedOnVehicle: virtual public Frame
 
 // general simulation functions
 
-#define G_CONST 9.8066f
+// Earth's 9.8066, or the moon's in the whole world's moon frame (EarthGravity.hpp).
+#define G_CONST (::Poseidon::EarthStreaming::Gravity)
 
 void Friction( float &speed, float friction, float accel, float deltaT );
 void Friction

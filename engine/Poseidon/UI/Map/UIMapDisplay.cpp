@@ -1,5 +1,7 @@
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/UI/Map/UIMap.hpp>
+#include <Poseidon/UI/Arma3Menu.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/UI/Map/UIMapCommon.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
@@ -20,6 +22,12 @@
 #include <Poseidon/Graphics/Textures/TexturePreload.hpp>
 #include <Poseidon/UI/Locale/StringtableExt.hpp>
 #include <Poseidon/UI/Locale/MissionHtmlLocalization.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
+#include <string>
+
+std::string Arma2BriefingHtml(const std::string& html); // GameStateExtA2.cpp
+int Arma2BriefingRevision();                           // GameStateExtA2.cpp
 #include <Poseidon/Foundation/Strings/Mbcs.hpp>
 #include <Poseidon/Foundation/Strings/Bstring.hpp>
 #include <Poseidon/AI/AIRadio.hpp>
@@ -31,6 +39,7 @@
 #include <Poseidon/Foundation/Containers/Array.hpp>
 #include <Poseidon/Foundation/Containers/BankArray.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/Foundation/Strings/RString.hpp>
 #include <Poseidon/Foundation/Types/LLinks.hpp>
 #include <Poseidon/Foundation/Types/Pointers.hpp>
@@ -397,6 +406,21 @@ LSError WeaponsInfo::Serialize(ParamArchive& ar)
     return LSOK;
 }
 
+// A mission's gear pool names classes of the game it was written for. Map them through the Arma 1
+// stand-ins (inert unless --arma1), and skip any the config does not define: constructing a type
+// for a missing class latches a config error, and that one entry used to stop the whole mission
+// from starting (Arma 1's M02MinerConvoy pools an M4).
+static RString PoolClass(const RString& name, bool magazine)
+{
+    const RString resolved = magazine ? Poseidon::Arma1Compat::ResolveMagazineClass(name)
+                                      : Poseidon::Arma1Compat::ResolveWeaponClass(name);
+    const ParamEntry* weapons = Pars.FindEntry("CfgWeapons");
+    if (weapons && weapons->FindEntry(resolved))
+        return resolved;
+    LOG_WARN(Mission, "Gear pool: '{}' is not defined in CfgWeapons; skipped", name.Data());
+    return RString();
+}
+
 bool WeaponsInfo::Import(const ParamEntry& superclass)
 {
     const ParamEntry* cls = superclass.FindEntry("Weapons");
@@ -406,7 +430,10 @@ bool WeaponsInfo::Import(const ParamEntry& superclass)
         for (int i = 0; i < cls->GetEntryCount(); i++)
         {
             const ParamEntry& entry = cls->GetEntry(i);
-            Ref<WeaponType> weapon = WeaponTypes.New(entry.GetName());
+            const RString weaponName = PoolClass(entry.GetName(), false);
+            if (weaponName.GetLength() == 0)
+                continue;
+            Ref<WeaponType> weapon = WeaponTypes.New(weaponName);
             if (!weapon)
             {
                 continue;
@@ -433,7 +460,10 @@ bool WeaponsInfo::Import(const ParamEntry& superclass)
         for (int i = 0; i < cls->GetEntryCount(); i++)
         {
             const ParamEntry& entry = cls->GetEntry(i);
-            Ref<MagazineType> type = MagazineTypes.New(entry.GetName());
+            const RString magazineName = PoolClass(entry.GetName(), true);
+            if (magazineName.GetLength() == 0)
+                continue;
+            Ref<MagazineType> type = MagazineTypes.New(magazineName);
             if (!type)
             {
                 continue;
@@ -461,6 +491,11 @@ bool WeaponsInfo::Import(const ParamEntry& superclass)
                 _magazinesPool.Add(magazine);
             }
         }
+    }
+    if (Poseidon::Arma1Compat::Active())
+    {
+        LOG_INFO(Mission, "{}: briefing weapon pool {} weapons, {} magazines", Poseidon::Arma1Compat::Label(),
+                 _weaponsPool.Size(), _magazinesPool.Size());
     }
     return true;
 }
@@ -564,6 +599,32 @@ DisplayMap::DisplayMap(ControlsContainer* parent, RString resource) : Display(pa
     ShowWarrant(false);
     ShowGPS(false);
 
+    // --arma-original-ui with Arma 3: its own diary over the map, read from its config (Arma3Menu)
+    const char* arma3 = strstr(resource, "GetReady") ? "RscDisplayGetReady"
+                        : stricmp(resource, "RscDisplayMainMap") == 0 ? "RscDisplayMainMap"
+                                                                      : nullptr;
+    if (arma3 && Arma3Menu::Active())
+    {
+        // CWA's own controls go (the map stays, as the backdrop); Arma 3's are added over them
+        for (int i = 0; i < _controlsBackground.Size(); i++)
+            if (_controlsBackground[i] != _map)
+                _controlsBackground[i]->ShowCtrl(false);
+        for (int i = 0; i < _controlsForeground.Size(); i++)
+            if (_controlsForeground[i] != _map)
+                _controlsForeground[i]->ShowCtrl(false);
+        _arma3 = std::make_shared<Arma3Menu::Screen>();
+        if (_arma3->Load(*this, arma3, _controlsBackground, _controlsForeground, false))
+        {
+            AIUnit* unit = GWorld->FocusOn();
+            _arma3->InitDiary(GetCurrentMissionDisplayName(),
+                              unit && unit->GetPerson() ? unit->GetPerson()->GetInfo()._name : RString());
+            _map->SetPos(0, 0, 1, 1);
+            ApplyArma3Look();
+        }
+        else
+            _arma3.reset();
+    }
+
     if (_langCbToken >= 0)
         UnregisterLanguageChangedCallback(_langCbToken);
     _langCbToken = RegisterLanguageChangedCallback(
@@ -572,6 +633,37 @@ DisplayMap::DisplayMap(ControlsContainer* parent, RString resource) : Display(pa
             RefreshLocalizedText();
             RefreshLanguage();
         });
+}
+
+void DisplayMap::ApplyArma3Look()
+{
+    // the notebook, compass, watch, radio, GPS and warrant are CWA's; Arma 3's map has none of them
+    // (the subclasses and the keys show them again: they are put away each frame)
+    bool changed = false;
+    if (IsShownNotepad())
+        ShowNotepad(false), changed = true;
+    if (IsShownCompass())
+        ShowCompass(false), changed = true;
+    if (IsShownWatch())
+        ShowWatch(false), changed = true;
+    if (IsShownWalkieTalkie())
+        ShowWalkieTalkie(false), changed = true;
+    if (IsShownGPS())
+        ShowGPS(false), changed = true;
+    if (IsShownWarrant())
+        ShowWarrant(false), changed = true;
+    if (changed || _map->X() != 0 || _map->W() != 1)
+    {
+        _map->SetPos(0, 0, 1, 1);
+        AdjustMapVisibleRect();
+    }
+}
+
+void DisplayMap::OnLBSelChanged(int idc, int curSel)
+{
+    if (_arma3 && _arma3->DiaryEvent(idc, curSel))
+        return;
+    Display::OnLBSelChanged(idc, curSel);
 }
 
 void DisplayMap::SwitchBriefingSection(RString section)
@@ -611,7 +703,19 @@ void DisplayMap::ReloadBriefingContent(RString activeSection)
     if (!_briefing)
         return;
 
-    LoadLocalizedMissionHtml(_briefing, GetBriefingFile());
+    if (Arma1Compat::Generation() >= 2)
+    {
+        // Arma 2 briefs through the diary and simple tasks (Arma2BriefingHtml).
+        const RString file = GetBriefingFile();
+        const std::string html =
+            Arma2BriefingHtml(file.GetLength() > 0 ? std::string((const char*)LoadLocalizedMissionHtmlUtf8(file)) : "");
+        _briefing->Init();
+        _briefing->LoadBuffer(file.GetLength() > 0 ? (const char*)file : "briefing.html", html.c_str(), false);
+    }
+    else
+    {
+        LoadLocalizedMissionHtml(_briefing, GetBriefingFile());
+    }
 
     AIUnit* unit = GWorld->FocusOn();
     int section = FindSectionForUnit(_briefing, "Main", unit);
@@ -960,7 +1064,7 @@ UnitWeaponsInfo::UnitWeaponsInfo(AIUnit* u)
     }
     // Legacy briefing grid layout: first ten cells are regular magazines,
     // remaining cells are handgun magazines.
-    const int handGunMagazineStart = 10;
+    const int handGunMagazineStart = HANDGUN_MAGAZINE_START;
     int item = 0;
     int itemHandGun = handGunMagazineStart;
     for (int i = 0; i < veh->NMagazines(); i++)
@@ -1601,13 +1705,13 @@ void DisplayMap::CreateWeaponsPage()
         int oldItem = item;
         while (item < maxItems)
         {
-            Magazine* magazine = info.magazines[10 + item];
+            Magazine* magazine = info.magazines[HANDGUN_MAGAZINE_START + item];
             RString href = "";
             //			if (_selectWeapons)
             {
                 char buffer[7];
                 snprintf(buffer, sizeof(buffer), "%s", (const char*)"Slot:F");
-                buffer[5] += 10 + item;
+                buffer[5] += HANDGUN_MAGAZINE_START + item;
                 href = buffer;
             }
             if (magazine)
@@ -1650,7 +1754,7 @@ void DisplayMap::CreateWeaponsPage()
         item = oldItem;
         while (item < maxItems)
         {
-            Magazine* magazine = info.magazines[10 + item];
+            Magazine* magazine = info.magazines[HANDGUN_MAGAZINE_START + item];
             if (magazine)
             {
                 int nItems = GetHandGunItemSlotsCount(magazine->_type->_magazineType);
@@ -1801,15 +1905,16 @@ void DisplayMap::CreateWeaponsPoolPage(int slot)
             empty = "Weapon:";
             mask = MaskSlotHandGun;
             break;
-        case 15:
-        case 16:
-        case 17:
-        case 18:
-            title = LocalizeString(IDS_BRIEF_SPECIAL_HANDGUN_MAGAZINES);
-            empty = "Magazine:";
-            mask = MaskSlotHandGunItem;
-            break;
         default:
+            // the hand gun magazines from HANDGUN_MAGAZINE_START (slots 15..18 while CWA's
+            // four sat right after ten items)
+            if (slot >= WEAPON_SLOTS + HANDGUN_MAGAZINE_START)
+            {
+                title = LocalizeString(IDS_BRIEF_SPECIAL_HANDGUN_MAGAZINES);
+                empty = "Magazine:";
+                mask = MaskSlotHandGunItem;
+                break;
+            }
             title = LocalizeString(IDS_BRIEF_SPECIAL_MAGAZINES);
             empty = "Magazine:";
             mask = MaskSlotItem;

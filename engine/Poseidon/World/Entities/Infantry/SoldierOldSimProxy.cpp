@@ -1,5 +1,7 @@
 #include <Poseidon/World/Entities/Infantry/SoldierOldCommon.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/World/Weather/MudField.hpp>
+#include <Poseidon/Graphics/Rendering/Effects/MuzzleBurst.hpp> // BOOM-005
 #include <Poseidon/World/Weather/SandField.hpp>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
@@ -23,6 +25,13 @@
 #include <Poseidon/Foundation/platform.hpp>
 #include <Random/randomGen.hpp>
 
+#include <chrono>
+#include <cstdint>
+#include <set>
+#include <unordered_map>
+#include <string>
+#include <Poseidon/World/Entities/Weapons/RecoilTuning.hpp>
+
 namespace Poseidon
 {
 using namespace Foundation;
@@ -32,6 +41,155 @@ bool Man::CastProxyShadow(int level, int index) const
 {
     return true;
 }
+
+namespace
+{
+// A held item (rifle, launcher, binocular) is drawn with a DIFFERENT model than the proxy
+// placeholder it replaces. The proxy's matrix already carries the placeholder's own
+// source-origin offset (ShapeAdapter); undo it here, and add the drawn model's
+// (HeldModelSourceOrigin). Both are zero for every OFP/CWA model, so nothing changes there;
+// an Arma ODOL model is stored around its bounding centre, and the corepatch M16A4 (centre
+// 0.98 m up, 0.48 m along) was drawn at its bearer's feet without this.
+Matrix4 HeldModelPlaceholderUndo(const ProxyObject& proxy)
+{
+    const LODShapeWithShadow* placeholder = proxy.obj ? proxy.obj->GetShape() : nullptr;
+    if (!placeholder || placeholder->AnimationOrigin().SquareSize() < 1e-8f)
+        return MIdentity;
+    return Matrix4(MTranslation, placeholder->AnimationOrigin());
+}
+
+Matrix4 HeldModelSourceOrigin(const LODShapeWithShadow* drawn)
+{
+    if (!drawn || drawn->AnimationOrigin().SquareSize() < 1e-8f)
+        return MIdentity;
+    return Matrix4(MTranslation, -drawn->AnimationOrigin());
+}
+
+// OP_A2_PROXYLOG=1, first person: where the view-pilot LOD's arms, fingers and collar land
+// against the same bones of LOD 0 posed with the same palette, what sits in front of the eye,
+// and which textures the LOD draws with. The Arma 2 first-person view showed spread pink
+// fingers (USMC) or a piece of gear filling the bottom of the screen (FR, ACR), while the
+// same soldiers looked right from outside.
+void LogViewLodPose(LODShapeWithShadow* lshape, const WeightInfo& weights, int level, const Matrix4Array& matrix,
+                    Vector3Par eye)
+{
+    static const bool enabled = [] {
+        const char* e = std::getenv("OP_A2_PROXYLOG");
+        return e && *e == '1';
+    }();
+    if (!enabled || !lshape)
+        return;
+    static DWORD last = 0;
+    static bool texturesLogged = false;
+    const DWORD now = Poseidon::Foundation::GlobalTickCount();
+    if (now - last < 2000)
+        return;
+    last = now;
+    Shape* view = lshape->Level(level);
+    if (!view)
+        return;
+    // posed centroid of a named selection, from the palette (weights as AnimationRT applies them)
+    const auto posed = [&](int lod, const char* name, Vector3& out, int& count, float& weightSum) -> bool
+    {
+        Shape* s = lshape->Level(lod);
+        if (!s)
+            return false;
+        const int si = s->FindNamedSel(name);
+        if (si < 0)
+            return false;
+        const NamedSelection& sel = s->NamedSel(si);
+        const AnimationRTWeights& w = weights[lod];
+        Vector3 sum = VZero;
+        count = 0;
+        weightSum = 0;
+        for (int i = 0; i < sel.Size(); i++)
+        {
+            const int v = sel[i];
+            const Vector3 orig = s->OriginalPosValid() ? s->OrigPos(v) : s->Pos(v);
+            const AnimationRTWeight& wg = w[v];
+            Vector3 p = VZero;
+            float ws = 0;
+            for (int k = 0; k < wg.Size(); k++)
+            {
+                const int bone = wg[k].GetSel();
+                if (bone < 0 || bone >= matrix.Size())
+                    continue;
+                p += matrix[bone].FastTransform(orig) * wg[k].GetWeight();
+                ws += wg[k].GetWeight();
+            }
+            if (ws <= 0)
+                continue;
+            sum += p;
+            weightSum += ws;
+            count++;
+        }
+        if (count > 0)
+        {
+            out = sum / float(count);
+            weightSum /= float(count);
+        }
+        return count > 0;
+    };
+    LOG_INFO(Graphics, "A2 view LOD: level {} res {} of {} bones {} eye {:.2f},{:.2f},{:.2f} verts {} (lod 0: {})", level,
+             lshape->Resolution(level), (const char*)lshape->GetName(), matrix.Size(), eye.X(), eye.Y(), eye.Z(), view->NPos(),
+             lshape->Level(0) ? lshape->Level(0)->NPos() : 0);
+    static const char* const names[] = {"head",          "neck1",          "spine3",         "leftshoulder",
+                                        "leftforearm",   "lefthand",       "lefthandindex3", "lefthandthumb3",
+                                        "rightforearm",  "righthand",      "righthandindex3", "weapon"};
+    for (const char* name : names)
+    {
+        Vector3 a = VZero, b = VZero;
+        int na = 0, nb = 0;
+        float wa = 0, wb = 0;
+        const bool hasA = posed(level, name, a, na, wa);
+        const bool hasB = posed(0, name, b, nb, wb);
+        if (!hasA && !hasB)
+            continue;
+        LOG_INFO(Graphics,
+                 "A2 view LOD bone {}: view {} verts at {:.2f},{:.2f},{:.2f} (weight {:.2f}) | lod 0 {} verts at "
+                 "{:.2f},{:.2f},{:.2f} (weight {:.2f}) | apart {:.2f} m",
+                 name, na, a.X(), a.Y(), a.Z(), wa, nb, b.X(), b.Y(), b.Z(), wb, hasA && hasB ? a.Distance(b) : -1.0f);
+    }
+    // what the drawn (CPU-skinned) view LOD puts in front of the eye: model +z is forward
+    int ahead = 0, unweighted = 0;
+    Vector3 nearest = VZero;
+    float nearestD = 1e9f;
+    Vector3 mn(1e9f, 1e9f, 1e9f), mx(-1e9f, -1e9f, -1e9f);
+    const AnimationRTWeights& vw = weights[level];
+    for (int v = 0; v < view->NPos(); v++)
+    {
+        if (vw[v].Size() <= 0)
+            unweighted++;
+        const Vector3 d = view->Pos(v) - eye;
+        if (d.Z() < 0.03f || fabs(d.X()) > d.Z() * 0.8f || fabs(d.Y()) > d.Z() * 0.5f)
+            continue;
+        ahead++;
+        mn = Vector3(std::min(mn.X(), d.X()), std::min(mn.Y(), d.Y()), std::min(mn.Z(), d.Z()));
+        mx = Vector3(std::max(mx.X(), d.X()), std::max(mx.Y(), d.Y()), std::max(mx.Z(), d.Z()));
+        if (d.Size() < nearestD)
+        {
+            nearestD = d.Size();
+            nearest = d;
+        }
+    }
+    LOG_INFO(Graphics,
+             "A2 view LOD in view of the eye: {} of {} vertices (unweighted {}), relative box {:.2f},{:.2f},{:.2f} .. "
+             "{:.2f},{:.2f},{:.2f}, nearest {:.2f},{:.2f},{:.2f}",
+             ahead, view->NPos(), unweighted, mn.X(), mn.Y(), mn.Z(), mx.X(), mx.Y(), mx.Z(), nearest.X(), nearest.Y(),
+             nearest.Z());
+    if (!texturesLogged)
+    {
+        texturesLogged = true;
+        for (int i = 0; i < view->NSections(); i++)
+        {
+            const ShapeSection& sec = view->GetSection(i);
+            Texture* tex = sec.properties.GetTexture();
+            LOG_INFO(Graphics, "A2 view LOD section {}: texture {} special {:x}", i,
+                     tex ? (const char*)tex->GetName() : "(none)", sec.properties.Special());
+        }
+    }
+}
+} // namespace
 
 Object* Man::GetProxy(LODShapeWithShadow*& shape, int level, Matrix4& transform, Matrix4& invTransform,
                       const FrameBase& parentPos, int i) const
@@ -53,9 +211,14 @@ Object* Man::GetProxy(LODShapeWithShadow*& shape, int level, Matrix4& transform,
         }
     }
     const ProxyObject& proxy = sShape->Proxy(i);
+    if (proxy.selection < 0 || proxy.selection >= sShape->NNamedSel())
+        return nullptr;
     const NamedSelection& sel = sShape->NamedSel(proxy.selection);
+    if (sel.Size() <= 0)
+        return nullptr;
     int point = sel[0];
-    PoseidonAssert(sel.Size() > 0);
+    if (point < 0 || point >= wgt.Size() || wgt[point].Size() <= 0)
+        return nullptr; // see DrawProxies: an Arma 2 proxy without skeleton weight
     const AnimationRTWeight& wg = wgt[point];
     int matIndex = wg[0].GetSel();
 
@@ -161,7 +324,7 @@ Object* Man::GetProxy(LODShapeWithShadow*& shape, int level, Matrix4& transform,
     Matrix4 animTransform = AnimateProxyMatrix(level, proxy);
 
     animTransform.Orthogonalize();
-    transform = transform * animTransform;
+    transform = transform * animTransform * HeldModelPlaceholderUndo(proxy);
 
     // if shape is reversed, reverse orientation
     if (pshape->Remarks() & REM_REVERSED)
@@ -169,6 +332,7 @@ Object* Man::GetProxy(LODShapeWithShadow*& shape, int level, Matrix4& transform,
         Matrix4 swapM(MScale, -1, +1, -1);
         transform = transform * swapM;
     }
+    transform = transform * HeldModelSourceOrigin(pshape);
     invTransform = transform.InverseScaled();
 
     shape = pshape;
@@ -180,6 +344,76 @@ int Man::GetProxyComplexity(int level, const FrameBase& pos, float dist2) const
     int nFaces = base::GetProxyComplexity(level, pos, dist2);
     // Note: calculate weapons complexity
     return nFaces;
+}
+
+namespace
+{
+// Once per model and LOD: which proxy could not be placed, so a missing weapon names itself.
+void ReportUnweightedProxy(const LODShapeWithShadow* shape, int level, const ProxyObject& proxy, const char* why)
+{
+    static std::set<std::string> reported;
+    const std::string key = std::string(shape ? (const char*)shape->Name() : "?") + "#" + std::to_string(level) + "#" +
+                            std::string((const char*)proxy.name);
+    if (reported.insert(key).second)
+        LOG_WARN(Graphics, "Man proxy '{}' on {} level {} not drawn: {}", (const char*)proxy.name,
+                 shape ? (const char*)shape->Name() : "?", level, why);
+}
+} // namespace
+
+Matrix4 Man::HeldModelPointCorrection(const ProxyObject& proxy, const WeaponType* weapon) const
+{
+    // DrawProxies draws the weapon with AnimateProxyMatrix * PlaceholderUndo * [reversed] *
+    // SourceOrigin. GetWeaponPoint used AnimateProxyMatrix alone, so on an Arma 1 rifle stored
+    // about its bounding centre the flash sat that far off the barrel (the owner: M16A4,
+    // M4A1 QDS, MK12 SPR "too far inward"). A reversed model's memory points are already in
+    // the turned frame, so its origin shift is turned with it (R * O * R, R its own inverse).
+    Matrix4 out = HeldModelPlaceholderUndo(proxy);
+    const LODShapeWithShadow* model = weapon ? weapon->_model.GetRef() : nullptr;
+    const Matrix4 origin = HeldModelSourceOrigin(model);
+    if (model && (model->Remarks() & REM_REVERSED))
+    {
+        const Matrix4 swap(MScale, -1, +1, -1);
+        out = out * (swap * origin * swap);
+    }
+    else
+        out = out * origin;
+    return out;
+}
+
+bool Man::HeldWeaponTransform(int level, const WeaponType* weapon, Matrix4& out) const
+{
+    if (!weapon || !weapon->_model || level < 0 || level >= _shape->NLevels())
+        return false;
+    const ManType* type = Type();
+    // a pistol is drawn on the right hand's proxy (DrawProxies, ShowHandGun): without it the
+    // Arma 1 M9's 3D sight found no weapon and the view showed none (owner, 2026-10-25)
+    const int wantMat = (weapon->_weaponType & MaskSlotPrimary)     ? type->_gunMatIndex
+                        : (weapon->_weaponType & MaskSlotSecondary) ? type->_rpgMatIndex
+                        : (weapon->_weaponType & MaskSlotHandGun)   ? type->_rightHandMatIndex
+                                                                    : -1;
+    if (wantMat < 0)
+        return false;
+    const Shape* sShape = _shape->LevelOpaque(level);
+    const AnimationRTWeights& wgt = type->GetWeights()[level];
+    for (int i = 0; i < sShape->NProxies(); i++)
+    {
+        const ProxyObject& proxy = sShape->Proxy(i);
+        if (proxy.selection < 0 || proxy.selection >= sShape->NNamedSel())
+            continue;
+        const NamedSelection& sel = sShape->NamedSel(proxy.selection);
+        if (sel.Size() <= 0)
+            continue;
+        const int point = sel[0];
+        if (point < 0 || point >= wgt.Size() || wgt[point].Size() <= 0 || wgt[point][0].GetSel() != wantMat)
+            continue;
+        // DrawProxies' chain for this proxy, less the man's world transform
+        Matrix4 t = AnimateProxyMatrix(level, proxy) * HeldModelPlaceholderUndo(proxy);
+        if (weapon->_model->Remarks() & REM_REVERSED)
+            t = t * Matrix4(MScale, -1, +1, -1);
+        out = t * HeldModelSourceOrigin(weapon->_model);
+        return true;
+    }
+    return false;
 }
 
 void Man::DrawProxies(int level, ClipFlags clipFlags, const Matrix4& transform, const Matrix4& invTransform,
@@ -205,16 +439,46 @@ void Man::DrawProxies(int level, ClipFlags clipFlags, const Matrix4& transform, 
             }
         }
         const ProxyObject& proxy = sShape->Proxy(i);
+        // A proxy whose selection has no point, or whose point carries no skeleton weight,
+        // cannot be placed on the skeleton. OFP models never do this; Arma 2 ODOL can (its
+        // skinning lives in per-vertex bone references), and indexing past the end here was
+        // the first-frame 0xC0000005 with Arma 2 soldiers. Such a proxy is not drawn.
+        if (proxy.selection < 0 || proxy.selection >= sShape->NNamedSel())
+            continue;
         const NamedSelection& sel = sShape->NamedSel(proxy.selection);
+        if (sel.Size() <= 0)
+        {
+            ReportUnweightedProxy(_shape, level, proxy, "selection has no point");
+            continue;
+        }
         int point = sel[0];
-        PoseidonAssert(sel.Size() > 0);
+        if (point < 0 || point >= wgt.Size() || wgt[point].Size() <= 0)
+        {
+            ReportUnweightedProxy(_shape, level, proxy, "point has no skeleton weight");
+            continue;
+        }
         const AnimationRTWeight& wg = wgt[point];
         int matIndex = wg[0].GetSel();
 
         const WeaponType* weapon = nullptr;
         LODShapeWithShadow* pshape = nullptr;
         const AnimationAnimatedTexture* animFire = nullptr;
-        if (matIndex == type->_rpgMatIndex)
+        const int gearSlot = type->A3GearSlotOf(level, i);
+        if (gearSlot >= 0)
+        {
+            // Arma 3: the head and what the class wears. In first person neither the head
+            // nor the helmet is drawn in front of the eye.
+            const bool onHead = gearSlot == ManType::A3GearHead || gearSlot == ManType::A3GearHeadgear;
+            if (onHead && (!_showHead || level == type->_insideView))
+                continue;
+            // the head of his face (CfgFaces >> head) where he has one, else the class's
+            pshape = gearSlot == ManType::A3GearHead ? (_a2Head ? _a2Head.GetRef() : proxy.obj->GetShape())
+                     : _a3GearSet[gearSlot]           ? _a3GearShape[gearSlot].GetRef()
+                                                      : type->_a3Gear[gearSlot].GetRef();
+            if (!pshape)
+                continue; // nothing worn there
+        }
+        else if (matIndex == type->_rpgMatIndex)
         {
             if (!_showSecondaryWeapon)
             {
@@ -334,13 +598,44 @@ void Man::DrawProxies(int level, ClipFlags clipFlags, const Matrix4& transform, 
 
         Matrix4 animTransform = AnimateProxyMatrix(level, proxy);
 
-        Matrix4 pTransform = transform * animTransform;
+        Matrix4 pTransform = transform * animTransform * HeldModelPlaceholderUndo(proxy);
+
+        // OP_A2_PROXYLOG=1: where a held weapon lands, the player against one other man,
+        // every two seconds (the player's rifle was drawn at his feet, the AI's in hand).
+        static const bool proxyLog = [] {
+            const char* e = std::getenv("OP_A2_PROXYLOG");
+            return e && *e == '1';
+        }();
+        if (proxyLog && matIndex == type->_gunMatIndex)
+        {
+            static DWORD lastPlayer = 0, lastOther = 0;
+            const bool isPlayer = GWorld && GWorld->CameraOn() == this;
+            DWORD& last = isPlayer ? lastPlayer : lastOther;
+            const DWORD now = Poseidon::Foundation::GlobalTickCount();
+            if (now - last > 2000)
+            {
+                last = now;
+                const Vector3 ap = animTransform.Position();
+                const Vector3 gp = _gunTrans.Position();
+                LOG_INFO(Graphics,
+                         "A2 proxy {}: level {} res {} insideView {} proxy '{}' shape {} anim pos {:.2f},{:.2f},{:.2f} "
+                         "up {:.2f},{:.2f},{:.2f} gunIdent {} gunTrans pos {:.2f},{:.2f},{:.2f} aimX {:.3f} aimY {:.3f} "
+                         "move {} cam {}",
+                         isPlayer ? "PLAYER" : "other", level, _shape->Resolution(level), type->_insideView,
+                         (const char*)proxy.name, (const char*)pshape->Name(), ap.X(), ap.Y(), ap.Z(),
+                         animTransform.DirectionUp().X(), animTransform.DirectionUp().Y(),
+                         animTransform.DirectionUp().Z(), _gunTransIdent, gp.X(), gp.Y(), gp.Z(), _gunXRot, _gunYRot,
+                         (const char*)Type()->GetMoveName(_primaryMove.id),
+                         GWorld ? static_cast<int>(GWorld->GetCameraType()) : -1);
+            }
+        }
 
         if (pshape->Remarks() & REM_REVERSED)
         {
             Matrix4 swapM(MScale, -1, +1, -1);
             pTransform = pTransform * swapM;
         }
+        pTransform = pTransform * HeldModelSourceOrigin(pshape);
         Matrix4Val invPTransform = pTransform.InverseScaled();
 
         int pLevel = -1;
@@ -357,14 +652,57 @@ void Man::DrawProxies(int level, ClipFlags clipFlags, const Matrix4& transform, 
             pLevel = GScene->LevelFromDistance2(pshape, dist2, pTransform.Scale(), pTransform.Direction(),
                                                 GScene->GetCamera()->Direction());
         }
+        if (proxyLog && GWorld && GWorld->CameraOn() == this)
+        {
+            static DWORD lastLevel[8] = {};
+            const DWORD now = Poseidon::Foundation::GlobalTickCount();
+            DWORD& last = lastLevel[i & 7];
+            if (now - last > 2000)
+            {
+                last = now;
+                const Vector3 wp = pTransform.Position();
+                const Vector3 up = pTransform.DirectionUp();
+                LOG_INFO(Graphics,
+                         "A2 proxy PLAYER draw #{} '{}' as {} ({}): man level {} -> level {} of {} (scale {:.2f}) world "
+                         "pos {:.2f},{:.2f},{:.2f} up {:.2f},{:.2f},{:.2f} man at {:.2f},{:.2f},{:.2f} filter {} "
+                         "reversed {} camera {:.2f},{:.2f},{:.2f} looking {:.2f},{:.2f},{:.2f} man facing {:.2f},{:.2f},{:.2f}",
+                         i, (const char*)proxy.name, (const char*)pshape->Name(),
+                         matIndex == type->_gunMatIndex ? "gun" : matIndex == type->_rpgMatIndex ? "launcher"
+                         : matIndex == type->_handMatIndex ? "hand" : matIndex == type->_rightHandMatIndex ? "righthand"
+                                                                                                         : "other",
+                         level, pLevel, pshape->NLevels(), pTransform.Scale(), wp.X(), wp.Y(), wp.Z(), up.X(), up.Y(),
+                         up.Z(),
+                         transform.Position().X(), transform.Position().Y(), transform.Position().Z(),
+                         static_cast<int>(GSectionFilter), (pshape->Remarks() & REM_REVERSED) != 0,
+                         GScene->GetCamera()->Position().X(), GScene->GetCamera()->Position().Y(),
+                         GScene->GetCamera()->Position().Z(), GScene->GetCamera()->Direction().X(),
+                         GScene->GetCamera()->Direction().Y(), GScene->GetCamera()->Direction().Z(),
+                         transform.Direction().X(), transform.Direction().Y(), transform.Direction().Z());
+            }
+        }
         if (pLevel == LOD_INVISIBLE)
         {
             continue;
         }
 
+        if (gearSlot == ManType::A3GearHead && _a2Head && pshape == _a2Head.GetRef() && _head._texture)
+            _a2HeadFace.SetTexture(_a2Head, pLevel, _head._texture); // his face on it
+        if (gearSlot > ManType::A3GearHead)
+        {
+            // the colours of this class's item on a model several items share
+            for (const ManType::A3GearColour& colour :
+                 _a3GearSet[gearSlot] ? _a3GearColour[gearSlot] : type->_a3GearColours[gearSlot])
+            {
+                colour.selection.Unhide(pshape, pLevel);
+                colour.selection.SetTexture(pshape, pLevel, colour.texture);
+            }
+        }
+
         if (animFire)
         {
-            if (weapon == _mGunFireWeapon && (_mGunFireFrames > 0 || Glob.uiTime < _mGunFireTime + 0.05f))
+            // BOOM-005: with the volumetric flash on, the retail flash sheet stays hidden
+            if (weapon == _mGunFireWeapon && (_mGunFireFrames > 0 || Glob.uiTime < _mGunFireTime + 0.05f) &&
+                !Poseidon::render::VolumetricMuzzleFlashEnabled())
             {
                 animFire->Unhide(pshape, pLevel);
                 animFire->SetPhase(pshape, pLevel, _mGunFirePhase);
@@ -434,7 +772,154 @@ void Man::DrawProxies(int level, ClipFlags clipFlags, const Matrix4& transform, 
         GEngine->SetPassKindHint(savedHint);
     }
 
+    DrawArma2Head(level, transform, dist2, z2, lights);
+    DrawArma2Backpack(level, transform, dist2, z2, lights);
+
     _mGunFireFrames--;
+}
+
+// An Arma 2 head model is skinned to the same skeleton as the body and modelled in the
+// body's source coordinates. It is drawn moved by the head bone as one piece: the face does
+// not move its own bones (no grimaces, no lip sync) and the neck seam follows the head.
+void Man::DrawArma2Head(int level, const Matrix4& transform, float dist2, float z2, const LightList& lights)
+{
+    const ManType* type = Type();
+    // an Arma 3 man's head is drawn by his head proxy (the gear proxies), this one or not
+    if (Arma1Compat::Generation() >= 3)
+        return;
+    if (!_a2Head || !_showHead || type->_headMatIndex < 0 || level == type->_insideView ||
+        _shape->Resolution(level) >= 900.0f)
+        return;
+    MATRIX_4_ARRAY(matrix, 128);
+    PrepareCorrectedPose(level, matrix);
+    const Matrix4 bone = type->_headMatIndex < matrix.Size() ? matrix[type->_headMatIndex] : Matrix4(MIdentity);
+    // head-model stored coordinates -> body stored coordinates: both are stored around their
+    // own bounding centre, AnimationOrigin is where their common source origin lies
+    const Vector3 d = _shape->AnimationOrigin() - _a2Head->AnimationOrigin();
+    const Matrix4 toBody(MTranslation, d);
+    // Skinned (OP_A2_HEAD_SKIN=0: one piece on the head bone): the neck and the collar follow
+    // the man's neck and spine bones; every face bone (jaw, lips, brows, eyes) moves with the
+    // head -- the face's own bones are not posed, the moves carry none.
+    static const bool skin = [] {
+        const char* e = std::getenv("OP_A2_HEAD_SKIN");
+        return !(e && *e == '0');
+    }();
+    const bool skinned = skin && _a2HeadWeights && matrix.Size() > 0 && type->_moveType &&
+                         type->_moveType->GetSkeleton() && matrix.Size() <= type->_moveType->GetSkeleton()->NBones();
+    MATRIX_4_ARRAY(headMatrix, 128);
+    if (skinned)
+    {
+        const Skeleton* skeleton = type->_moveType->GetSkeleton();
+        const Matrix4 fromBody(MTranslation, -d);
+        // Lip sync: the speech's .lip track (Head::AttachWave, from `say` and the conversation
+        // lines) opens the mouth -- the jaw, chin and lower lip drop by up to 12 mm in the
+        // head's own frame, the mouth corners by half of that.
+        float mouth = 0.0f;
+        if (_head._lipInfo)
+        {
+            const float phase = _head._lipInfo->GetPhase();
+            if (phase > 0.0f)
+                mouth = std::min(phase, 1.0f);
+            static int reported = 0;
+            static const void* lastTrack = nullptr;
+            if (mouth > 0.3f && lastTrack != static_cast<const ManLipInfo*>(_head._lipInfo) && reported < 40)
+            {
+                lastTrack = static_cast<const ManLipInfo*>(_head._lipInfo);
+                ++reported;
+                LOG_INFO(Graphics, "Arma 2 lip sync: {} opens the mouth ({:.2f})", (const char*)GetDebugName(), mouth);
+            }
+        }
+        const Matrix4 jawOpen(MTranslation, Vector3(0, -0.012f * mouth, 0));
+        const Matrix4 cornerOpen(MTranslation, Vector3(0, -0.006f * mouth, 0));
+        headMatrix.Resize(matrix.Size());
+        for (int i = 0; i < matrix.Size(); i++)
+        {
+            const RStringB boneName = skeleton->GetBone(i);
+            const char* name = boneName;
+            const bool own = name && (_strnicmp(name, "spine", 5) == 0 || _strnicmp(name, "neck", 4) == 0 ||
+                                      stricmp(name, "head") == 0 || stricmp(name, "pelvis") == 0);
+            headMatrix[i] = fromBody * (own ? matrix[i] : bone) * toBody;
+            if (mouth > 0.0f && name && !own)
+            {
+                if (_strnicmp(name, "jaw", 3) == 0 || stricmp(name, "chin") == 0 || _strnicmp(name, "lip_lw", 6) == 0)
+                    headMatrix[i] = headMatrix[i] * jawOpen;
+                else if (stricmp(name, "lip_lc") == 0 || stricmp(name, "lip_rc") == 0)
+                    headMatrix[i] = headMatrix[i] * cornerOpen;
+            }
+        }
+    }
+    const Matrix4 pTransform = skinned ? transform * toBody : transform * bone * toBody;
+    const int pLevel = GScene->LevelFromDistance2(_a2Head, dist2, pTransform.Scale(), pTransform.Direction(),
+                                                  GScene->GetCamera()->Direction());
+    if (pLevel < 0 || pLevel == LOD_INVISIBLE)
+        return;
+    if (_head._texture)
+        _a2HeadFace.SetTexture(_a2Head, pLevel, _head._texture);
+    Shape* shape = _a2Head->LevelOpaque(pLevel);
+    if (!shape)
+        return;
+    if (skinned)
+        AnimationRT::ApplyMatrices(*_a2HeadWeights, _a2Head, pLevel, headMatrix);
+    int spec = shape->Special();
+    shape->PrepareTextures(z2, spec);
+    shape->Draw(this, lights, ClipAll, spec, pTransform, pTransform.InverseScaled());
+}
+
+// An Arrowhead backpack (CfgVehicles >> man >> backpack >> model) is skinned to the man's
+// skeleton (spine..spine3) in the body's source coordinates; the body only carries an
+// unbound "us_bag" placeholder proxy for it. Posed with the man's own bone matrices,
+// moved from the body's stored coordinates into the pack's.
+void Man::DrawArma2Backpack(int level, const Matrix4& transform, float dist2, float z2, const LightList& lights)
+{
+    const ManType* type = Type();
+    if (!_a2BackpackLooked)
+    {
+        _a2BackpackLooked = true;
+        const std::string model = Poseidon::Arma1Compat::Arma2BackpackModel(type->GetName(), _shape->GetName());
+        const RString name = model.empty() ? RString() : ::GetShapeName(RString(model.c_str()));
+        if (name.GetLength() > 0 && QIFStreamB::FileExist(name))
+        {
+            _a2Backpack = Shapes.New(name, type->_shapeReversed, true);
+            if (_a2Backpack && type->_moveType && type->_moveType->GetSkeleton())
+            {
+                WeightInfoName wname;
+                wname.shape = _a2Backpack.GetRef();
+                wname.skeleton = type->_moveType->GetSkeleton();
+                _a2BackpackWeights = WeigthBank.New(wname);
+                type->_moveType->GetSkeleton()->Prepare(_a2Backpack, *_a2BackpackWeights);
+            }
+            else
+                _a2Backpack = nullptr;
+        }
+        else if (name.GetLength() > 0)
+            LOG_WARN(Physics, "Arma 2 backpack model {} not found", (const char*)name);
+    }
+    if (!_a2Backpack || !_a2BackpackWeights || level == type->_insideView || _shape->Resolution(level) >= 900.0f)
+        return;
+    MATRIX_4_ARRAY(matrix, 128);
+    PrepareCorrectedPose(level, matrix);
+    if (matrix.Size() <= 0)
+        return;
+    // pack stored coordinates -> body stored coordinates, as for the head
+    const Vector3 d = _shape->AnimationOrigin() - _a2Backpack->AnimationOrigin();
+    const Matrix4 toBody(MTranslation, d);
+    const Matrix4 fromBody(MTranslation, -d);
+    MATRIX_4_ARRAY(packMatrix, 128);
+    packMatrix.Resize(matrix.Size());
+    for (int i = 0; i < matrix.Size(); i++)
+        packMatrix[i] = fromBody * matrix[i] * toBody;
+    const Matrix4 pTransform = transform * toBody;
+    const int pLevel = GScene->LevelFromDistance2(_a2Backpack, dist2, pTransform.Scale(), pTransform.Direction(),
+                                                  GScene->GetCamera()->Direction());
+    if (pLevel < 0 || pLevel == LOD_INVISIBLE)
+        return;
+    Shape* shape = _a2Backpack->LevelOpaque(pLevel);
+    if (!shape)
+        return;
+    AnimationRT::ApplyMatrices(*_a2BackpackWeights, _a2Backpack, pLevel, packMatrix);
+    int spec = shape->Special();
+    shape->PrepareTextures(z2, spec);
+    shape->Draw(this, lights, ClipAll, spec, pTransform, pTransform.InverseScaled());
 }
 
 void Man::DrawNVOptics()
@@ -550,7 +1035,9 @@ void Man::Draw(int level, ClipFlags clipFlags, const FrameBase& pos)
         }
     }
 #endif
-    if (GWorld->GetCameraType() == CamGunner && GWorld->CameraOn() == this)
+    // Through Arma 2 3D sights the soldier is drawn as in first person -- the camera sits
+    // at the weapon's "eye" -- rather than replaced by the 2D optics overlay.
+    if (GWorld->GetCameraType() == CamGunner && GWorld->CameraOn() == this && !Optics3DSelected())
     {
         if (_currentWeapon >= 0 && _currentWeapon < NMagazineSlots())
         {
@@ -583,7 +1070,17 @@ void Man::Draw(int level, ClipFlags clipFlags, const FrameBase& pos)
                     // binoculars are a 4:3 vignette (scopes keep full width) — stretch when bars off.
                     const bool isBinocular = BinocularSelected();
                     const bool preserve4x3 = isBinocular && AspectRatio::ArePillarboxBarsEnabled();
-                    Draw2D(oShape, 0, GetOpticsColor(this), /*preserveAspect4x3*/ preserve4x3);
+                    // PIM-RECOIL: punch the sight toward the face as the weapon kicks. The optic
+                    // is a flat overlay, so there is no depth to move it along - scaling it up
+                    // about its centre is what reads as the gun coming back at you. Driven off
+                    // the live recoil curve, so it rises and falls with the kick.
+                    float opticsScale = 1.0f;
+                    if (_recoil)
+                    {
+                        opticsScale += GRecoilTune.opticsKick *
+                            fabs(_recoil->GetRecoilRotX(_recoilTime)) * _recoilFactor;
+                    }
+                    Draw2D(oShape, 0, GetOpticsColor(this), /*preserveAspect4x3*/ preserve4x3, opticsScale);
                     if (isBinocular)
                         Object::DrawWidescreenPillarbox();
                 }
@@ -688,6 +1185,22 @@ bool Man::IsAbleToStand() const
 bool Man::IsAbleToFire() const
 {
     return true;
+}
+
+bool Man::Optics3DSelected() const
+{
+    if (_currentWeapon < 0 || _currentWeapon >= NMagazineSlots() || !EnableOptics())
+        return false;
+    if (LauncherSelected() && !EnableMissile()) // as GetOpticsModel
+        return false;
+    const MagazineSlot& slot = GetMagazineSlot(_currentWeapon);
+    return slot._muzzle && slot._muzzle->_optics3D && slot._weapon && slot._weapon->_model &&
+           (slot._weapon->_hasEyePos || slot._muzzle->_hasArmaEye);
+}
+
+bool Man::LooksThroughSights(Person* person) const
+{
+    return person == this && Optics3DSelected();
 }
 
 LODShapeWithShadow* Man::GetOpticsModel(Person* person)
@@ -914,6 +1427,10 @@ void Man::ApplyAnimation(int level, RStringB move, float time)
         // moved, i.e. the face would come off the head.
         MATRIX_4_ARRAY(matrix, 128);
         anim->PrepareMatrices(matrix, time, 1);
+        // Arma 1 shapes are stored around their bounding centre (see PrepareBasePose).
+        if (const Vector3 o = GetShape()->AnimationOrigin(); o.SquareSize() > 1e-8f)
+            for (int i = 0; i < matrix.Size(); i++)
+                matrix[i].SetPosition(matrix[i].FastTransform(-o) + o);
         if (matrix.Size() > 0)
         {
             // AnimationRT::Apply returns early on an animation with no phases; matching
@@ -1020,12 +1537,16 @@ void Man::PrepareCorrectedPose(int level, Matrix4Array& matrix) const
                                           headRes.Size());
         }
 
-        if (type->_aimingAxisPoint >= 0 && !_gunTransIdent)
+        // The collision LOD does not lean (see _gunTransNoLean); every other LOD, the fire
+        // geometry included, does.
+        const bool collisionLod = level == _shape->FindGeometryLevel();
+        const Matrix4& gunTrans = collisionLod ? _gunTransNoLean : _gunTrans;
+        if (type->_aimingAxisPoint >= 0 && !(collisionLod ? _gunTransNoLeanIdent : _gunTransIdent))
         {
             BLEND_ANIM(aiming);
             const BlendAnimSelections& aimingRes = GetAiming(aiming);
 
-            AnimationRT::CombineTransform(type->GetWeights(), _shape, memory, matrix, _gunTrans, aimingRes.Data(),
+            AnimationRT::CombineTransform(type->GetWeights(), _shape, memory, matrix, gunTrans, aimingRes.Data(),
                                           aimingRes.Size());
         }
 
@@ -1074,6 +1595,8 @@ void Man::Animate(int level)
         else _head.ApplyFaceBones(type->_head, type->GetWeights(), level, matrix, _isDead);
 
         AnimationRT::ApplyMatrices(type->GetWeights(), _shape, level, matrix);
+        if (level == type->_insideView && level > 0 && GWorld && GWorld->CameraOn() == this)
+            LogViewLodPose(_shape, type->GetWeights(), level, matrix, GetPilotPosition(CamInternal));
     }
 
     BasicAnimation(level);
@@ -1107,6 +1630,22 @@ const EnumName* Foundation::GetEnumNames(ManAction action)
     return ManActionNames;
 }
 
+// The move an action map gives for `action`. Arma 1 move sets (A1_CfgMovesMaleSdr)
+// name the vehicle boarding actions by height instead of by vehicle; an absent
+// OFP action falls back to its Arma 1 equivalent rather than to a config error.
+static RStringB ActionMove(const ParamEntry& map, const char* action)
+{
+    if (const ParamEntry* entry = map.FindEntry(action))
+        return *entry;
+    static const char* const aliases[][2] = {
+        {"GetInCar", "GetInLow"}, {"GetOutCar", "GetOutLow"}, {"GetInTank", "GetInMedium"}, {"GetOutTank", "GetOutMedium"}};
+    for (const auto& alias : aliases)
+        if (_stricmp(action, alias[0]) == 0)
+            if (const ParamEntry* entry = map.FindEntry(alias[1]))
+                return *entry;
+    return map >> action;
+}
+
 ActionMap::ActionMap(const ActionMapName& name)
 {
     _name = name;
@@ -1116,7 +1655,7 @@ ActionMap::ActionMap(const ActionMapName& name)
     _upDegree = e >> "upDegree";
     _limitFast = e >> "limitFast";
 
-#define ACTION(x) _actions[ManAct##x] = _name.motion->GetMoveId(e >> #x);
+#define ACTION(x) _actions[ManAct##x] = _name.motion->GetMoveId(ActionMove(e, #x));
 #include <Poseidon/World/Entities/Infantry/ManActions.hpp>
 #undef ACTION
 }
@@ -1139,8 +1678,26 @@ MovesType::MovesType(const MovesTypeName& name)
     wname.skeleton = _name.motionType->GetSkeleton();
 
     LODShapeWithShadow* shape = _name.shape;
+    const auto tStart = std::chrono::steady_clock::now();
     _weights = WeigthBank.New(wname);
-    for (int i = 0; i < _moves.Size(); i++)
+    bool anyAnimation = false;
+
+    // None of a move's MoveInfo depends on the model, nor on the class beyond its moves config
+    // and skeleton. Every Arma 3 soldier class has the same 5575 moves, and building them took
+    // ~0.5 s per class (Old Man creates hundreds of classes): a class whose moves config and
+    // skeleton match a built one takes its moves, and the action maps and blend types they use.
+    static std::unordered_map<const ParamEntry*, Link<MovesType>> builtFor;
+    Link<MovesType>& donor = builtFor[&moves];
+    const bool share = donor && donor != this && &donor->_name.motionType->GetEntry() == &moves &&
+                       donor->GetSkeleton() == GetSkeleton() && donor->_moves.Size() == _moves.Size();
+    if (share)
+    {
+        if (donor->_name.motionType != _name.motionType)
+            _name.motionType->ShareActionsFrom(*donor->_name.motionType);
+        _moves = donor->_moves;
+        anyAnimation = donor->_anyAnimation;
+    }
+    for (int i = 0; !share && i < _moves.Size(); i++)
     {
         MoveId id = MoveId(i);
         RStringB moveName = _name.motionType->GetMoveName(id);
@@ -1163,14 +1720,36 @@ MovesType::MovesType(const MovesTypeName& name)
         AnimationRT* anim = moveI;
         if (anim)
         {
-            _name.motionType->GetSkeleton()->Prepare(shape, GetWeights());
+            anyAnimation = true;
             anim->SetLooped((*entry) >> "looped");
         }
     }
+    _anyAnimation = anyAnimation;
+    if (!share)
+        donor = this;
+    const auto tMoves = std::chrono::steady_clock::now();
+    // PERF (2026-10-14): once, after the loop. This ran inside it, once per animated move --
+    // hundreds per soldier type at mission start, each a case-insensitive search of every
+    // selection for every bone on every level (~half of a ~1 s MovesType build). Prepare
+    // re-Inits the weights from scratch, so only the last call ever counted; the skeleton
+    // grows as each move's RTM loads (Skeleton::NewBone), and the last call already came after
+    // the last load. Nothing in the loop reads the weights. Same final weights, one pass.
+    // (MrDudeX-arma1 made the same fix independently: with Arma 2's ~2000 moves and 132-bone
+    // soldiers the per-move Prepare took over a minute per soldier model on the laptop.)
+    if (anyAnimation)
+        _name.motionType->GetSkeleton()->Prepare(shape, GetWeights());
+    const auto tPrepare = std::chrono::steady_clock::now();
 
     // FACE-002: after the LAST Prepare -- Prepare re-Inits the weights, so a rig built
     // inside the loop would be wiped by the next move.
     SetupFaceBoneRig(_name.motionType->GetSkeleton(), shape, GetWeights());
+
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto tEnd = std::chrono::steady_clock::now();
+    if (ms(tStart, tEnd) > 50.0)
+        LOG_INFO(World, "Slow MovesType build: {} {:.1f} ms | {} moves {:.1f} prepare {:.1f} face {:.1f}",
+                 shape ? (const char*)shape->GetName() : "", ms(tStart, tEnd), _moves.Size(), ms(tStart, tMoves),
+                 ms(tMoves, tPrepare), ms(tPrepare, tEnd));
 }
 
 MovesType::~MovesType() = default;
@@ -1208,8 +1787,24 @@ void BlendAnimSelections::Load(Skeleton* skelet, const ParamEntry& cfg)
     {
         RStringB name = cfg[i];
         float factor = cfg[i + 1];
-        BlendAnimInfo& info = Set(Add());
         int index = skelet->FindBone(name);
+        if (index < 0)
+        {
+            // Skeleton bone names are lower case (the RTM loader lowers them); OFP's
+            // configs name bones in lower case too, Arma 1's do not ("LeftShoulder").
+            char lower[64];
+            snprintf(lower, sizeof(lower), "%s", (const char*)name);
+            for (char* c = lower; *c; c++)
+                *c = static_cast<char>(tolower(static_cast<unsigned char>(*c)));
+            index = skelet->FindBone(RStringB(lower));
+        }
+        if (index < 0)
+        {
+            // An unknown bone used to stay in the list as matrix index -1, and the
+            // blend then read the matrix before the palette: a garbage transform.
+            continue;
+        }
+        BlendAnimInfo& info = Set(Add());
         info.matrixIndex = index;
         info.factor = factor;
     }
@@ -1259,6 +1854,39 @@ BlendAnimType::BlendAnimType(const BlendAnimTypeName& name)
     Load(name.motion->GetSkeleton(), *name.cfg);
 }
 
+// AnimationRTBank.New searches the whole bank by name: with Arma 3's 5575 moves that was some
+// 15 million name compares for every soldier type built (half a second each, and Old Man builds
+// hundreds of types). An index of where each name sits makes it one hash lookup. The bank still
+// owns the animations; a slot that no longer holds the name (the bank was cleared or a slot
+// reused) is looked up the old way and indexed again.
+static AnimationRT* BankedAnimation(const AnimationRTName& name)
+{
+    static std::unordered_map<std::string, int> index;
+    std::string key(name.name ? (const char*)name.name : "");
+    for (char& c : key)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    key += '|';
+    key += std::to_string(reinterpret_cast<std::uintptr_t>(name.skeleton.GetRef()));
+
+    const auto it = index.find(key);
+    if (it != index.end() && it->second < AnimationRTBank.Size())
+    {
+        AnimationRT* anim = AnimationRTBank.Get(it->second);
+        if (anim && BankTraits<AnimationRT>::CompareNames(anim->GetName(), name) == 0)
+            return anim;
+    }
+    AnimationRT* anim = AnimationRTBank.New(name);
+    if (!anim)
+        return nullptr;
+    const int n = AnimationRTBank.Size();
+    int slot = n > 0 && AnimationRTBank.Get(n - 1) == anim ? n - 1 : -1; // Load appends
+    for (int i = 0; slot < 0 && i < n; i++)
+        if (AnimationRTBank.Get(i) == anim)
+            slot = i;
+    index[key] = slot;
+    return anim;
+}
+
 MoveInfo::MoveInfo(MotionType* motion, const ParamEntry& entry)
 {
     _motion = motion;
@@ -1276,7 +1904,7 @@ MoveInfo::MoveInfo(MotionType* motion, const ParamEntry& entry)
         name.skeleton = motion->GetSkeleton();
 
         bool preload = entry >> "preload";
-        _move = AnimationRTBank.New(name);
+        _move = BankedAnimation(name);
         if (preload)
         {
             _move->AddPreloadCount();
@@ -1310,6 +1938,18 @@ MoveInfo::MoveInfo(MotionType* motion, const ParamEntry& entry)
     _soundOverride = entry >> "soundOverride"; // default - no override
     _soundEdge1 = entry >> "soundEdge1";       // default - no override
     _soundEdge2 = entry >> "soundEdge2";       // default - no override
+    // Arma 1 and later write the step times as one array, soundEdge[] = {0.5, 1} (Arma 3
+    // walks: four entries, one per footfall of the cycle). With only soundEdge1/2 read, an
+    // Arma move had both at 0 and no soldier ever made a step sound. The first two edges
+    // are what the CWA step logic plays.
+    if (!entry.FindEntry("soundEdge1"))
+    {
+        if (const ParamEntry* edges = entry.FindEntry("soundEdge"); edges && edges->IsArray() && edges->GetSize() > 0)
+        {
+            _soundEdge1 = (*edges)[0];
+            _soundEdge2 = edges->GetSize() > 1 ? (float)(*edges)[1] : _soundEdge1;
+        }
+    }
 
     _relSpeedMin = entry >> "relSpeedMin";
     _relSpeedMax = entry >> "relSpeedMax";
@@ -1456,6 +2096,19 @@ void ManType::Load(const ParamEntry& par)
     }
 }
 
+// Engine-facing names (bones, memory points, selections) default to OFP's Czech
+// names. A class may name its own -- the Arma 1 properties (boneHead, weaponBone,
+// memoryPointAim, selectionHeadWound, ...) are read where present, so an Arma 1
+// model can be driven by this code without renaming its selections.
+static RStringB ManNameOr(const ParamEntry& par, const char* key, const char* fallback)
+{
+    const ParamEntry* entry = par.FindEntry(key);
+    if (!entry || entry->IsClass() || entry->IsArray())
+        return RStringB(fallback);
+    RStringB value = *entry;
+    return value.GetLength() > 0 ? value : RStringB(fallback);
+}
+
 void ManType::InitShape()
 {
     _scopeLevel = 2;
@@ -1488,10 +2141,90 @@ void ManType::InitShape()
         }
     }
 
+    // Arma 3 gear: the models the class wears (see _a3Gear) and, per LOD, which of the
+    // man's placeholder proxies draws which. Nothing for any other man.
+    const bool arma3 = Arma1Compat::Active() && Arma1Compat::Generation() >= 3;
+    static const char* const gearKeys[A3GearN] = {nullptr, "a3Headgear", "a3Vest", "a3Backpack"};
+    for (int g = 0; g < A3GearN; g++)
+    {
+        _a3Gear[g] = nullptr;
+        _a3GearColours[g].clear();
+        const ParamEntry* entry = arma3 && gearKeys[g] ? par.FindEntry(gearKeys[g]) : nullptr;
+        if (!entry || entry->IsClass() || entry->IsArray())
+            continue;
+        const RStringB model = *entry;
+        if (model.GetLength() == 0)
+            continue;
+        _a3Gear[g] = Shapes.New(::GetShapeName(model), false, true);
+        if (!_a3Gear[g])
+            continue;
+        _a3Gear[g]->SetAutoCenter(false);
+        _a3Gear[g]->CalculateMinMax();
+        const ParamEntry* sels = par.FindEntry(RString(gearKeys[g]) + RString("Selections"));
+        const ParamEntry* texs = par.FindEntry(RString(gearKeys[g]) + RString("Textures"));
+        if (!sels || !sels->IsArray() || !texs || !texs->IsArray())
+            continue;
+        for (int i = 0; i < sels->GetSize() && i < texs->GetSize(); i++)
+        {
+            RString path = (RStringB)(*texs)[i];
+            const char* p = path.Data();
+            if (*p == '\\')
+                p++;
+            RString lower = p;
+            lower.Lower();
+            Ref<Texture> texture = GlobLoadTexture(lower);
+            if (!texture)
+                continue;
+            A3GearColour& colour = _a3GearColours[g].emplace_back();
+            colour.selection.Init(_a3Gear[g], (RStringB)(*sels)[i], nullptr);
+            colour.texture = texture;
+        }
+    }
+    for (int l = 0; l < MAX_LOD_LEVELS; l++)
+    {
+        _a3GearProxySlot[l].clear();
+        Shape* shape = arma3 && l < _shape->NLevels() ? _shape->Level(l) : nullptr;
+        if (!shape)
+            continue;
+        _a3GearProxySlot[l].assign(shape->NProxies(), -1);
+        for (int p = 0; p < shape->NProxies(); p++)
+        {
+            std::string name = (const char*)shape->Proxy(p).name;
+            for (char& c : name)
+                c = c == '/' ? '\\' : static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            const size_t slash = name.find_last_of('\\');
+            const std::string leaf = slash == std::string::npos ? name : name.substr(slash + 1);
+            const bool gearProxy = name.find("\\proxies\\") != std::string::npos;
+            int slot = -1;
+            if (name.find("\\heads\\") != std::string::npos)
+                slot = A3GearHead;
+            else if (gearProxy && leaf == "headgear")
+                slot = A3GearHeadgear;
+            else if (gearProxy && leaf == "equipment")
+                slot = A3GearVest;
+            else if (gearProxy && leaf == "backpack")
+                slot = A3GearBackpack;
+            // kept even where the class wears nothing there: a script may dress him (Man::SetA3Gear)
+            _a3GearProxySlot[l][p] = static_cast<signed char>(slot);
+        }
+    }
+
     Shape* mem = _shape->MemoryLevel();
     PoseidonAssert(mem);
 
-    _cameraPoint = mem ? mem->PointIndex("zamerny") : -1;
+    // An Arma 2 man names its memory points in English ("aimpoint", "aiming_axis",
+    // "head_axis", "footstepl"); the imported class does not carry CAManBase's
+    // memoryPoint* entries, so the OFP default is tried first and then the Arma 2 name.
+    // Without "aiming_axis" the player's aim turned his rifle about his feet.
+    const auto pointOr = [&](const char* key, const char* ofpName, const char* a2Name) {
+        if (!mem)
+            return -1;
+        int index = mem->PointIndex(ManNameOr(par, key, ofpName));
+        if (index < 0 && a2Name)
+            index = mem->PointIndex(a2Name);
+        return index;
+    };
+    _cameraPoint = pointOr("memoryPointAim", "zamerny", "aimpoint");
     _pilotPoint = mem ? mem->FindNamedSel("pilot") : -1;
     // An EMPTY "pilot" selection is no pilot point. Every reader takes sel[0] of it (the camera /
     // eye position), and community MLODs ship memory selections with no points -- fml_vorhees'
@@ -1510,17 +2243,17 @@ void ManType::InitShape()
 
     WoundInfo woundInfo;
     woundInfo.LoadAndRegister(_shape, par >> "wounds");
-    _headWound.Init(_shape, woundInfo, "head injury", nullptr);
-    _bodyWound.Init(_shape, woundInfo, "body injury", nullptr);
-    _lArmWound.Init(_shape, woundInfo, "l arm injury", nullptr);
-    _rArmWound.Init(_shape, woundInfo, "r arm injury", "p arm injury");
-    _lLegWound.Init(_shape, woundInfo, "l leg injury", nullptr);
-    _rLegWound.Init(_shape, woundInfo, "r leg injury", "p leg injury");
+    _headWound.Init(_shape, woundInfo, ManNameOr(par, "selectionHeadWound", "head injury"), nullptr);
+    _bodyWound.Init(_shape, woundInfo, ManNameOr(par, "selectionBodyWound", "body injury"), nullptr);
+    _lArmWound.Init(_shape, woundInfo, ManNameOr(par, "selectionLArmWound", "l arm injury"), nullptr);
+    _rArmWound.Init(_shape, woundInfo, ManNameOr(par, "selectionRArmWound", "r arm injury"), "p arm injury");
+    _lLegWound.Init(_shape, woundInfo, ManNameOr(par, "selectionLLegWound", "l leg injury"), nullptr);
+    _rLegWound.Init(_shape, woundInfo, ManNameOr(par, "selectionRLegWound", "r leg injury"), "p leg injury");
 
     _head.InitShape(par, _shape);
 
-    _headHide.Init(_shape, "hlava", nullptr);
-    _neckHide.Init(_shape, "krk", nullptr);
+    _headHide.Init(_shape, ManNameOr(par, "selectionHeadHide", "hlava"), nullptr);
+    _neckHide.Init(_shape, ManNameOr(par, "selectionNeckHide", "krk"), nullptr);
 
     _lightPos = _shape->MemoryPoint("L svetlo");
     _lightDir = _shape->MemoryPoint("konec L svetla") - _lightPos;
@@ -1529,21 +2262,21 @@ void ManType::InitShape()
     _insideView = 0;
     _gunnerView = 0;
 
-    _stepLIndex = mem ? mem->PointIndex("stopaL") : -1;
-    _stepRIndex = mem ? mem->PointIndex("stopaP") : -1;
+    _stepLIndex = pointOr("memoryPointLStep", "stopaL", "footstepl");
+    _stepRIndex = pointOr("memoryPointRStep", "stopaP", "footstepr");
 
     _aimPoint = -1;
     _aimingAxisPoint = -1;
     _headAxisPoint = -1;
     if (mem)
     {
-        _aimPoint = mem->PointIndex("zamerny");
+        _aimPoint = pointOr("memoryPointAim", "zamerny", "aimpoint");
         if (_aimPoint < 0)
         {
             LOG_DEBUG(Physics, "No aim point in {}", (const char*)GetName());
         }
-        _aimingAxisPoint = mem->PointIndex("osa mireni");
-        _headAxisPoint = mem->PointIndex("osa otaceni");
+        _aimingAxisPoint = pointOr("memoryPointAimingAxis", "osa mireni", "aiming_axis");
+        _headAxisPoint = pointOr("memoryPointHeadAxis", "osa otaceni", "head_axis");
         if (_headAxisPoint < 0)
         {
             _headAxisPoint = _aimingAxisPoint;
@@ -1577,23 +2310,32 @@ void ManType::InitShape()
 
     if (_isMan)
     {
-        _gunMatIndex = _moveType->GetSkeleton()->FindBone("zbran");
-        _rpgMatIndex = _moveType->GetSkeleton()->FindBone("roura");
-        _handMatIndex = _moveType->GetSkeleton()->FindBone("lruka");
-        _rightHandMatIndex = _moveType->GetSkeleton()->FindBone("pruka");
-        if (_gunMatIndex < 0)
+        _gunMatIndex = _moveType->GetSkeleton()->FindBone(ManNameOr(par, "weaponBone", "zbran"));
+        _rpgMatIndex = _moveType->GetSkeleton()->FindBone(ManNameOr(par, "boneLauncher", "roura"));
+        _handMatIndex = _moveType->GetSkeleton()->FindBone(ManNameOr(par, "boneLeftHand", "lruka"));
+        _rightHandMatIndex = _moveType->GetSkeleton()->FindBone(ManNameOr(par, "boneRightHand", "pruka"));
+        _headMatIndex = _moveType->GetSkeleton()->FindBone(ManNameOr(par, "boneHead", "head"));
+        // A man without weapons whose skeleton has no weapon or hand bones (an Arma 2
+        // animal: weapons[] = {}) holds nothing; only a soldier missing them is an error.
+        const ParamEntry* weapons = par.FindEntry("weapons");
+        const bool unarmed = weapons && weapons->IsArray() && weapons->GetSize() == 0;
+        if (unarmed && (_gunMatIndex < 0 || _rpgMatIndex < 0 || _handMatIndex < 0 || _rightHandMatIndex < 0))
+        {
+            LOG_DEBUG(Physics, "{}: no weapon/hand bones (unarmed)", (const char*)_shape->GetName());
+        }
+        else if (_gunMatIndex < 0)
         {
             LOG_ERROR(Physics, "Bone 'zbran' not found in {}", (const char*)_shape->GetName());
         }
-        if (_rpgMatIndex < 0)
+        if (_rpgMatIndex < 0 && !unarmed)
         {
             LOG_ERROR(Physics, "Bone 'roura' not found in {}", (const char*)_shape->GetName());
         }
-        if (_handMatIndex < 0)
+        if (_handMatIndex < 0 && !unarmed)
         {
             LOG_ERROR(Physics, "Bone 'lruka' not found in {}", (const char*)_shape->GetName());
         }
-        if (_rightHandMatIndex < 0)
+        if (_rightHandMatIndex < 0 && !unarmed)
         {
             LOG_ERROR(Physics, "Bone 'pruka' not found in {}", (const char*)_shape->GetName());
         }
@@ -1631,7 +2373,7 @@ void ManType::InitShape()
         }
     }
 
-    int headIndex = GetSkeleton()->FindBone("hlava");
+    int headIndex = GetSkeleton()->FindBone(ManNameOr(par, "boneHead", "hlava"));
     if (headIndex >= 0)
     {
         _headOnlyWeight.Add(AnimationRTPair(headIndex, 1));
@@ -1644,10 +2386,10 @@ void ManType::InitShape()
         }
     }
 
-    DEF_HIT(_shape, _headHit, "hlava", nullptr, GetArmor() * (float)(par >> "armorHead"));
-    DEF_HIT(_shape, _bodyHit, "telo", nullptr, GetArmor() * (float)(par >> "armorBody"));
-    DEF_HIT(_shape, _handsHit, "ruce", nullptr, GetArmor() * (float)(par >> "armorHands"));
-    DEF_HIT(_shape, _legsHit, "nohy", nullptr, GetArmor() * (float)(par >> "armorLegs"));
+    DEF_HIT(_shape, _headHit, ManNameOr(par, "hitNameHead", "hlava"), nullptr, GetArmor() * (float)(par >> "armorHead"));
+    DEF_HIT(_shape, _bodyHit, ManNameOr(par, "hitNameBody", "telo"), nullptr, GetArmor() * (float)(par >> "armorBody"));
+    DEF_HIT(_shape, _handsHit, ManNameOr(par, "hitNameHands", "ruce"), nullptr, GetArmor() * (float)(par >> "armorHands"));
+    DEF_HIT(_shape, _legsHit, ManNameOr(par, "hitNameLegs", "nohy"), nullptr, GetArmor() * (float)(par >> "armorLegs"));
 }
 
 void ManType::DeinitShape()
@@ -1672,6 +2414,68 @@ ActionMap* ManType::GetActionMap(MoveId move) const
         map = MotionType::GetNoActions();
     }
     return map;
+}
+
+namespace
+{
+// A config value as text ("" when absent or not a plain value).
+RString PlainText(const ParamEntry* cls, const char* name)
+{
+    const ParamEntry* e = cls ? cls->FindEntry(name) : nullptr;
+    return e && !e->IsClass() && !e->IsArray() ? RString((RStringB)*e) : RString();
+}
+} // namespace
+
+void Man::SetA3Gear(int slot, const RString& itemClass)
+{
+    if (slot <= ManType::A3GearHead || slot >= ManType::A3GearN)
+        return;
+    _a3GearSet[slot] = true;
+    _a3GearShape[slot] = nullptr;
+    _a3GearColour[slot].clear();
+    _a3GearClass[slot] = itemClass;
+    if (itemClass.GetLength() == 0)
+        return;
+    // headgear and vests are CfgWeapons items (their worn model is ItemInfo's uniformModel), a
+    // backpack a CfgVehicles class; their colours are hiddenSelections / hiddenSelectionsTextures
+    const bool backpack = slot == ManType::A3GearBackpack;
+    const ParamEntry* cls = Arma1Compat::FindConfigClass(backpack ? "CfgVehicles" : "CfgWeapons", itemClass);
+    if (!cls || !cls->IsClass())
+        return;
+    const ParamEntry* info = backpack ? nullptr : cls->FindEntry("ItemInfo");
+    if (info && !info->IsClass())
+        info = nullptr;
+    RString model = PlainText(info, "uniformModel");
+    if (model.GetLength() == 0)
+        model = PlainText(cls, "model");
+    if (model.GetLength() == 0)
+        return;
+    _a3GearShape[slot] = Shapes.New(::GetShapeName(model), false, true);
+    if (!_a3GearShape[slot])
+        return;
+    _a3GearShape[slot]->SetAutoCenter(false);
+    _a3GearShape[slot]->CalculateMinMax();
+    const ParamEntry* sels = info ? info->FindEntry("hiddenSelections") : nullptr;
+    if (!sels || !sels->IsArray())
+        sels = cls->FindEntry("hiddenSelections");
+    const ParamEntry* texs = cls->FindEntry("hiddenSelectionsTextures");
+    if (!sels || !sels->IsArray() || !texs || !texs->IsArray())
+        return;
+    for (int i = 0; i < sels->GetSize() && i < texs->GetSize(); i++)
+    {
+        RString path = (RStringB)(*texs)[i];
+        const char* p = path.Data();
+        if (*p == '\\')
+            p++;
+        RString lower = p;
+        lower.Lower();
+        Ref<Texture> texture = GlobLoadTexture(lower);
+        if (!texture)
+            continue;
+        ManType::A3GearColour& colour = _a3GearColour[slot].emplace_back();
+        colour.selection.Init(_a3GearShape[slot], (RStringB)(*sels)[i], nullptr);
+        colour.texture = texture;
+    }
 }
 
 } // namespace Poseidon

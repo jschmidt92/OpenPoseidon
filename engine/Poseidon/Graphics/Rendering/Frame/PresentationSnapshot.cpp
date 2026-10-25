@@ -243,7 +243,7 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
         }
     }
 
-    snap.timeSeconds = Glob.time.toFloat();
+    snap.timeSeconds = PresentationClockSeconds(); // between ticks, like the objects (REN-INTERP-001)
     snap.timeOfDay = Glob.clock.GetTimeOfDay();
 
     if (GLandscape)
@@ -311,7 +311,7 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
             if (dx * dx + dz * dz < farthestD2)
                 snap.rotorSources[farthest] = source;
         };
-        const Helicopter* cameraHeli = dynamic_cast<const Helicopter*>(cameraOn);
+        const Helicopter* cameraHeli = cameraOn ? cameraOn->AsHelicopter() : nullptr;
         if (cameraHeli)
         {
             addRotor(cameraHeli);
@@ -320,7 +320,8 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
         }
         for (int i = 0; i < GWorld->NVehicles(); ++i)
         {
-            const Helicopter* helicopter = dynamic_cast<const Helicopter*>(GWorld->GetVehicle(i));
+            const Entity* vehicle = GWorld->GetVehicle(i);
+            const Helicopter* helicopter = vehicle ? vehicle->AsHelicopter() : nullptr;
             if (helicopter && helicopter != cameraHeli)
                 addRotor(helicopter);
         }
@@ -329,7 +330,6 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
         // has sunk below its own draft (a wreck on its way down) no longer makes a wake.
         if (GLandscape)
         {
-            const float sea = GLandscape->GetSeaLevel();
             const Vector3 reference = snap.cameraPos;
             auto addBoat = [&](const Ship* ship)
             {
@@ -345,6 +345,7 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
                 const Vector3 pos = pose.Position();
                 const Vector3 mn = shape->Min();
                 const Vector3 mx = shape->Max();
+                const float sea = GLandscape->SeaLevelAt(pos.X(), pos.Z());
                 const float draft = sea - (pos.Y() + mn.Y());
                 if (draft < 0.05f || pos.Y() + mx.Y() < sea - 0.5f)
                     return;
@@ -367,7 +368,11 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
                 // ~3.5 m beam; no displacement hull is wider than ~0.42 x its length)
                 boat.halfBeam = std::min(std::max(0.5f * (mx.X() - mn.X()) * 0.9f, 0.4f), 0.42f * boat.halfLength);
                 boat.id = static_cast<uint32_t>((reinterpret_cast<uintptr_t>(ship) >> 4u) & 0x007fffffu) + 2u;
-                const float designDraft = WakeDesignDraft(boat.id, std::clamp(draft, 0.15f, 5.0f));
+                // The draft the hull floats at in the boat model (ShipDesignDraft), not one latched at spawn
+                // when the boat may still have been dropping onto the water.
+                const float designDraft = ShipDesignDraft(mx.Z() - mn.Z());
+                (void)draft;
+                (void)WakeDesignDraft;
                 boat.draft = designDraft;
                 boat.driven = ship->Driver() != nullptr;
                 // W6i: pose, freeboard and the sea at the bow contacts / propeller
@@ -379,6 +384,22 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
                 boat.velY = vel.Y();
                 boat.originY = pos.Y() + mn.Y() + designDraft;
                 boat.freeboard = std::clamp(pos.Y() + mx.Y() - boat.originY, 0.3f, std::max(0.3f, 0.3f * boat.halfLength));
+                // A hull that describes itself (Tidewater's boat): its real waterline origin and outline, and the
+                // mask that keeps the drawn sea out of it -- a 0.35 m cockpit sole is under every swell's crest.
+                const ShipType::TidewaterHull& own = ship->Type()->GetTidewaterHull();
+                if (own.valid && own.waterMask)
+                {
+                    const Vector3 origin = pose.FastTransform(own.origin);
+                    boat.x = origin.X();
+                    boat.z = origin.Z();
+                    boat.originY = origin.Y();
+                    boat.halfBeam = own.maskHalfBeam;
+                    boat.waterMask = true;
+                    boat.maskStern = own.maskStern;
+                    boat.maskBow = own.maskBow;
+                    boat.maskSheerAft = own.maskSheerAft;
+                    boat.maskSheerBow = own.maskSheerBow;
+                }
                 {
                     // x axis = up x forward, written out (the same formula as boat_spray.rs)
                     const float ax = up.Y() * fwd.Z() - up.Z() * fwd.Y();
@@ -390,10 +411,10 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
                         WakeSprayContactPoint(boat.halfBeam, boat.halfLength, k, cx, cz);
                         const float wx = boat.x + ax * cx + fwd.X() * cz;
                         const float wz = boat.z + az * cx + fwd.Z() * cz;
-                        boat.hwContact[k] = QueryWaterSurfaceScaled(wx, wz, time, sea, 1.0f).height;
+                        boat.hwContact[k] = QueryWaterSurfaceScaled(wx, wz, time, GLandscape->SeaLevelAt(wx, wz), 1.0f).height;
                     }
                     const float pz = -boat.halfLength + 0.3f;
-                    boat.hwProp = QueryWaterSurfaceScaled(boat.x + fwd.X() * pz, boat.z + fwd.Z() * pz, time, sea, 1.0f).height;
+                    boat.hwProp = QueryWaterSurfaceScaled(boat.x + fwd.X() * pz, boat.z + fwd.Z() * pz, time, GLandscape->SeaLevelAt(boat.x + fwd.X() * pz, boat.z + fwd.Z() * pz), 1.0f).height;
                 }
                 const float dx = boat.x - reference.X();
                 const float dz = boat.z - reference.Z();
@@ -411,15 +432,81 @@ static void FillPresentationSnapshot(PresentationSnapshot& snap)
                     snap.wakeBoats[farthest] = boat;
             };
             for (int i = 0; i < GWorld->NVehicles(); ++i)
-                addBoat(dynamic_cast<const Ship*>(GWorld->GetVehicle(i)));
+            {
+                const Entity* vehicle = GWorld->GetVehicle(i);
+                addBoat(vehicle ? vehicle->AsShip() : nullptr);
+            }
             // the occupied boat is not always in the vehicle list (see the rotor walk above)
-            const Ship* cameraShip = dynamic_cast<const Ship*>(cameraOn);
+            const Ship* cameraShip = cameraOn ? cameraOn->AsShip() : nullptr;
             bool listed = false;
             for (int k = 0; k < snap.wakeBoatCount; ++k)
                 listed |= cameraShip && snap.wakeBoats[k].id ==
                     static_cast<uint32_t>((reinterpret_cast<uintptr_t>(cameraShip) >> 4u) & 0x007fffffu) + 2u;
             if (cameraShip && !listed)
                 addBoat(cameraShip);
+
+            // The swimming player is a small "hull" for the same simulation (owner: "the player needs
+            // to cause ripples too"): a 2 m x 0.6 m body 0.3 m deep. Moving, he leaves Tidewater's
+            // wake; treading water, his body heaving against the waves rings the surface. His design
+            // waterline is the chin, 1.44 m above the man's origin when swimming (SoldierOldSwim).
+            const Person* swimmer = GWorld->GetRealPlayer();
+            if (swimmer && swimmer->IsSwimming() && swimmer->IsInLandscape())
+            {
+                const Matrix4 pose = swimmer->RenderTransform();
+                const Vector3 pos = pose.Position();
+                Vector3 fwd = pose.Direction();
+                fwd[1] = 0;
+                if (fwd.SquareSize() < 1e-4f)
+                    fwd = Vector3(0, 0, 1);
+                fwd.Normalize();
+                PresentationSnapshot::WakeBoat body;
+                body.x = pos.X();
+                body.z = pos.Z();
+                body.fwdX = fwd.X();
+                body.fwdZ = fwd.Z();
+                const Vector3 vel = swimmer->Speed();
+                body.velX = vel.X();
+                body.velZ = vel.Z();
+                body.velY = vel.Y();
+                body.thrust = 0.0f;
+                body.halfLength = 1.0f;
+                body.halfBeam = 0.3f;
+                body.draft = 0.3f;
+                body.driven = false;
+                body.id = 1u;
+                body.fwdY = 0.0f;
+                body.upX = 0.0f;
+                body.upY = 1.0f;
+                body.upZ = 0.0f;
+                body.originY = pos.Y() + 1.44f;
+                body.freeboard = 0.3f;
+                const float time = Glob.time.toFloat();
+                for (int k = 0; k < 6; ++k)
+                {
+                    float cx, cz;
+                    WakeSprayContactPoint(body.halfBeam, body.halfLength, k, cx, cz);
+                    const float wx = body.x + fwd.Z() * cx + fwd.X() * cz;
+                    const float wz = body.z - fwd.X() * cx + fwd.Z() * cz;
+                    body.hwContact[k] = QueryWaterSurfaceScaled(wx, wz, time, GLandscape->SeaLevelAt(wx, wz), 1.0f).height;
+                }
+                body.hwProp = body.hwContact[0];
+                const float dx = body.x - reference.X();
+                const float dz = body.z - reference.Z();
+                body.distance2 = dx * dx + dz * dz;
+                if (snap.wakeBoatCount < PresentationSnapshot::kMaxWakeBoats)
+                {
+                    snap.wakeBoats[snap.wakeBoatCount++] = body;
+                }
+                else
+                {
+                    int farthest = 0;
+                    for (int k = 1; k < snap.wakeBoatCount; ++k)
+                        if (snap.wakeBoats[k].distance2 > snap.wakeBoats[farthest].distance2)
+                            farthest = k;
+                    if (body.distance2 < snap.wakeBoats[farthest].distance2)
+                        snap.wakeBoats[farthest] = body;
+                }
+            }
         }
     }
 

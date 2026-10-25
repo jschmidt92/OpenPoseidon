@@ -19,11 +19,16 @@ RString& GetLanguage();
 #define GLanguage ::Poseidon::GetLanguage()
 
 void LoadStringtable(RString type, RString filename, float priority = 0, bool init = true);
+// Arma 1 (--arma1) stringtable bytes read from a privately opened archive.
+void LoadArma1StringtableFromMemory(const char* name, const char* data, size_t size);
 
 int RegisterString(RString name);
 
 RString LocalizeString(int ids);
 RString LocalizeString(const char* str);
+// `key` (without "$"/"@") from the Arma 1 stringtables first, then the usual order. CWA's
+// tables win otherwise, and a key both name (STR_DN_AIR) came out in CWA's text.
+RString LocalizeArma1String(const char* key);
 
 // Localized value for `key`, or `fallback` verbatim if the key is missing/empty.
 const char* LocalizeStringWithFallback(const char* key, const char* fallback);

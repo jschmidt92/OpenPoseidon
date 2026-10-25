@@ -4,15 +4,22 @@
 #include <Poseidon/IO/ParamFileExt.hpp>
 #include <Poseidon/IO/Serialization/ParamArchive.hpp>
 #include <Poseidon/Audio/Speaker.hpp>
+#include <Poseidon/Audio/GameVoiceMute.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/World/World.hpp>
 #include <Random/randomGen.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 
 #include <Poseidon/UI/Locale/Languages.hpp>
 #include <Poseidon/Foundation/Common/FltOpts.hpp>
 #include <Poseidon/Foundation/Enums/EnumNames.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
 #include <Poseidon/Foundation/Memory/FastAlloc.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
+#include <map>
+#include <set>
+#include <Poseidon/IO/Streams/QBStream.hpp>
+#include <string>
 #include <Poseidon/Foundation/Time/Time.hpp>
 #include <Poseidon/Foundation/Types/LLinks.hpp>
 
@@ -47,16 +54,178 @@ BasicSpeaker::BasicSpeaker(const ParamEntry& cfg)
     }
 }
 
+BasicSpeaker::BasicSpeaker(const ParamEntry& cwaFallback, const ParamEntry& a2Voice, const ParamEntry& a2Words)
+    : BasicSpeaker(cwaFallback)
+{
+    _a2Words = &a2Words;
+    const ParamEntry& dirs = a2Voice >> "directories";
+    for (int i = 0; i < dirs.GetSize(); i++)
+    {
+        RString dir = dirs[i];
+        _a2Directories.Add(dir.GetLength() > 0 && dir[0] == '\\' ? RString((const char*)dir + 1) : dir);
+    }
+}
+
+static const char* const A2Silent = "*arma2-silent*";
+
+// The clip the Arma 2 voice says `id` (a CWA radio word) with: the Arma 2 word that says the
+// same (by the CWA word's file, else its name), one of its variants at random, under the
+// voice's directory unless the variant is absolute; ".wss" or ".ogg" when it names none.
+// Empty when Arma 2's radio has no such word or the voice has no clip for it.
+RString BasicSpeaker::A2Clip(const RString& id) const
+{
+    if (!_a2Words || _a2Directories.Size() == 0)
+        return RString();
+    const ParamEntry* cwaWords = (Pars >> "CfgVoice").FindEntry("Words");
+    const ParamEntry* cwaWord = cwaWords ? cwaWords->FindEntry(id) : nullptr;
+    const char* a2 = nullptr;
+    if (cwaWord && cwaWord->IsArray() && cwaWord->GetSize() > 0)
+        a2 = Arma1Compat::Arma2RadioWord(RString((*cwaWord)[0].GetValue()));
+    if (!a2)
+        a2 = Arma1Compat::Arma2RadioWord(id);
+    // Arrowhead's protocol renamed some words: "GetDownE" for "GetDown", "BoardThat",
+    // "GetInThat", "TargetThat"; the word itself first, then those.
+    const RString base0 = a2 ? RString(a2) : id;
+    const ParamEntry* word = nullptr;
+    for (const char* suffix : {"", "E", "That"})
+    {
+        word = _a2Words->FindEntry(base0 + RString(suffix));
+        if (word && word->IsArray())
+            break;
+        word = nullptr;
+    }
+    if (word && word->GetSize() == 0)
+        return RString(A2Silent); // Arma 2 says nothing for it ("Unknown[] = {}")
+    if (!word)
+    {
+        static std::set<std::string> reported;
+        if (reported.insert(std::string((const char*)id)).second)
+            LOG_INFO(Audio, "Radio word '{}' has no word in the Arma 2 radio protocol: the CWA voice says it",
+                     (const char*)id);
+        return RString();
+    }
+    const int n = word->GetSize();
+    const int pick = std::min(n - 1, toIntFloor(GRandGen.RandomValue() * n));
+    for (int k = 0; k < n; k++)
+    {
+        RString v = (*word)[(pick + k) % n].GetValue();
+        if (v.GetLength() == 0)
+            continue;
+        const RString base = v[0] == '\\' ? RString((const char*)v + 1) : _a2Directories[0] + v;
+        const char* dot = strrchr((const char*)base, '.');
+        const char* slash = strrchr((const char*)base, '\\');
+        if (dot && (!slash || dot > slash))
+        {
+            if (QIFStreamB::FileExist(base))
+                return base;
+            continue;
+        }
+        for (const char* ext : {".wss", ".ogg", ".wav"})
+            if (QIFStreamB::FileExist(base + RString(ext)))
+                return base + RString(ext);
+    }
+    static std::set<std::string> missing;
+    if (missing.insert(std::string((const char*)_a2Directories[0]) + "|" + (const char*)id).second)
+        LOG_WARN(Audio, "Arma 2 voice {} has no clip for radio word '{}' ({}): the CWA voice says it",
+                 (const char*)_a2Directories[0], (const char*)id, a2 ? a2 : (const char*)id);
+    return RString();
+}
+
+// A word CfgVoice >> Words does not define (the bearing callouts' "at") still has a
+// clip in the voice data when a speaker ships one under the word's own name
+// (voice\Rob\at.wss). Use the speaker's own clip first, else the first speaker in
+// CfgVoice >> voices that has it, so the word is spoken instead of left out.
+static RString UndefinedWordClip(const RString& dir, const RString& id)
+{
+    const RString own = dir + id + RString(".wss");
+    if (QIFStreamB::FileExist(own))
+    {
+        static std::set<std::string> ownLogged;
+        if (ownLogged.insert((const char*)own).second)
+            LOG_INFO(Audio, "Radio word '{}' is not in CfgVoice >> Words: spoken from {}", (const char*)id,
+                     (const char*)own);
+        return own;
+    }
+    static std::map<std::string, std::string> shared;
+    const std::string key = (const char*)id;
+    auto it = shared.find(key);
+    if (it == shared.end())
+    {
+        std::string found;
+        const ParamEntry& voice = Pars >> "CfgVoice";
+        const ParamEntry* voices = voice.FindEntry("voices");
+        for (int i = 0; voices && voices->IsArray() && i < voices->GetSize() && found.empty(); i++)
+        {
+            const ParamEntry* cls = voice.FindEntry(RString((*voices)[i].GetValue()));
+            const ParamEntry* dirs = cls ? cls->FindEntry("directories") : nullptr;
+            for (int d = 0; dirs && dirs->IsArray() && d < dirs->GetSize() && found.empty(); d++)
+            {
+                RString vdir = (*dirs)[d];
+                RString full = vdir.GetLength() > 0 && vdir[0] == '\\' ? RString((const char*)vdir + 1)
+                                                                       : RString("voice\\") + vdir;
+                RString name = full + id + RString(".wss");
+                if (QIFStreamB::FileExist(name))
+                    found = (const char*)name;
+            }
+        }
+        if (found.empty())
+            LOG_WARN(Audio, "Radio word '{}' is not in CfgVoice >> Words and no speaker has a clip for it",
+                     (const char*)id);
+        else
+            LOG_INFO(Audio, "Radio word '{}' is not in CfgVoice >> Words: speakers without their own clip use {}",
+                     (const char*)id, found);
+        it = shared.emplace(key, found).first;
+    }
+    return it->second.empty() ? RString() : RString(it->second.c_str());
+}
+
 IWave* BasicSpeaker::Say(RString id, float pitch, bool loop)
 {
     RString dir = ENGINE_CONFIG.singleVoice ? _directories[1] : _directories[0];
-    const ParamEntry& word = Pars >> "CfgVoice" >> "Words" >> id;
-    RString name = dir + word[0].GetValue() + RString(".wss");
+    if (const RString a2 = A2Clip(id); a2.GetLength() > 0)
+    {
+        if (strcmp(a2, A2Silent) == 0)
+            return GSoundsys ? GSoundsys->CreateEmptyWave(1) : nullptr;
+        IWave* wave = GSoundScene->OpenAndPlayOnce2D(a2, 1, pitch, false);
+        if (wave)
+        {
+            wave->SetKind(WaveSpeech);
+            if (GameVoicesMuted())
+                wave->SetVolume(0.0f);
+            if (loop)
+                wave->Repeat(1000);
+        }
+        return wave;
+    }
+    const ParamEntry* words = (Pars >> "CfgVoice").FindEntry("Words");
+    const ParamEntry* wordEntry = words ? words->FindEntry(id) : nullptr;
+    RString name;
+    if (!wordEntry || !wordEntry->IsArray() || wordEntry->GetSize() == 0 ||
+        RString((*wordEntry)[0].GetValue()).GetLength() == 0)
+    {
+        name = UndefinedWordClip(dir, id);
+        if (name.GetLength() == 0)
+        {
+            // Nothing to play: name the word once; the radio carries on as before (the
+            // failed wave still ends and passes the message on).
+            static std::set<std::string> reported;
+            if (reported.insert((const char*)id).second)
+                LOG_WARN(Audio, "Radio word '{}' is not in CfgVoice >> Words", (const char*)id);
+            name = dir + RString(".wss");
+        }
+    }
+    else
+    {
+        const ParamEntry& word = Pars >> "CfgVoice" >> "Words" >> id;
+        name = dir + word[0].GetValue() + RString(".wss");
+    }
 
     IWave* wave = GSoundScene->OpenAndPlayOnce2D(name, 1, pitch, false);
     if (wave)
     {
         wave->SetKind(WaveSpeech);
+        if (GameVoicesMuted())
+            wave->SetVolume(0.0f); // still plays (the radio queue times on it), just silent
         if (loop)
         {
             wave->Repeat(1000);

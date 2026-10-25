@@ -8,9 +8,33 @@
 #include <dbghelp.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 
 namespace Poseidon::Foundation
 {
+namespace
+{
+// DbgHelp looks for the .pdb in the working directory and the path the build recorded,
+// not beside the executable -- and the game runs with the game folder as its working
+// directory while the binaries (and their .pdb) sit elsewhere, so every frame of our own
+// code came out "<unknown>". The executable's folder goes first on the search path.
+void InitSymbols(HANDLE proc)
+{
+    char exe[MAX_PATH] = {};
+    std::string path;
+    if (GetModuleFileNameA(nullptr, exe, MAX_PATH) > 0)
+    {
+        path = exe;
+        const size_t slash = path.find_last_of("\\/");
+        path = slash == std::string::npos ? std::string() : path.substr(0, slash);
+    }
+    if (const char* env = getenv("_NT_SYMBOL_PATH"); env && *env)
+        path += (path.empty() ? "" : ";") + std::string(env);
+    SymSetOptions(SymGetOptions() | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, path.empty() ? nullptr : path.c_str(), TRUE);
+}
+} // namespace
 namespace
 {
 char g_crashDir[MAX_PATH] = {}; // where to write the minidump; empty = beside the exe
@@ -108,7 +132,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
     fprintf(stderr, "\n=== UNHANDLED EXCEPTION 0x%08lX at %p ===\n", code, addr);
     LOG_ERROR(Core, "UNHANDLED EXCEPTION 0x{:08X} at {}", (unsigned)code, addr);
 
-    SymInitialize(proc, nullptr, TRUE);
+    InitSymbols(proc);
     CONTEXT walkContext = *ep->ContextRecord;
     CONTEXT* ctx = &walkContext;
     STACKFRAME64 frame = {};
@@ -163,6 +187,9 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
         }
     }
     fflush(stderr);
+    // The log file is written by its own thread (PERF-LOG-FILE-QUEUE): let it write the lines
+    // above before the process ends.
+    DrainLogFileQueue(2000);
 
     if (g_crashNotify)
         g_crashNotify(static_cast<unsigned>(code), addr, g_crashDump, g_crashStack);
@@ -188,6 +215,98 @@ void InstallCrashHandler(const char* crashDir)
     if (!g_dumpContext)
         AllocateDumpContext();
     SetUnhandledExceptionFilter(CrashFilter);
+}
+
+namespace
+{
+HANDLE g_watchedThread = nullptr;
+}
+
+void RememberStallThread()
+{
+    if (g_watchedThread)
+        return;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_watchedThread,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
+}
+
+void LogStallThreadStack()
+{
+    if (!g_watchedThread)
+        return;
+    HANDLE proc = GetCurrentProcess();
+    static bool symbols = false;
+    if (!symbols)
+    {
+        symbols = true;
+        InitSymbols(proc);
+    }
+    if (SuspendThread(g_watchedThread) == (DWORD)-1)
+        return;
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(g_watchedThread, &ctx))
+    {
+        ResumeThread(g_watchedThread);
+        return;
+    }
+    // Walk while suspended (the stack must not move), log after resuming. Nothing in the walk
+    // may allocate or take a lock the suspended thread could hold: StackWalk64 with dbghelp's
+    // table and module callbacks does both, and with the main thread suspended inside the heap
+    // (a mission still loading) the monitor waited on it for ever -- TE15_UAVs in run 44 froze
+    // at its first stall report instead of ending at 60 s. x64 unwinds with the image's own
+    // tables (RtlLookupFunctionEntry/RtlVirtualUnwind), which read only mapped memory.
+    DWORD64 pcs[48];
+    int n = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+    while (n < 48 && ctx.Rip)
+    {
+        pcs[n++] = ctx.Rip;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+        if (!fn)
+        {
+            // a leaf function: the return address is on top of the stack
+            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+            ctx.Rsp += 8;
+            continue;
+        }
+        PVOID handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
+    }
+#else
+    STACKFRAME64 frame = {};
+    constexpr DWORD machineType = IMAGE_FILE_MACHINE_I386;
+    frame.AddrPC.Offset = ctx.Eip;
+    frame.AddrFrame.Offset = ctx.Ebp;
+    frame.AddrStack.Offset = ctx.Esp;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Mode = AddrModeFlat;
+    while (n < 48 && StackWalk64(machineType, proc, g_watchedThread, &frame, &ctx, nullptr, SymFunctionTableAccess64,
+                                 SymGetModuleBase64, nullptr) &&
+           frame.AddrPC.Offset)
+        pcs[n++] = frame.AddrPC.Offset;
+#endif
+    ResumeThread(g_watchedThread);
+    char symBuf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+    for (int i = 0; i < n; i++)
+    {
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        const char* name = SymFromAddr(proc, pcs[i], &disp, sym) ? sym->Name : "<unknown>";
+        IMAGEHLP_LINE64 line = {};
+        line.SizeOfStruct = sizeof(line);
+        DWORD lineDisp = 0;
+        if (SymGetLineFromAddr64(proc, pcs[i], &lineDisp, &line))
+            LOG_WARN(Core, "  stall #{:02} {}+0x{:x} ({}:{})", i, name, static_cast<unsigned long long>(disp),
+                     line.FileName ? line.FileName : "?", line.LineNumber);
+        else
+            LOG_WARN(Core, "  stall #{:02} {}+0x{:x}", i, name, static_cast<unsigned long long>(disp));
+    }
 }
 } // namespace Poseidon::Foundation
 
@@ -391,6 +510,8 @@ void captureBuildId()
 } // namespace
 
 void SetCrashNotify(CrashNotifyFn) {} // DIAG-001: Windows only (see CrashHandler.hpp)
+void RememberStallThread() {}
+void LogStallThreadStack() {}
 
 void InstallCrashHandler(const char* crashDir)
 {

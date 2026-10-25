@@ -11,6 +11,8 @@
 #include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/Foundation/Strings/RString.hpp>
 #include <Poseidon/Foundation/platform.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthFreeFlight.hpp>
 
 // The PCH pulls in Logging.hpp which #defines DebugLog() as a logging macro.
 // That collides with the method ImGui::DebugLog().  Undef before including
@@ -26,6 +28,7 @@
 #include <glad/gl.h>
 
 #include <Poseidon/Dev/Debug/DebugOverlay.hpp>
+#include <Poseidon/Dev/Debug/ReShadeOptional.hpp>
 #include <Poseidon/Dev/Debug/DevPanelWidgets.hpp>
 #include <Poseidon/Dev/Debug/DebugCheats.hpp>
 #include <Poseidon/Dev/Debug/DebugCommands.hpp>
@@ -58,6 +61,10 @@
 #include <Poseidon/Dev/Diag/PictureModeTab.hpp>
 #include <Poseidon/Dev/Diag/WeatherTab.hpp>
 #include <Poseidon/Dev/Diag/SmokeTab.hpp>
+#include <Poseidon/Dev/Diag/AudioTab.hpp>
+#include <Poseidon/Dev/Debug/DevPanelHome.hpp>
+#include <Poseidon/Dev/NpcChat/NpcChat.hpp>
+#include <Poseidon/Dev/NpcChat/NpcChatUi.hpp>
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 3D overlay (--diag-draw)
 #include <Poseidon/UI/Settings/GameSettingsConfig.hpp>
 #include <Poseidon/UI/Settings/AspectRatio.hpp>
@@ -233,7 +240,12 @@ constexpr std::array<const char*, 4> kZeusSideNames = {"West", "East", "Resistan
 constexpr std::array<TargetSide, 4> kZeusSides = {TWest, TEast, TGuerrila, TCivilian};
 constexpr std::array<const char*, 6> kZeusUnitPresets = {"SoldierWB", "SoldierEB", "SoldierGB",
                                                          "OfficerW",  "OfficerE",  "Civilian"};
-constexpr std::array<const char*, 7> kZeusVehiclePresets = {"Jeep", "UAZ", "M1A1", "T72", "BMP", "UH60", "Mi17"};
+constexpr std::array<const char*, 9> kZeusVehiclePresets = {"Jeep", "UAZ", "M1A1", "T72", "BMP", "UH60", "Mi17",
+                                                            "BoatW", "OP_TidewaterBoat"};
+// Tidewater's lobster boat (@OP_TidewaterBoat, generate_tidewater_boat.py)
+constexpr const char* kTidewaterBoatClass = "OP_TidewaterBoat";
+// Tidewater's humpback whale (@OP_TidewaterWildlife, Whale.cpp)
+constexpr const char* kTidewaterWhaleClass = "OP_TidewaterHumpback";
 
 bool ZeusWorldAvailable()
 {
@@ -404,6 +416,142 @@ ZeusGotoPose ParseZeusGoto(const char* text)
     return pose;
 }
 
+// Whole world: a pasted GPS position instead of a map pose (owner: "make the go to coordinates accept real
+// gps coordinates"). Two forms, as map sites copy them:
+//   decimal degrees, comma between them    38.72230, -9.13934        (an optional third number: altitude, m)
+//   degrees / minutes / seconds + N S E W  38 43'20.3"N 9 08'21.6"W  (degree signs, or N 38 43 20.3 W 9 8 21.6)
+// A map pose has no hemisphere letter or degree sign, and is outside +-90 / +-180 or has no comma.
+struct ZeusGps
+{
+    double latitude = 0, longitude = 0, altitude = 0;
+    bool hasAltitude = false;
+};
+bool IsHemisphere(const char* p, const char* text)
+{
+    const char c = *p;
+    if (c != 'N' && c != 'S' && c != 'E' && c != 'W' && c != 'n' && c != 's' && c != 'e' && c != 'w')
+        return false;
+    const auto letter = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); };
+    // a letter on its own: not part of a word, nor a number's exponent ("1e5")
+    if (p > text && letter(p[-1]))
+        return false;
+    if (p > text && (c == 'e' || c == 'E') && p[-1] >= '0' && p[-1] <= '9' && ((p[1] >= '0' && p[1] <= '9') || p[1] == '-' || p[1] == '+'))
+        return false;
+    return !letter(p[1]);
+}
+bool ZeusGpsNumber(const char*& p, double& v)
+{
+    const bool start = (*p >= '0' && *p <= '9') || *p == '.' ||
+                       ((*p == '-' || *p == '+') && ((p[1] >= '0' && p[1] <= '9') || p[1] == '.'));
+    if (!start)
+        return false;
+    char* end = nullptr;
+    v = std::strtod(p, &end);
+    if (end == p)
+        return false;
+    p = end;
+    return true;
+}
+std::optional<ZeusGps> ParseZeusGps(const char* text)
+{
+    if (!text)
+        return std::nullopt;
+    bool marked = std::strstr(text, "\xC2\xB0") != nullptr; // the degree sign (UTF-8)
+    for (const char* p = text; *p && !marked; ++p)
+        marked = IsHemisphere(p, text);
+    ZeusGps gps;
+    if (marked)
+    {
+        // Each coordinate is up to three numbers (degrees, minutes, seconds), its hemisphere letter after
+        // them or before them; without letters latitude comes first.
+        double parts[3] = {};
+        int count = 0;
+        char pending = 0;
+        bool haveLat = false, haveLon = false;
+        const auto close = [&](char hemisphere) {
+            if (count == 0)
+                return;
+            double v = std::abs(parts[0]) + (count > 1 ? parts[1] / 60.0 : 0.0) + (count > 2 ? parts[2] / 3600.0 : 0.0);
+            const char h = char(std::toupper(static_cast<unsigned char>(hemisphere)));
+            if (parts[0] < 0 || h == 'S' || h == 'W')
+                v = -v;
+            if (h == 'N' || h == 'S')
+                gps.latitude = v, haveLat = true;
+            else if (h == 'E' || h == 'W')
+                gps.longitude = v, haveLon = true;
+            else if (!haveLat)
+                gps.latitude = v, haveLat = true;
+            else
+                gps.longitude = v, haveLon = true;
+            count = 0;
+        };
+        for (const char* p = text; *p;)
+        {
+            double v = 0;
+            if (ZeusGpsNumber(p, v))
+            {
+                if (count == 3)
+                {
+                    close(pending);
+                    pending = 0;
+                }
+                parts[count++] = v;
+                continue;
+            }
+            if (IsHemisphere(p, text))
+            {
+                if (count > 0 && pending)
+                {
+                    close(pending); // "N 38 43 20 W ..." -- this letter opens the next coordinate
+                    pending = *p;
+                }
+                else if (count > 0)
+                    close(*p); // "38 43 20 N"
+                else
+                    pending = *p;
+            }
+            else if (*p == ',' || *p == ';')
+            {
+                close(pending);
+                pending = 0;
+            }
+            ++p;
+        }
+        close(pending);
+        if (!haveLat || !haveLon)
+            return std::nullopt;
+    }
+    else
+    {
+        if (!std::strchr(text, ','))
+            return std::nullopt;
+        double v[3] = {};
+        int count = 0;
+        for (const char* p = text; *p && count < 4;)
+        {
+            double x = 0;
+            if (ZeusGpsNumber(p, x))
+            {
+                if (count < 3)
+                    v[count] = x;
+                ++count;
+                continue;
+            }
+            ++p;
+        }
+        if (count < 2 || count > 3 || std::abs(v[0]) > 90.0 || std::abs(v[1]) > 180.0)
+            return std::nullopt;
+        gps.latitude = v[0];
+        gps.longitude = v[1];
+        if (count == 3)
+            gps.altitude = v[2], gps.hasAltitude = true;
+    }
+    if (!std::isfinite(gps.latitude) || !std::isfinite(gps.longitude) || std::abs(gps.latitude) > 90.0 ||
+        std::abs(gps.longitude) > 180.0)
+        return std::nullopt;
+    return gps;
+}
+
 // Move the free-fly camera to a pasted pose, enabling free-fly first if it is not already
 // running, so one paste + one click is the whole interaction.
 //
@@ -412,6 +560,21 @@ ZeusGotoPose ParseZeusGoto(const char* text)
 // there plus an eye offset, because a paste of just X/Z otherwise buries the camera.
 void GoToZeusCoordinates()
 {
+    if (EarthStreaming::Enabled())
+        if (const auto gps = ParseZeusGps(s_zeusGotoBuf))
+        {
+            // 500 m over the place unless an altitude was given, where the Earth tab's Go starts too
+            const double altitude = gps->hasAltitude ? gps->altitude : 500.0;
+            char status[192];
+            if (SetEarthPreviewLocation(gps->latitude, gps->longitude, altitude))
+                std::snprintf(status, sizeof(status), "Moved to %.6f, %.6f, %.0f m up; the ground there is streaming in.",
+                              gps->latitude, gps->longitude, altitude);
+            else
+                std::snprintf(status, sizeof(status), "GPS %.6f, %.6f rejected (latitude -84..84, single-player free flight).",
+                              gps->latitude, gps->longitude);
+            s_zeusStatus = status;
+            return;
+        }
     const ZeusGotoPose pose = ParseZeusGoto(s_zeusGotoBuf);
     if (pose.count < 2)
     {
@@ -481,6 +644,16 @@ void BeamPlayerToZeusCamera()
     }
 
     Vector3 position = s_zeusCamera->Position();
+    // On the moon (whole world's moon frame) the ground is the moon's sphere, everywhere.
+    if (EarthStreaming::Enabled() && !EarthStreaming::OnMoon)
+    {
+        const auto ground = EarthStreaming::Locations().Ground();
+        if (!ground || !ground->Contains(position.X(), position.Z(), 2.0f))
+        {
+            s_zeusStatus = "Earth ground is not resident here yet. Wait for near elevation before beaming.";
+            return;
+        }
+    }
     position[1] = GLandscape->RoadSurfaceYAboveWater(position[0], position[2]);
     Vector3 direction = s_zeusCamera->Direction();
     direction[1] = 0.0f;
@@ -492,11 +665,13 @@ void BeamPlayerToZeusCamera()
     transform.SetPosition(position);
     transform.SetDirectionAndUp(direction, VUp);
     Vector3 normal;
-    if (EntityAI* entity = dyn_cast<EntityAI>(player))
-        AIUnit::FindFreePosition(position, normal, true, entity);
+    if (!EarthStreaming::Enabled())
+        if (EntityAI* entity = dyn_cast<EntityAI>(player))
+            AIUnit::FindFreePosition(position, normal, true, entity);
     transform.SetPosition(position);
     player->PlaceOnSurface(transform);
     player->SetTransform(transform);
+    if (EarthStreaming::Enabled()) player->SetSpeed(VZero);
 
     // The camera must be released before switching back to the player.  This
     // returns input and view control in the same operation, rather than
@@ -767,6 +942,12 @@ void MoveZeusSelectionAtPixel(float pixelX, float pixelY)
         const auto& record = s_zeusSelection[i];
         Matrix4 transform = record.object->Transform();
         Vector3 position = target + s_zeusMoveOffsets[i];
+        if (EarthStreaming::Enabled())
+        {
+            const auto ground = EarthStreaming::Locations().Ground();
+            if (!ground || !ground->Contains(position.X(), position.Z(), std::max(2.0f, record.object->GetRadius())))
+                continue;
+        }
         position[1] = GLandscape->RoadSurfaceYAboveWater(position[0], position[2]);
         transform.SetPosition(position);
         if (Person* person = dyn_cast<Person>(record.object.GetLink()))
@@ -774,7 +955,7 @@ void MoveZeusSelectionAtPixel(float pixelX, float pixelY)
             StabilizeZeusInfantry(person, transform.Direction());
             Vector3 normal;
             EntityAI* entity = dyn_cast<EntityAI>(record.object.GetLink());
-            if (entity && AIUnit::FindFreePosition(position, normal, true, entity))
+            if (!EarthStreaming::Enabled() && entity && AIUnit::FindFreePosition(position, normal, true, entity))
                 transform.SetPosition(position);
             person->PlaceOnSurface(transform);
             person->SetTransform(transform);
@@ -853,6 +1034,12 @@ bool SpawnZeusVehicle(const char* className, Vector3Par position, float heading)
     Ref<Entity> vehicle = NewNonAIVehicle(className);
     if (!vehicle)
         return false;
+    if (EarthStreaming::Enabled())
+    {
+        const auto ground = EarthStreaming::Locations().Ground();
+        if (!ground || !ground->Contains(position.X(), position.Z(), std::max(2.0f, vehicle->GetRadius())))
+            return false;
+    }
 
     EntityAI* aiVehicle = dyn_cast<EntityAI>(vehicle.GetRef());
     Matrix4 transform;
@@ -892,6 +1079,11 @@ bool SpawnZeusVehicle(const char* className, Vector3Par position, float heading)
 
 bool SpawnZeusUnit(const char* className, TargetSide side, Vector3Par position, float heading)
 {
+    if (EarthStreaming::Enabled())
+    {
+        const auto ground = EarthStreaming::Locations().Ground();
+        if (!ground || !ground->Contains(position.X(), position.Z(), 2.0f)) return false;
+    }
     AICenter* center = GWorld->GetCenter(side);
     if (!center)
         center = GWorld->CreateCenter(side);
@@ -923,7 +1115,7 @@ bool SpawnZeusUnit(const char* className, TargetSide side, Vector3Par position, 
     // initializing the soldier, which prevents invalid move/action state.
     Vector3 normal;
     Vector3 safePosition = position;
-    if (AIUnit::FindFreePosition(safePosition, normal, true, vehicle))
+    if (!EarthStreaming::Enabled() && AIUnit::FindFreePosition(safePosition, normal, true, vehicle))
     {
         float dx, dz;
         safePosition[1] = GLandscape->RoadSurfaceYAboveWater(safePosition[0], safePosition[2], &dx, &dz);
@@ -996,6 +1188,82 @@ void SpawnZeusSelection()
         spawned += didSpawn ? 1 : 0;
     }
     s_zeusStatus = "Spawned " + std::to_string(spawned) + " / " + std::to_string(count) + " " + s_zeusClassName + ".";
+}
+
+// The Tidewater boat on the sea in front of the camera (the free-fly camera, else the player): the first point
+// along the view, 12 m out or more, with 2 m of water under the whole hull, its bow pointing away.
+void SpawnTidewaterBoatAhead()
+{
+    if (!ZeusWorldAvailable())
+    {
+        s_zeusStatus = "Spawning requires a loaded world.";
+        return;
+    }
+    Object* source = s_zeusCamera ? static_cast<Object*>(s_zeusCamera) : GWorld->CameraOn();
+    Vector3 dir = source->Direction();
+    dir[1] = 0;
+    if (dir.SquareSize() < 1e-4f)
+        dir = VForward;
+    dir.Normalize();
+    const Vector3 aside(dir.Z(), 0, -dir.X());
+    const float sea = GLandscape->GetSeaLevel();
+    const auto deep = [&](Vector3Par p) { return sea - GLandscape->SurfaceY(p.X(), p.Z()) >= 2.0f; };
+    for (float d = 12.0f; d <= 400.0f; d += 4.0f)
+    {
+        Vector3 p = source->Position() + dir * d;
+        if (!deep(p) || !deep(p + dir * 5.0f) || !deep(p - dir * 5.0f) || !deep(p + aside * 2.5f) || !deep(p - aside * 2.5f))
+            continue;
+        p[1] = sea;
+        const float heading = std::atan2(dir.X(), dir.Z()) * (180.0f / H_PI);
+        const bool spawned = SpawnZeusVehicle(kTidewaterBoatClass, p, heading < 0 ? heading + 360.0f : heading);
+        char buf[160];
+        if (spawned)
+            std::snprintf(buf, sizeof(buf), "Tidewater boat placed %.0f m ahead.", d);
+        else
+            std::snprintf(buf, sizeof(buf), "Could not create %s (is @OP_TidewaterBoat installed?)", kTidewaterBoatClass);
+        s_zeusStatus = buf;
+        return;
+    }
+    s_zeusStatus = "No open sea within 400 m in front of the camera.";
+}
+
+// The humpback in front of the camera: the first point along the view, 40 m out or more, over 12 m of water (it
+// finds its own loop through the deepest water near there and surfaces to blow at once).
+void SpawnTidewaterWhaleAhead()
+{
+    if (!ZeusWorldAvailable())
+    {
+        s_zeusStatus = "Spawning requires a loaded world.";
+        return;
+    }
+    Object* source = s_zeusCamera ? static_cast<Object*>(s_zeusCamera) : GWorld->CameraOn();
+    Vector3 dir = source->Direction();
+    dir[1] = 0;
+    if (dir.SquareSize() < 1e-4f)
+        dir = VForward;
+    dir.Normalize();
+    const float sea = GLandscape->GetSeaLevel();
+    for (const float need : {12.0f, 6.0f})
+    {
+        for (float d = 40.0f; d <= 800.0f; d += 10.0f)
+        {
+            Vector3 p = source->Position() + dir * d;
+            if (sea - GLandscape->SurfaceY(p.X(), p.Z()) < need)
+                continue;
+            p[1] = sea - 5.0f;
+            const float heading = std::atan2(dir.X(), dir.Z()) * (180.0f / H_PI);
+            const bool spawned = SpawnZeusVehicle(kTidewaterWhaleClass, p, heading < 0 ? heading + 360.0f : heading);
+            char buf[160];
+            if (spawned)
+                std::snprintf(buf, sizeof(buf), "Humpback whale placed %.0f m ahead.", d);
+            else
+                std::snprintf(buf, sizeof(buf), "Could not create %s (is @OP_TidewaterWildlife installed?)",
+                              kTidewaterWhaleClass);
+            s_zeusStatus = buf;
+            return;
+        }
+    }
+    s_zeusStatus = "No deep water within 800 m in front of the camera.";
 }
 
 void SpawnZeusAtClick()
@@ -1521,11 +1789,13 @@ void DrawZeusTab()
     // Enter in the box is the same as pressing the button: pasting a pose and hitting
     // return is the whole gesture this exists for.
     const bool submitted =
-        Dev::InputTextWithHint("##zeusgoto", "paste a pose, e.g. 2721.96 944.30 99.33 306.9 -5.4", s_zeusGotoBuf,
+        Dev::InputTextWithHint("##zeusgoto", EarthStreaming::Enabled() ? "a pose (2721.96 944.30 99.33) or GPS (38.72230, -9.13934)"
+                                                                       : "paste a pose, e.g. 2721.96 944.30 99.33 306.9 -5.4", s_zeusGotoBuf,
                                sizeof(s_zeusGotoBuf), ImGuiInputTextFlags_EnterReturnsTrue);
     Dev::PanelTooltip("X Z ALTITUDE [azimuth elevation] -- the same order this panel's freefly readout prints,\n"
                       "so you can paste that line back in verbatim, brackets and labels and all.\n"
-                      "Two numbers = X and Z at head height on the terrain.");
+                      "Two numbers = X and Z at head height on the terrain.\n"
+                      "Whole World: GPS too -- 38.72230, -9.13934 [, altitude m] or 38\xC2\xB0" "43'20.3\"N 9\xC2\xB0" "08'21.6\"W.");
     if (Dev::Button("Go") || submitted)
         Defer([] { GoToZeusCoordinates(); });
     Dev::PanelSameLine();
@@ -1566,7 +1836,7 @@ void DrawZeusTab()
         }
         Dev::PanelSameLine();
         ImGui::SetNextItemWidth(140.0f);
-        ImGui::InputText("class##zeusthrow", s_zeusThrowClass, sizeof(s_zeusThrowClass));
+        Dev::InputText("class##zeusthrow", s_zeusThrowClass, sizeof(s_zeusThrowClass));
         Dev::PanelTooltip("Any CfgAmmo class name: shells, missiles, rockets, bombs, grenades, mines.");
         ImGui::SetNextItemWidth(160.0f);
         Dev::SliderFloat("Speed (m/s)", &s_zeusThrowSpeed, 1.0f, 1000.0f, "%.0f");
@@ -1610,7 +1880,7 @@ void DrawZeusTab()
             ImGui::SetNextItemWidth(140.0f);
             Dev::SliderFloat("Torch reach m", &s_headlampRange, 2.0f, 60.0f, "%.0f");
             ImGui::SetNextItemWidth(160.0f);
-            ImGui::ColorEdit3("Torch colour", s_headlampColor, ImGuiColorEditFlags_NoInputs);
+            Dev::ColorEdit3("Torch colour", s_headlampColor, ImGuiColorEditFlags_NoInputs);
         }
 
     }
@@ -1767,6 +2037,14 @@ void DrawZeusTab()
     if (ImGui::CollapsingHeader("Spawn at camera aim##zeus", ImGuiTreeNodeFlags_DefaultOpen))
     {
     ImGui::BeginDisabled(!worldAvailable);
+    if (Dev::Button("Spawn Tidewater boat ahead"))
+        Defer([] { SpawnTidewaterBoatAhead(); });
+    Dev::PanelTooltip("Tidewater's lobster boat on the sea in front of the camera (the first spot with 2 m of\n"
+                      "water under the hull, bow away from you). Get in at the helm; step out onto the deck.");
+    if (Dev::Button("Spawn humpback whale ahead"))
+        Defer([] { SpawnTidewaterWhaleAhead(); });
+    Dev::PanelTooltip("Tidewater's humpback whale in the deep water in front of the camera (12 m of water or more).\n"
+                      "It loops through the deepest water near there and comes up to blow at once.");
     if (Dev::RadioButton("Unit", s_zeusSpawnKind == 0))
     {
         s_zeusSpawnKind = 0;
@@ -3899,7 +4177,7 @@ void DrawGrassTab()
         {
             changed = true;
         }
-        if (ImGui::IsItemHovered())
+        if (Dev::PanelItemHovered())
         {
             ImGui::SetTooltip("Reforger's own ground cover is a procedural PlantMat: a blade atlas plus the\n"
                               "rectangles it picks tufts from. On, the near ring's eight blade layers are cut\n"
@@ -4188,6 +4466,30 @@ void DrawGrassTab()
         Dev::PanelHelp("Effective mix: %.0f%% grass, %.0f%% weed, %.0f%% flower. Chosen per clump (~25 m "
                        "patches), so these are area fractions, not per-blade odds.",
                        (1.0f - weed - flower) * 100.0f, weed * 100.0f, flower * 100.0f);
+    }
+    // GRS-VAR: which look each clump of a group takes.
+    changed |= Dev::Checkbox("Meadow variety", &grass.meadowVariety);
+    Dev::PanelHelp("Flower heads, weed tints and seeding grass per clump. Off = the meadow before it. "
+                   "Never applies on a native (Reforger) world. WGR_GRASS_VARIETY=0/1 overrides.");
+    if (grass.meadowVariety)
+    {
+        changed |= Dev::SliderFloat("Look drift size", &grass.lookDrift, 0.01f, 0.5f, "%.3f /m");
+        Dev::PanelHelp("Frequency of the field that groups one look into a drift: 0.09 = ~11 m patches.");
+        changed |= Dev::SliderFloat("Head share", &grass.headShare, 0.0f, 1.0f, "%.2f");
+        Dev::PanelHelp("Share of a flowering or seeding clump's blades that carry the head.");
+        changed |= Dev::SliderFloat("Head brightness", &grass.headBrightness, 0.0f, 2.0f, "%.2f");
+        if (ImGui::TreeNode("Look weights##grassVariety"))
+        {
+            static const char* const LookNames[16] = {
+                "Grass: plain",     "Grass: foxtail",   "Grass: short bent", "Grass: seeding fescue",
+                "Weed: clover",     "Weed: nettle",     "Weed: thistle",     "Weed: dock",
+                "Flower: daisy",    "Flower: poppy",    "Flower: dandelion", "Flower: cornflower",
+                "Flower: buttercup", "Flower: red clover", "Flower: yarrow",  "Flower: cranesbill"};
+            for (int i = 0; i < 16; ++i)
+                changed |= Dev::SliderFloat(LookNames[i], &grass.lookWeights[i], 0.0f, 10.0f, "%.1f");
+            Dev::PanelHelp("Relative odds inside each group. A group at all zeros keeps its plain look.");
+            ImGui::TreePop();
+        }
     }
     changed |= Dev::SliderFloat("Blade height", &grass.height, 0.10f, 3.0f, "%.2fx");
     changed |= Dev::Checkbox("Use live world wind", &grass.useLiveWind);
@@ -4871,7 +5173,7 @@ void DrawGiTab()
         const char* kBasis[] = {"Ambient cube (6 faces)", "SH-1 (worse -- see REN-GI-008)",
                                 "SH-2 (default)"};
         int basis = std::clamp(gi.basis, 0, 2);
-        if (ImGui::Combo("Probe basis", &basis, kBasis, IM_ARRAYSIZE(kBasis)))
+        if (Dev::Combo("Probe basis", &basis, kBasis, IM_ARRAYSIZE(kBasis)))
         {
             gi.basis = basis;
             changed = true;
@@ -4879,31 +5181,31 @@ void DrawGiTab()
         Dev::PanelHelp("  how each probe stores the light it gathered, and what the shading can");
         Dev::PanelHelp("  read back out of it for a given surface normal");
     }
-    changed |= ImGui::SliderFloat("Weight", &gi.weight, 0.0f, 1.0f, "%.2f");
+    changed |= Dev::SliderFloat("Weight", &gi.weight, 0.0f, 1.0f, "%.2f");
     Dev::PanelHelp("  0 = the old ambient exactly, 1 = the probes alone");
-    changed |= ImGui::SliderFloat("Interior AO share", &gi.interiorMix, 0.0f, 1.0f, "%.2f");
+    changed |= Dev::SliderFloat("Interior AO share", &gi.interiorMix, 0.0f, 1.0f, "%.2f");
     Dev::PanelHelp("  how much of the per-pixel interior-sky darkening still applies on top");
-    changed |= ImGui::SliderFloat("Indoor sky occlusion", &gi.indoorSky, 0.0f, 1.0f, "%.2f");
+    changed |= Dev::SliderFloat("Indoor sky occlusion", &gi.indoorSky, 0.0f, 1.0f, "%.2f");
     Dev::PanelHelp("  REN-GI-010. A probe's rays are tested against the terrain and, going UP,");
     Dev::PanelHelp("  against the interior-sky dome maps -- never sideways against a wall. So a");
     Dev::PanelHelp("  probe in a room took full sky from every horizontal direction and lit the");
     Dev::PanelHelp("  interior almost as brightly as the field outside. This darkens each probe");
     Dev::PanelHelp("  by how much sky it can see at its own position. 0 = the old look exactly.");
-    changed |= ImGui::SliderFloat("Spacing (m)", &gi.spacing, 1.0f, 16.0f, "%.1f");
-    changed |= ImGui::SliderInt("Rays per probe update", &gi.rays, 8, 64);
-    changed |= ImGui::SliderFloat("Hysteresis", &gi.hysteresis, 0.05f, 1.0f, "%.2f");
+    changed |= Dev::SliderFloat("Spacing (m)", &gi.spacing, 1.0f, 16.0f, "%.1f");
+    changed |= Dev::SliderInt("Rays per probe update", &gi.rays, 8, 64);
+    changed |= Dev::SliderFloat("Hysteresis", &gi.hysteresis, 0.05f, 1.0f, "%.2f");
     Dev::PanelHelp("  per-update blend toward the fresh integral; low = smoother, slower");
-    changed |= ImGui::ColorEdit3("Ground albedo", gi.groundAlbedo);
-    changed |= ImGui::SliderFloat("Ground bounce gain", &gi.groundGain, 0.0f, 4.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Wall/roof albedo", &gi.wallAlbedo, 0.0f, 1.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Ray length (m)", &gi.rayLength, 8.0f, 256.0f, "%.0f");
+    changed |= Dev::ColorEdit3("Ground albedo", gi.groundAlbedo);
+    changed |= Dev::SliderFloat("Ground bounce gain", &gi.groundGain, 0.0f, 4.0f, "%.2f");
+    changed |= Dev::SliderFloat("Wall/roof albedo", &gi.wallAlbedo, 0.0f, 1.0f, "%.2f");
+    changed |= Dev::SliderFloat("Ray length (m)", &gi.rayLength, 8.0f, 256.0f, "%.0f");
     Dev::PanelSeparator();
     Dev::PanelHelp("Sun proxy (stage 2): a map of every sunlit surface seen from the sun, with");
     Dev::PanelHelp("colour; each probe gathers the first sun bounce from a disc of it.");
-    changed |= ImGui::SliderInt("Sun-proxy samples", &gi.rsmSamples, 0, 64);
+    changed |= Dev::SliderInt("Sun-proxy samples", &gi.rsmSamples, 0, 64);
     Dev::PanelHelp("  0 turns the sun bounce off");
-    changed |= ImGui::SliderFloat("Sun-proxy radius (m)", &gi.rsmRadius, 1.0f, 40.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Sun-bounce gain", &gi.rsmGain, 0.0f, 4.0f, "%.2f");
+    changed |= Dev::SliderFloat("Sun-proxy radius (m)", &gi.rsmRadius, 1.0f, 40.0f, "%.0f");
+    changed |= Dev::SliderFloat("Sun-bounce gain", &gi.rsmGain, 0.0f, 4.0f, "%.2f");
     if (changed)
     {
         GEngine->SetGiSettings(gi);
@@ -5529,6 +5831,7 @@ void DrawRenderTab()
 // to a live frame-time readout, so the sweet spot is found by eye and measured in fps.
 void DrawTemporalTab()
 {
+    DrawOptionalReShadeControls();
     if (!GEngine)
     {
         Dev::PanelHelp("engine not up");
@@ -7415,6 +7718,13 @@ void DrawMouseTab()
 
 void DrawMainWindow()
 {
+    // NPC chat's "Compact: chat only" replaces the whole panel with its chat window until
+    // "Full dev panel" is pressed there.
+    if (Poseidon::NpcChat::CompactPanel())
+    {
+        Poseidon::NpcChat::DrawCompactPanel();
+        return;
+    }
     ImGui::SetNextWindowSize(ImVec2(560, 480), ImGuiCond_FirstUseEver);
     ImGui::Begin("Poseidon Dev Panel");
 
@@ -7472,8 +7782,14 @@ void DrawMainWindow()
         ImGui::EndPopup();
     }
 
-    if (ImGui::BeginTabBar("DevPanelTabs"))
+    if (ImGui::BeginTabBar("DevPanelTabs", ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton))
     {
+        // Index of every other tab, grouped, with one-click jumps (DevPanelHome.cpp).
+        if (Dev::PanelTabItem("Home"))
+        {
+            Poseidon::Dev::DrawHomeTab();
+            ImGui::EndTabItem();
+        }
         if (Dev::PanelTabItem("Zeus"))
         {
             DrawZeusTab();
@@ -7582,6 +7898,43 @@ void DrawMainWindow()
             if (!available) ImGui::TextWrapped("Load a single-player mission to edit terrain.");
             ImGui::EndTabItem();
         }
+        if (EarthStreaming::Enabled() && Dev::PanelTabItem("Earth"))
+        {
+            static auto location=EarthStreaming::GetLocation();
+            const auto current=EarthStreaming::GetLocation();
+            if (location.revision!=current.revision) { location=current; location.altitude=std::max(location.altitude,500.0f); }
+            ImGui::TextWrapped("Go to a geographic region without restarting. Elevation streams in after the overview; this preview does not relocate the playable mission.");
+            ImGui::TextWrapped("Resident near ground supports infantry; uncovered teleports are rejected. Geographic Go moves the camera, not the player.");
+            ImGui::TextWrapped("Cached buildings and landscape features: (c) OpenStreetMap contributors, ODbL 1.0. openstreetmap.org/copyright. Presentation prototype; no building collision or road navigation.");
+            ImGui::TextWrapped("Optional Luxembourg imagery: ACT ortho_2023, CC0 1.0. Prepared regional coverage; NASA overview elsewhere.");
+            ImGui::InputDouble("Latitude",&location.latitude,0.1,1.0,"%.6f");
+            ImGui::InputDouble("Longitude",&location.longitude,0.1,1.0,"%.6f");
+            ImGui::InputFloat("Go starting altitude (metres)",&location.altitude,500.0f,5000.0f,"%.0f");
+            ImGui::TextDisabled("Latitude -84..84; longitude -180..180; Go starts at 500..30,000,000m above datum");
+            ImGui::TextWrapped("Manual flight can descend to resident terrain +0.30m. Unknown ground retains a guarded 500m radial fallback; low flight pauses at coverage gaps.");
+            const auto go=[&](double latitude,double longitude,double altitude) {
+                Defer([latitude,longitude,altitude] {
+                    s_zeusStatus=SetEarthPreviewLocation(latitude,longitude,altitude)
+                        ? "Earth region changed; elevation is streaming."
+                        : "Earth Go rejected: check coordinates and single-player freefly.";
+                });
+            };
+            if (Dev::Button("Go##Earth")) go(location.latitude,location.longitude,location.altitude);
+            Dev::PanelSameLine();
+            if (Dev::Button("Globe##Earth")) go(current.latitude,current.longitude,18000000);
+            Dev::PanelSameLine();
+            if (Dev::Button("Luxembourg##Earth")) go(49.61,6.13,1000);
+            if (Dev::Button("Alps##Earth")) go(46.6,8.1,4500);
+            Dev::PanelSameLine();
+            if (Dev::Button("Grand Canyon##Earth")) go(36.1,-112.1,6000);
+            Dev::PanelSameLine();
+            if (Dev::Button("Dateline##Earth")) go(-16.8,179.95,12000);
+            Dev::PanelHelp("Freefly: W/S follow the view, Shift accelerates, mouse wheel changes ground clearance/altitude.");
+            ImGui::Text("Origin %.6f, %.6f; revision %llu",current.latitude,current.longitude,
+                static_cast<unsigned long long>(current.revision));
+            ImGui::TextWrapped("%s",s_zeusStatus.c_str());
+            ImGui::EndTabItem();
+        }
         // Not a diagnostic: this tab CHANGES what the AI does. See AITab.cpp.
         if (Dev::PanelTabItem("AI"))
         {
@@ -7604,7 +7957,18 @@ void DrawMainWindow()
             Poseidon::Dev::DrawWeatherTab();
             ImGui::EndTabItem();
         }
-        if (Dev::PanelTabItem("Smoke"))
+        if (Dev::PanelTabItem("Audio")) // the audio engine (Steam Audio / OpenAL) and HRTF (AudioTab.cpp)
+        {
+            Poseidon::Dev::DrawAudioTab();
+            ImGui::EndTabItem();
+        }
+        // EXPERIMENTAL: talk to / command NPCs through a language model (Dev/NpcChat).
+        if (Dev::PanelTabItem("NPC Chat"))
+        {
+            Poseidon::NpcChat::DrawTab();
+            ImGui::EndTabItem();
+        }
+        if (Dev::PanelTabItem("Particles")) // smoke, fire and the emitters (SmokeTab.cpp)
         {
             Poseidon::Dev::DrawSmokeTab();
             ImGui::EndTabItem();
@@ -7882,6 +8246,7 @@ void Shutdown()
 {
     if (!s_initialized)
         return;
+    Poseidon::NpcChat::Shutdown(); // joins the network worker; forgets in-memory API keys
     if (s_backend == RenderBackend::OpenGL3)
     {
         ImGui_ImplOpenGL3_Shutdown();
@@ -7920,7 +8285,11 @@ void ProcessEvent(const SDL_Event& event)
         // though the game remains in absolute mouse mode for Zeus editing.
         SDL_HideCursor();
     }
-    if (!s_visible && s_zeusCamera)
+    // A game menu over the free-fly view (the Esc menu: Continue / Retry / Abort, or a mission dialog) takes
+    // the clicks: Zeus took every left click for selection, so the menu could not be used without leaving free
+    // flight first (owner, 2026-10-24).
+    const bool gameMenuOpen = GWorld && (GWorld->GetOptions() || GWorld->UserDialog());
+    if (!s_visible && s_zeusCamera && !gameMenuOpen)
     {
         if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT)
         {
@@ -8043,6 +8412,22 @@ void ProcessEvent(const SDL_Event& event)
             const float deltaY = event.wheel.y * step;
             Defer([deltaY] { MoveZeusSelectionVertical(deltaY); });
         }
+        else if (event.type == SDL_EVENT_MOUSE_WHEEL && EarthStreaming::Enabled() && event.wheel.y != 0.0f)
+        {
+            s_zeusConsumeMouseEvent = true;
+            const float steps=event.wheel.direction==SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y;
+            Defer([steps] {
+                if (!s_zeusCamera) return;
+                Vector3 position=s_zeusCamera->Position();
+                const auto location = EarthStreaming::GetLocation();
+                const auto ground = EarthStreaming::Locations().Ground();
+                const auto next = EarthStreaming::ZoomFlight({position[0],position[1],position[2]}, steps,
+                    ground.get(), location.revision);
+                position = Vector3(next.x,next.y,next.z);
+                s_zeusCamera->SetPosition(position);
+                s_zeusCamera->ResetTargets();
+            });
+        }
         else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
         {
             const bool ctrlDown = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
@@ -8073,6 +8458,14 @@ void ProcessEvent(const SDL_Event& event)
         }
     }
     ImGui_ImplSDL3_ProcessEvent(&event);
+
+    // NPC chat hotkeys (open the chat box, hold to talk) work with the panel closed; while its
+    // chat box is open it owns the keyboard.
+    if (Poseidon::NpcChat::ProcessEvent(event))
+    {
+        s_zeusConsumeKeyboardEvent = true;
+        return;
+    }
 
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
     {
@@ -8206,6 +8599,7 @@ void NewFrame()
     // hands: without this the search could only ever be checked by a person.
     if (s_visible || Dev::PanelSearchPreseeded())
         DrawMainWindow();
+    Poseidon::NpcChat::DrawOverlay(s_visible);
 }
 
 void Render()
@@ -8227,12 +8621,55 @@ void Render()
         // Make sure we draw to the default framebuffer in case the engine left
         // an FBO bound — happens with post-FX in GL33.  Other state (blend,
         // scissor, vao, depth) is saved/restored inside RenderDrawData.
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // Looked up through SDL, not glad: glad's loader lives in PoseidonGL33, and tools that link
+        // Poseidon without the GL33 backend (PoseidonTools, unit tests) must still link.
+        using BindFramebufferFn = void (*)(GLenum, GLuint);
+        static const auto bindFramebuffer =
+            reinterpret_cast<BindFramebufferFn>(SDL_GL_GetProcAddress("glBindFramebuffer"));
+        if (bindFramebuffer)
+            bindFramebuffer(GL_FRAMEBUFFER, 0);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }
     else
     {
         RenderDrawDataEngine(ImGui::GetDrawData());
+    }
+
+    // Harness seed: POSEIDON_ZEUS_BOAT_AHEAD=<mission seconds> presses the Zeus tab's "Spawn Tidewater boat
+    // ahead" once, so a capture can prove the button's path without a hand on the panel.
+    {
+        static const float boatAt = []
+        {
+            const char* v = std::getenv("POSEIDON_ZEUS_BOAT_AHEAD");
+            return v && *v ? static_cast<float>(std::atof(v)) : -1.0f;
+        }();
+        static bool boatDone = false;
+        if (boatAt >= 0.0f && !boatDone && ZeusWorldAvailable() && Glob.time.toFloat() >= boatAt)
+        {
+            boatDone = true;
+            Defer([] {
+                SpawnTidewaterBoatAhead();
+                LOG_INFO(Core, "Zeus harness: {}", s_zeusStatus);
+            });
+        }
+    }
+
+    // Harness seed: POSEIDON_ZEUS_WHALE_AHEAD=<mission seconds> presses "Spawn humpback whale ahead" once.
+    {
+        static const float whaleAt = []
+        {
+            const char* v = std::getenv("POSEIDON_ZEUS_WHALE_AHEAD");
+            return v && *v ? static_cast<float>(std::atof(v)) : -1.0f;
+        }();
+        static bool whaleDone = false;
+        if (whaleAt >= 0.0f && !whaleDone && ZeusWorldAvailable() && Glob.time.toFloat() >= whaleAt)
+        {
+            whaleDone = true;
+            Defer([] {
+                SpawnTidewaterWhaleAhead();
+                LOG_INFO(Core, "Zeus harness: {}", s_zeusStatus);
+            });
+        }
     }
 
     // Drain deferred actions queued by UI click handlers.  See the
@@ -8288,6 +8725,8 @@ bool WantsKeyboard()
 {
     if (MultiplayerSession())
         return false;
+    if (s_initialized && Poseidon::NpcChat::WantsKeyboard())
+        return true;
     if (!s_initialized || (!s_visible && !s_zeusConsumeKeyboardEvent))
         return false;
     if (s_zeusConsumeKeyboardEvent)
@@ -8335,11 +8774,94 @@ bool SetFreeFlyTestPose(const char* coordinates)
     if (!coordinates || std::strlen(coordinates) >= sizeof(s_zeusGotoBuf) || pose.count != 5 ||
         !std::isfinite(pose.x) || !std::isfinite(pose.z) || !std::isfinite(pose.altitude) ||
         !std::isfinite(pose.azimuth) || !std::isfinite(pose.elevation) ||
-        std::abs(pose.x) > 1000000 || std::abs(pose.z) > 1000000 || std::abs(pose.altitude) > 1000000)
+        std::abs(pose.x) > 1000000 || std::abs(pose.z) > 1000000 ||
+        std::abs(pose.altitude) > (EarthStreaming::Enabled() ? EarthStreaming::FlightAltitudeLimit : 1000000.0f))
         return false;
     snprintf(s_zeusGotoBuf, sizeof(s_zeusGotoBuf), "%s", coordinates);
     GoToZeusCoordinates();
     return s_zeusCamera != nullptr;
+}
+
+bool SetEarthPreviewLocation(double latitude,double longitude,double altitude)
+{
+    if (!EarthStreaming::Enabled() || MultiplayerSession() || !ZeusWorldAvailable() ||
+        !EarthStreaming::ValidateLocation(latitude,longitude,altitude)) return false;
+    char pose[160];
+    // At orbital distances a slanted ground view puts the whole planet below
+    // the frame. Geographic Go and the Globe button share this transaction.
+    const double elevation=altitude>500000.0 ? -89.9 : -60.0;
+    snprintf(pose,sizeof(pose),"[%g,%g,%.9g] az 0 el %g",double(EarthStreaming::CameraAnchor),
+        double(EarthStreaming::CameraAnchor),altitude,elevation);
+    if (!SetFreeFlyTestPose(pose)) return false;
+    return EarthStreaming::Locations().Set(latitude,longitude,altitude);
+}
+
+void DisableFreeFly()
+{
+    if (s_zeusCamera) DisableZeusCamera();
+}
+
+const char* BeamPlayerHere()
+{
+    BeamPlayerToZeusCamera();
+    return s_zeusStatus.c_str();
+}
+
+bool SetEarthMoonPose(double altitude, double pitchDegrees, int surface)
+{
+    // Straight into the moon frame (EarthMoonFrame.hpp): the camera `altitude` above a selenographic
+    // point -- over the sunlit side looking at the moon, or on the near side with the sun ~15 degrees up,
+    // looking along the ground away from the sun, pitched by `pitchDegrees` (the Earth stands overhead).
+    using namespace EarthStreaming;
+    if (!Enabled() || MultiplayerSession() || !ZeusWorldAvailable() || !std::isfinite(altitude) || altitude < 1.0 ||
+        altitude > 1.0e8 || !std::isfinite(pitchDegrees))
+        return false;
+    const auto sky = Celestial().Sky();
+    D3 moon;
+    if (!MoonCentreEcef(sky, moon)) return false;
+    const auto earthFrame = EarthBasis(sky.originLatitude, sky.originLongitude);
+    const D3 s = Normalize(DirToEcef(earthFrame, sky.toSun));
+    const D3 w = Normalize(moon * -1.0); // toward the Earth
+    D3 up, look;
+    if (surface == 2)
+    {
+        up = w;
+        const D3 away = Normalize(s - up * Dot(s, up)) * -1.0;
+        const double e = pitchDegrees * H_PI / 180.0;
+        look = Normalize(away * std::cos(e) + up * std::sin(e));
+    }
+    else if (surface)
+    {
+        const D3 perp = Normalize(w - s * Dot(w, s));
+        const double a = 75.0 * H_PI / 180.0;
+        up = Normalize(s * std::cos(a) + perp * std::sin(a));
+        const D3 away = Normalize((s - up * Dot(s, up)) * -1.0);
+        const double e = pitchDegrees * H_PI / 180.0;
+        look = Normalize(away * std::cos(e) + up * std::sin(e));
+    }
+    else
+    {
+        up = Normalize(s + w);
+        look = up * -1.0;
+    }
+    double latitude = 0, longitude = 0;
+    SelenographicOf(MoonFixedAxes(moon), up, latitude, longitude);
+    Celestial().EnterMoon(latitude, longitude);
+    // The player, left standing on the Earth, would otherwise keep his Earth-frame height and fall onto
+    // the moon from it: stand him on the surface below the camera, ready to be beamed or walked about.
+    if (Person* player = GWorld ? GWorld->GetRealPlayer() : nullptr)
+    {
+        Vector3 standing(float(CameraAnchor) + 4.0f, 0.0f, float(CameraAnchor) + 4.0f);
+        if (const auto ground = QueryGround(standing.X(), standing.Z())) standing[1] = ground->height;
+        player->Move(standing);
+        player->SetSpeed(VZero);
+    }
+    const D3 l = DirToWorld(MoonBasis(moon, latitude, longitude), look);
+    char pose[192];
+    snprintf(pose, sizeof(pose), "[%g,%g,%.9g] az %.6f el %.6f", double(CameraAnchor), double(CameraAnchor), altitude,
+             std::atan2(l.x, l.z) * 180.0 / H_PI, std::asin(std::clamp(l.y, -1.0, 1.0)) * 180.0 / H_PI);
+    LOG_INFO(Core, "Earth moon pose: selenographic [{:.4f},{:.4f}] altitude {:.0f}; {}", latitude, longitude, altitude, pose);
+    return SetFreeFlyTestPose(pose);
 }
 
 } // namespace DebugOverlay

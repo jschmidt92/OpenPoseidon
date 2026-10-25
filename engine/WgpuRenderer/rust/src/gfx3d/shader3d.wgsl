@@ -5,9 +5,13 @@
 // point): the plain pipeline binds `object`, the skinned pipeline binds the
 // bone `palette` (from the skin module). Shadowing is the shared cascade kernel.
 
-#import frame::{frame, reverse_z, fog_factor, atmo_applied, terrain_sun_shadow, apply_fog, apply_fog_terrain, veg_sway_offset, gtao_ao, matdbg_view, matdbg_flag, MATDBG_VIEW_FULL, MATDBG_VIEW_BASE_COLOR, MATDBG_VIEW_NORMAL, MATDBG_VIEW_AMBIENT_SHADOW, MATDBG_VIEW_SPECULAR_GLOSS, MATDBG_VIEW_UV, MATDBG_VIEW_LIGHTING, MATDBG_DISABLE_FRESNEL_ENV}
-#import shadow::shadow_strength
-#import frame::{surface_rays, cloud_shadow_tex, terrain_shadow_samp, terrain_shadow_map}
+// naga 30 / wgpu 30: binding_array needs its enable extension (before any #import or declaration).
+enable wgpu_binding_array;
+
+#import frame::{frame, reverse_z, fog_factor, atmo_applied, terrain_sun_shadow, apply_fog, apply_layered_fog, apply_fog_terrain, veg_sway_offset, veg_sway_height, gtao_ao, matdbg_view, matdbg_flag, MATDBG_VIEW_FULL, MATDBG_VIEW_BASE_COLOR, MATDBG_VIEW_NORMAL, MATDBG_VIEW_AMBIENT_SHADOW, MATDBG_VIEW_SPECULAR_GLOSS, MATDBG_VIEW_UV, MATDBG_VIEW_LIGHTING, MATDBG_DISABLE_FRESNEL_ENV, sky_irradiance}
+#import shadow::{shadow_strength, csm_occlusion_point}
+#import snow_material::{snow_powder_albedo, snow_powder_normal, snow_surface_coverage}
+#import frame::{surface_rays, cloud_shadow_tex, terrain_shadow_samp, terrain_shadow_map, cloud_sun_shadow}
 #import frame::monitor_scene
 #import skin::{skin_pos, skin_normal}
 #import lighting::lights_contrib
@@ -15,16 +19,24 @@
 #import boot_relief::{boot_relief_height, boot_relief_normal, boot_relief_parallax, boot_relief_multiplier, boot_relief_composite}
 #import gbuffer::{oct_encode, a2c_coverage, mip_alpha_boost}
 // Shared fragment shading, also used by the GPU-driven indirect path (gpu_driven.wgsl).
-#import shading::{shade, ShadeMaterial, surface_normal, object_snow_coverage, object_snow_normal}
+#import shading::{shade, ShadeMaterial, surface_normal, object_snow_coverage, object_snow_normal, reflect_classified, reflect_class_mirrors, reflect_base_reflectance}
 #import tree_snow::{tree_snow_height, tree_snow_coverage}
 // Group(4) terrain heightmap + surface_y, shared with the shadow depth pass.
 // surface_grad tilts conformed veg normals to follow the ground slope (color pass only).
-#import conform::{surface_y, surface_grad, surface_y_raster, hm_params, snow_depth, rigid_ground_fragment, cave_daylight}
+#import conform::{surface_y, surface_grad, bare_surface_y, bare_surface_valid, surface_y_raster, hm_params, snow_depth, snow_deficit, rigid_ground_fragment, cave_daylight}
 
 // BEGIN_MUZZLE_FLASH_HELPERS (actual helper exercised by the GPU probe)
+// The warmed sheet encodes its heat in chroma (MuzzleFlashAppearance.hpp: blue/red =
+// 0.07 + 0.73*hot), so the hot core can be recovered here without a new material lane.
+// The core is HDR radiance well above the bloom knee (a real flash outshines the scene
+// by orders of magnitude, day or night); the cooler petals stay a modest orange.
+const MUZZLE_EDGE_GAIN: f32 = 1.5;
+const MUZZLE_CORE_GAIN: f32 = 16.0;
 fn stock_muzzle_flash_radiance(srgb: vec3<f32>, linear: f32) -> vec3<f32> {
     let bounded = clamp(srgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return select(bounded, srgb_to_linear(bounded) * 1.25, linear > 0.5);
+    let heat = clamp((bounded.b / max(bounded.r, 1e-4) - 0.07) / 0.73, 0.0, 1.0);
+    let gain = MUZZLE_EDGE_GAIN + (MUZZLE_CORE_GAIN - MUZZLE_EDGE_GAIN) * heat * heat;
+    return select(bounded, srgb_to_linear(bounded) * gain, linear > 0.5);
 }
 // END_MUZZLE_FLASH_HELPERS
 
@@ -97,6 +109,90 @@ fn uniform_cloth_color(rgb: vec3<f32>, encoded: f32, uv: vec2<f32>, footprint: v
 }
 // END_UNIFORM_CLOTH_HELPERS
 
+// BEGIN_VEHICLE_MUD_HELPERS
+// Mud caked on vehicles (engine Weather/MudCoat.hpp). The per-draw material's
+// light_ambient.w is the material ambient alpha (never negative) except on a
+// muddy vehicle, where it is -(1 + round(wheels*127) + body); light_diffuse.w is
+// then the world height of the vehicle's lowest point. Mud is laid on the lower
+// part of the model by height above that point -- wheels and sills first,
+// creeping up the body as `body` grows -- and broken up by noise in UV space,
+// so the patches and flecks stay put on the panels as the vehicle moves.
+fn vmud_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2<f32>(0.1031, 0.1030));
+    let r = q + dot(q, q.yx + vec2<f32>(33.33, 33.33));
+    return fract((r.x + r.y) * r.x);
+}
+
+fn vmud_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (vec2<f32>(3.0, 3.0) - 2.0 * f);
+    let a = mix(vmud_hash(i), vmud_hash(i + vec2<f32>(1.0, 0.0)), u.x);
+    let b = mix(vmud_hash(i + vec2<f32>(0.0, 1.0)), vmud_hash(i + vec2<f32>(1.0, 1.0)), u.x);
+    return mix(a, b, u.y);
+}
+
+// Height of a world point above the vehicle's lowest point, measured along the
+// vehicle's own up axis (packed as in MudCoat.hpp PackMudUp), so the mud line
+// stays on the panels when the vehicle pitches or rolls.
+fn vehicle_mud_height(world_abs: vec3<f32>, packed_up: f32, plane_d: f32) -> f32 {
+    let qx = floor(packed_up / 4096.0);
+    let qz = packed_up - qx * 4096.0;
+    let ux = qx / 4095.0 * 2.0 - 1.0;
+    let uz = qz / 4095.0 * 2.0 - 1.0;
+    let up = vec3<f32>(ux, sqrt(max(0.0, 1.0 - ux * ux - uz * uz)), uz);
+    return dot(world_abs, up) - plane_d;
+}
+
+// x = mud cover 0..1, y = how fresh/wet that mud is 0..1. h: vehicle_mud_height.
+fn vehicle_mud_cover(encoded: f32, h: f32, uv: vec2<f32>, normal: vec3<f32>,
+                     footprint: vec2<f32>) -> vec2<f32> {
+    if (!(encoded <= -1.0)) { return vec2<f32>(0.0, 0.0); }
+    let t = -encoded - 1.0;
+    let whole = floor(t + 0.0001);
+    let wheels = clamp(whole / 127.0, 0.0, 1.0);
+    let body = clamp(t - whole, 0.0, 1.0);
+    // Fine detail fades where one pixel covers a lot of texture (distant or grazing).
+    let detail = 1.0 - smoothstep(0.003, 0.012, max(footprint.x, footprint.y));
+    let n1 = vmud_noise(uv * 18.0);
+    let n2 = vmud_noise(uv * 70.0 + vec2<f32>(17.3, 5.1));
+    let n = mix(n1, n1 * 0.6 + n2 * 0.4, detail);
+    let jitter = (n - 0.5) * 0.45;
+    // Wheels turn, so a tyre is caked all the way round, not only below its hub:
+    // the wheel band reaches past the top of a truck tyre (~1.1 m) at full strength,
+    // taking the frame rails and other low parts along with it.
+    let low = wheels * (1.0 - smoothstep(1.35, 1.75, h + jitter * 0.5));
+    let reach = mix(0.8, 2.3, body);
+    let high = body * (1.0 - smoothstep(reach * 0.55, reach, h + jitter));
+    // On the body, faces pointing down or sideways catch the spray; tops collect less.
+    // Not in the wheel band: a turning tyre's tread faces every way in turn.
+    let facing = 1.0 - 0.45 * clamp(normal.y, 0.0, 1.0);
+    // Below the top of the tyres the wheel coat decides (it is never lower than
+    // the body coat while mud builds up), so a wheel-deep ford visibly washes the
+    // tyres and frame while the mud higher up stays.
+    let above_wheels = smoothstep(1.25, 1.6, h + jitter * 0.5);
+    let amount = mix(low, max(low, high * facing), above_wheels);
+    // Soft, partial coverage (thin smears blend into the paint); the hard-edged
+    // patch threshold tried in step 20 read as plastic in game.
+    var cover = clamp(amount * 1.35 - (1.0 - n) * 0.55, 0.0, 1.0);
+    // Flecks flung higher than the coat itself.
+    let fleck = step(0.8, vmud_noise(uv * 140.0 + vec2<f32>(3.7, 9.2))) * detail
+              * (1.0 - smoothstep(reach, reach * 1.6, h))
+              * mix(wheels * 0.5, max(body, wheels * 0.5), above_wheels);
+    cover = max(cover, fleck * 0.85);
+    // Low down it stays wet and dark; higher splashes dry lighter.
+    let wet = clamp(1.0 - h / max(reach, 0.5), 0.0, 1.0);
+    return vec2<f32>(cover, wet);
+}
+
+fn vehicle_mud_albedo(uv: vec2<f32>, wet: f32) -> vec3<f32> {
+    let v = vmud_noise(uv * 31.0 + vec2<f32>(1.3, 7.1));
+    let wet_mud = vec3<f32>(0.17, 0.12, 0.08);
+    let dry_mud = vec3<f32>(0.40, 0.33, 0.24);
+    return mix(dry_mud, wet_mud, clamp(wet * 0.8 + v * 0.3, 0.0, 1.0)) * (0.85 + 0.3 * v);
+}
+// END_VEHICLE_MUD_HELPERS
+
 struct Object {
     world: mat4x4<f32>,
     // Terrain-conform plane, published per instance by the CPU (ForestPlain).
@@ -128,6 +224,9 @@ struct Material {
     // w retains the small BITFIELD (see MATFLAG_* below), not a bool.
     normal_map: vec4<f32>,
     local_specular: vec4<f32>, // w = admitted uniform wetness/mask category (0..1, 2..3, 4..5)
+    // REFLECT-001 (ReflectMaterial.hpp). All zero = not classified, nothing below reads it.
+    reflect0: vec4<f32>, // roughness, F0, metal, clear coat
+    reflect1: vec4<f32>, // class id, clear-coat roughness, source id, debug view (0 = off)
 };
 
 // Material.normal_map.w bits.
@@ -142,6 +241,9 @@ const MATFLAG_NIGHT_EMITTER: u32 = 4u;
 // otherwise vanish from the pilot seat. 0.18 is the retail tint's own average (46/255).
 const MATFLAG_GLASS: u32 = 8u;
 const GLASS_MIN_ALPHA: f32 = 0.18;
+// RFG-164: the Fresnel curve of Reforger's window_glass.emat (FresnelBias, FresnelPower).
+const GLASS_FRESNEL_BIAS: f32 = 0.05;
+const GLASS_FRESNEL_POWER: f32 = 1.333;
 // MAT-052 second half (WGR_DRAW3D_COCKPIT): a first-person cockpit draw. shade() takes the
 // FLAT scene ambient for these instead of the sky-dome irradiance -- an interior plate lit
 // by the full outdoor sky washes to near-sky brightness and reads as a TRANSPARENT cockpit
@@ -151,11 +253,101 @@ const MATFLAG_COCKPIT: u32 = 16u;
 const MATFLAG_NORMAL_RG: u32 = 128u;
 const MATFLAG_SNOW_RECEIVER: u32 = 2048u;
 const MATFLAG_GROUND_RECEIVER: u32 = 4096u;
+// RFG-129: WGR_DRAW3D_BLEND_SECTION -- a back-to-front section not on a surface; see mod.rs.
+const MATFLAG_BLEND_SECTION: u32 = 8192u;
 const MATFLAG_BOOT_RELIEF: u32 = 16384u;
+const MATFLAG_EARTH_SURFACE: u32 = 32768u;
 
 fn material_flags(m: Material) -> u32 {
     return u32(m.normal_map.w + 0.5);
 }
+
+// BEGIN_EARTH_GROUND_DETAIL_HELPERS
+// Matched inverse chart: EarthSurfaceStream::NearPoint. The analytic gradient
+// keeps the existing trilinear/anisotropic sampler's true pixel footprint.
+fn earth_near_uv(uv: vec2<f32>) -> vec4<f32> {
+    let q = 2.0 * uv - vec2<f32>(1.0);
+    let denominator = vec2<f32>(0.25) + 0.75 * abs(q);
+    return vec4<f32>(vec2<f32>(0.5) + 0.5 * q / denominator,
+                     vec2<f32>(0.25) / (denominator * denominator));
+}
+// Three fixed world-metre bands, 24 bounded integer corner hashes total.
+// High ECEF lattice coordinates stay separate from small local coordinates so
+// neither Earth-sized float cancellation nor camera motion drives the grain.
+fn earth_ground_hash(cell: vec3<i32>) -> f32 {
+    let bits = bitcast<vec3<u32>>(cell);
+    var h = (bits.x * 1597334677u) ^ (bits.y * 3812015801u) ^ (bits.z * 2798796415u);
+    h = (h ^ (h >> 16u)) * 2246822519u;
+    h = (h ^ (h >> 13u)) * 3266489917u;
+    return f32((h ^ (h >> 16u)) & 65535u) / 65535.0;
+}
+
+fn earth_ground_noise(high: vec3<f32>, low: vec3<f32>, frequency: f32) -> vec4<f32> {
+    let p = low * frequency;
+    let cell = vec3<i32>(high * frequency) + vec3<i32>(floor(p));
+    let f = fract(p);
+    let s = f * f * (vec3<f32>(3.0) - 2.0 * f);
+    let ds = 6.0 * f * (vec3<f32>(1.0) - f);
+    var value = 0.0;
+    var gradient = vec3<f32>(0.0);
+    for (var z = 0; z < 2; z++) {
+        for (var y = 0; y < 2; y++) {
+            for (var x = 0; x < 2; x++) {
+                let corner = earth_ground_hash(cell + vec3<i32>(x,y,z));
+                let w = select(vec3<f32>(1.0) - s, s, vec3<bool>(x == 1,y == 1,z == 1));
+                let dw = select(-ds, ds, vec3<bool>(x == 1,y == 1,z == 1));
+                value += corner * w.x * w.y * w.z;
+                gradient += corner * vec3<f32>(dw.x * w.y * w.z, w.x * dw.y * w.z, w.x * w.y * dw.z);
+            }
+        }
+    }
+    return vec4<f32>(value, gradient * frequency);
+}
+
+fn earth_ground_band(footprint: f32, frequency: f32, distance: f32) -> f32 {
+    return (1.0 - smoothstep(0.12, 0.5, footprint * frequency)) *
+        (1.0 - smoothstep(25.0, 180.0, distance));
+}
+
+struct EarthGroundDetailSample { normal: vec3<f32>, reflectance: f32, };
+fn earth_ground_detail(absolute: vec3<f32>, normal: vec3<f32>, footprint: f32, distance: f32,
+                       high: vec3<f32>, low: vec3<f32>) -> EarthGroundDetailSample {
+    var result: EarthGroundDetailSample;
+    result.normal = normal;
+    result.reflectance = 1.0;
+    if (distance >= 180.0) { return result; }
+    let up = normalize(high + low);
+    let east = normalize(vec3<f32>(-up.z, 0.0, up.x));
+    let north = cross(east, up);
+    let local = absolute - vec3<f32>(6400.0,0.0,6400.0);
+    let p = low + east * local.x + up * local.y + north * local.z;
+    let coarse = earth_ground_noise(high, p, 0.125);
+    let middle = earth_ground_noise(high, p, 1.0);
+    let fine = earth_ground_noise(high, p, 8.0);
+    let weights = vec3<f32>(earth_ground_band(footprint,0.125,distance),
+        earth_ground_band(footprint,1.0,distance),earth_ground_band(footprint,8.0,distance));
+    result.reflectance = 1.0 + dot((vec3<f32>(coarse.x,middle.x,fine.x) * 2.0 - vec3<f32>(1.0)) * weights,
+        vec3<f32>(0.12,0.09,0.04));
+    let gradient = coarse.yzw * (0.12 * weights.x) + middle.yzw * (0.035 * weights.y) + fine.yzw * (0.004 * weights.z);
+    let local_gradient = vec3<f32>(dot(gradient,east),dot(gradient,up),dot(gradient,north));
+    result.normal = normalize(normal - (local_gradient - normal * dot(local_gradient,normal)));
+    return result;
+}
+// Sunlight transmittance down to a point of the globe whose local sun height (cosine of the
+// zenith angle) is `mu`: the Rayleigh, Mie and ozone columns of the sky's default atmosphere
+// (Engine::SkySettings), each along a Chapman-like air mass that is 1/mu overhead and finite
+// (~sqrt(pi R / 2H)) on the horizon. A few exps, evaluated only for the Earth surface.
+fn earth_air_mass(mu: f32, horizon: f32) -> f32 {
+    return 1.0 / max(mu + exp(-max(mu, -0.05) * horizon * 0.6) / horizon, 1e-3);
+}
+fn earth_sun_transmittance(mu: f32, altitude: f32) -> vec3<f32> {
+    let h = max(altitude, 0.0);
+    let rayleigh = vec3<f32>(5.8e-6, 13.5e-6, 33.1e-6) * 8000.0 * exp(-h / 8000.0) * earth_air_mass(mu, 35.4);
+    let mie = 6.0e-6 * 1.11 * 1200.0 * exp(-h / 1200.0) * earth_air_mass(mu, 91.0);
+    let ozone = vec3<f32>(0.650e-6, 1.881e-6, 0.085e-6) * 25000.0 * earth_air_mass(mu, 9.0);
+    return exp(-(rayleigh + vec3<f32>(mie) + ozone));
+}
+// END_EARTH_GROUND_DETAIL_HELPERS
 
 // Per-draw world matrix + material as read-only storage arrays, indexed by
 // @builtin(instance_index) (fed as the draw's base_instance). One upload per
@@ -180,6 +372,19 @@ fn material_flags(m: Material) -> u32 {
 // See gpu_driven.wgsl's copy of this for the full argument; the constants must agree with it
 // and with mip_feedback.rs.
 @group(1) @binding(4) var<storage, read_write> mip_feedback: array<atomic<u32>>;
+
+// REFLECT-001 phase E -- screen-space reflections (gfx3d/reflect_ssr.rs). The previous frame's
+// lit HDR image, THIS frame's linear view-Z (GTAO's chain, mip 0, metres), and the matrix that
+// takes a point relative to this frame's camera into the previous frame's clip space.
+struct SsrParams {
+    reproj: mat4x4<f32>,
+    misc: vec4<f32>, // x = enabled, y/z = prev-colour size, w = max march distance (m)
+    tune: vec4<f32>, // x = normal-map share of the reflected direction, y = top mip of prev colour
+};
+@group(1) @binding(5) var ssr_prev_color: texture_2d<f32>;
+@group(1) @binding(6) var ssr_depth: texture_2d<f32>;
+@group(1) @binding(7) var ssr_samp: sampler;
+@group(1) @binding(8) var<uniform> ssr: SsrParams;
 
 const MIPFB_HEADER_WORDS: u32 = 8u;
 const MIPFB_CODE_BASE: u32 = 16u;
@@ -314,6 +519,479 @@ fn env_reflection(shaded: vec3<f32>, normal: vec3<f32>, world_pos: vec3<f32>, fo
 @group(2) @binding(0) var textures: binding_array<texture_2d<f32>>;
 @group(3) @binding(0) var samplers: binding_array<sampler, 8>;
 
+#ifdef WHOLE_WORLD
+// --- (OP) Whole world imagery as a tile pyramid (EarthTileCache.hpp, POSEIDON_EARTH_TILES=1) ---------------
+// The atlas (bound as the draw's texture): 30 x 30 slots of 272 texels, a 256 tile in each with an 8-texel
+// border of its own edge. The lookup table (the specular-map slot, reflect1.z): per zoom level a row with
+// the 16x16 window's origin tile, then 16 rows of entries (slot in r + 256 g, a = 1 when loaded).
+const ET_ATLAS: f32 = 8192.0;
+const ET_SLOT: f32 = 272.0;
+const ET_BORDER: f32 = 8.0;
+const ET_PER_ROW: i32 = 30;
+const ET_WINDOW: i32 = 16;
+const ET_ROWS: i32 = 17;
+const ET_NIGHT_BASE: i32 = 772; // EarthTileCache::NightBase: Black Marble zoom 3, 8 x 8 tiles
+const ET_NIGHT_FINE: i32 = 836; // EarthTileCache::NightFineBase: zoom 6, an 8 x 8 window, slot (y % 8) * 8 + x % 8
+const ET_NIGHT_ROW: i32 = 340;  // EarthTileCache::NightFineRow: per fine slot the tile it holds (r = x, g = y)
+fn et_u24(c: vec4<f32>) -> i32 {
+    let b = vec3<i32>(round(c.rgb * 255.0));
+    return b.x + b.y * 256 + b.z * 65536;
+}
+// The finest LOADED tile under the point (ref19 + off19, zoom-19 tile units), at most as fine as one texel a
+// pixel: the zoom from the ground footprint, then down to the nearest ancestor in the atlas -- ground that
+// was on screen never drops while a finer tile loads. sRGB rgb; a = 0 when nothing at all is loaded.
+// City lights on the night side (EarthTileCache night slots), at web-mercator position `merc` in [0, 1):
+// the zoom-6 window where it holds the tile and is fine enough to matter, else zoom 3. Linear out.
+fn earth_night_sample(atlas: u32, samp: u32, slot: i32, f: vec2<f32>, lod: f32) -> vec3<f32> {
+    let corner = vec2<f32>(f32(slot % ET_PER_ROW), f32(slot / ET_PER_ROW)) * ET_SLOT + ET_BORDER;
+    let uv = (corner + clamp(f, vec2<f32>(0.002), vec2<f32>(0.998)) * 256.0) / ET_ATLAS;
+    return srgb_to_linear(textureSampleLevel(textures[atlas], samplers[samp], uv, lod).rgb);
+}
+fn earth_night_lights(atlas: u32, samp: u32, lut: u32, merc: vec2<f32>, footprint: f32) -> vec3<f32> {
+    let m = clamp(merc, vec2<f32>(0.0), vec2<f32>(0.999999));
+    let texel3 = 19567.88 / cosh(3.14159265 * (1.0 - 2.0 * m.y)); // one zoom-3 texel here, metres
+    var c = vec3<f32>(-1.0);
+    if (footprint < texel3 * 0.5) {
+        let t = m * 64.0;
+        let tile = vec2<i32>(floor(t));
+        let s = (tile.y % 8) * 8 + tile.x % 8;
+        let e = textureLoad(textures[lut], vec2<i32>(s % ET_WINDOW, ET_NIGHT_ROW + s / ET_WINDOW), 0);
+        if (e.a > 0.5 && i32(round(e.r * 255.0)) == tile.x && i32(round(e.g * 255.0)) == tile.y) {
+            let lod = clamp(log2(max(footprint / (texel3 * 0.125), 1.0e-4)), 0.0, 2.0);
+            c = earth_night_sample(atlas, samp, ET_NIGHT_FINE + s, fract(t), lod);
+        }
+    }
+    if (c.x < 0.0) {
+        let t = m * 8.0;
+        let tile = vec2<i32>(floor(t));
+        let lod = clamp(log2(max(footprint / texel3, 1.0e-4)), 0.0, 2.0);
+        c = earth_night_sample(atlas, samp, ET_NIGHT_BASE + tile.y * 8 + tile.x, fract(t), lod);
+    }
+    // The composite carries moonlit land, sea and snow under the lights, navy to blue-grey (red/blue ~0.2-0.35
+    // in linear); lights are warm or white (>= 1). A ratio, so it holds through the mips, where a threshold on
+    // brightness lost every averaged-down town on the far globe.
+    return c * smoothstep(0.5, 0.9, c.r / max(c.b, 1.0e-4));
+}
+
+fn earth_tile_albedo(atlas: u32, samp: u32, lut: u32, ref19: vec2<f32>, off19: vec2<f32>, footprint: f32) -> vec4<f32> {
+    let y01 = (ref19.y + off19.y) / 524288.0;
+    let lat = atan(sinh(3.14159265 * (1.0 - 2.0 * y01)));
+    let metres = 156543.03392 * max(cos(lat), 0.01); // one texel of zoom 0
+    var level = i32(clamp(ceil(log2(metres / max(footprint, 0.01))), 0.0, 19.0));
+    loop {
+        if (level < 0) { break; }
+        let s = exp2(f32(19 - level));
+        let rf = floor(ref19 / s);
+        let local = (ref19 - rf * s) / s + off19 / s;
+        let tile = rf + floor(local);
+        let in_tile = fract(local);
+        let n = i32(1u << u32(level));
+        let ty = i32(tile.y);
+        if (ty >= 0 && ty < n) {
+            let tx = ((i32(tile.x) % n) + n) % n;
+            let row = level * ET_ROWS;
+            let ox = et_u24(textureLoad(textures[lut], vec2<i32>(0, row), 0));
+            let oy = et_u24(textureLoad(textures[lut], vec2<i32>(1, row), 0));
+            let dx = ((tx - ox) % n + n) % n;
+            let dy = ty - oy;
+            if (dx < ET_WINDOW && dy >= 0 && dy < ET_WINDOW) {
+                let e = textureLoad(textures[lut], vec2<i32>(dx, row + 1 + dy), 0);
+                if (e.a > 0.5) {
+                    let slot = i32(round(e.r * 255.0)) + i32(round(e.g * 255.0)) * 256;
+                    let corner = vec2<f32>(f32(slot % ET_PER_ROW), f32(slot / ET_PER_ROW)) * ET_SLOT + ET_BORDER;
+                    let uv = (corner + in_tile * 256.0) / ET_ATLAS;
+                    let lod = clamp(log2(max(footprint / (metres / exp2(f32(level))), 1.0e-4)), 0.0, 2.0);
+                    return vec4<f32>(textureSampleLevel(textures[atlas], samplers[samp], uv, lod).rgb, 1.0);
+                }
+            }
+        }
+        level = level - 1;
+    }
+    return vec4<f32>(0.0);
+}
+#endif
+
+#ifdef WHOLE_WORLD
+// --- (OP) Whole world ground from the elevation pyramid (docs/earth-elevation-pyramid.md) ---------------------------
+// EarthHeightCache's atlas (256 x 256 slots, Terrarium-encoded RGBA8) and lookup (per zoom a 16 x 16 window, as the
+// imagery's), at group 4 beside the terrain heightmap. Read in the vertex stage only (conform mode 3).
+@group(4) @binding(4) var earth_heights: texture_2d<f32>;
+@group(4) @binding(5) var earth_height_lut: texture_2d<f32>;
+// The terrain sun shadow (gfx3d/earth_shadow.rs): two cascades side by side, each texel the height a point must be
+// above to see the sun; and their placement: c0, c1 = (world x, z of the corner, texel metres, samples a side),
+// info = (tan sun elevation, 1 when valid, ...).
+struct EarthShadowPlace {
+    c0: vec4<f32>,
+    c1: vec4<f32>,
+    info: vec4<f32>,
+};
+@group(4) @binding(6) var earth_shadow_map: texture_2d<f32>;
+@group(4) @binding(7) var<uniform> earth_shadow_place: EarthShadowPlace;
+const EH_PER_ROW: i32 = 16;  // EarthHeightCache::SlotsPerRow
+const EH_ROWS: i32 = 17;     // EarthHeightCache::LookupRowsPerLevel
+const EH_MAX_LEVEL: i32 = 15;
+const EH_RADIUS: f32 = 6378137.0;
+const EH_ANCHOR: f32 = 6400.0;
+// metres a texel may span per metre of distance: 5 m at 1 km (finer than the node grid there: a node 1 km away
+// is 330-660 m wide, 10-20 m between vertices). EarthGroundNodes' Detail.
+const EH_DETAIL: f32 = 0.005;
+
+fn eh_u24(c: vec4<f32>) -> i32 {
+    return i32(round(c.r * 255.0)) + i32(round(c.g * 255.0)) * 256 + i32(round(c.b * 255.0)) * 65536;
+}
+// The atlas slot of tile (level, tx, ty), or -1 when it is not resident.
+fn eh_slot(level: i32, tx: i32, ty: i32) -> i32 {
+    let n = 1 << u32(level);
+    if (ty < 0 || ty >= n) { return -1; }
+    let x = ((tx % n) + n) % n;
+    let row = level * EH_ROWS;
+    let ox = eh_u24(textureLoad(earth_height_lut, vec2<i32>(0, row), 0));
+    let oy = eh_u24(textureLoad(earth_height_lut, vec2<i32>(1, row), 0));
+    let dx = ((x - ox) % n + n) % n;
+    let dy = ty - oy;
+    if (dx >= 16 || dy < 0 || dy >= 16) { return -1; }
+    let e = textureLoad(earth_height_lut, vec2<i32>(dx, row + 1 + dy), 0);
+    if (e.a < 0.5) { return -1; }
+    return eh_u24(e);
+}
+// A Terrarium-encoded texel's height (m).
+fn eh_decode(c: vec4<f32>) -> f32 {
+    return round(c.r * 255.0) * 256.0 + round(c.g * 255.0) + round(c.b * 255.0) / 256.0 - 32768.0;
+}
+// One texel (lx, ly may step one past the tile's edge into its neighbour): (height, 1) or (0, 0) when not resident.
+fn eh_texel(level: i32, tx: i32, ty: i32, lx: i32, ly: i32) -> vec2<f32> {
+    var x = tx;
+    var y = ty;
+    var px = lx;
+    var py = ly;
+    if (px < 0) { x = x - 1; px = px + 256; } else if (px > 255) { x = x + 1; px = px - 256; }
+    if (py < 0) { y = y - 1; py = py + 256; } else if (py > 255) { y = y + 1; py = py - 256; }
+    let slot = eh_slot(level, x, y);
+    if (slot < 0) { return vec2<f32>(0.0, 0.0); }
+    let c = textureLoad(earth_heights, vec2<i32>((slot % EH_PER_ROW) * 256 + px, (slot / EH_PER_ROW) * 256 + py), 0);
+    return vec2<f32>(eh_decode(c), 1.0);
+}
+struct EhPoint {
+    tile: vec2<i32>,
+    local: vec2<f32>, // texels, [0, 256)
+};
+// A point of node (nz, nx, ny) at its (u, v) as a tile of zoom `level` and a place in it, without losing precision.
+fn eh_point(level: i32, nz: i32, nx: i32, ny: i32, uv: vec2<f32>) -> EhPoint {
+    if (level <= nz) {
+        let s = u32(nz - level);
+        let mask = (1 << s) - 1;
+        return EhPoint(vec2<i32>(nx >> s, ny >> s),
+                       (vec2<f32>(f32(nx & mask), f32(ny & mask)) + uv) / f32(1 << s) * 256.0);
+    }
+    let s = u32(level - nz);
+    let scaled = uv * f32(1 << s);
+    let whole = floor(scaled);
+    return EhPoint(vec2<i32>(nx << s, ny << s) + vec2<i32>(whole), (scaled - whole) * 256.0);
+}
+// The bilinear patch of four texels at (t.x, t.y): (height, its slope per texel east, per texel south).
+fn eh_bilinear(a: f32, b: f32, c: f32, d: f32, t: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(mix(mix(a, b, t.x), mix(c, d, t.x), t.y), mix(b - a, d - c, t.y), mix(c - a, d - b, t.x));
+}
+// Bilinear height at zoom `level` and its slope: (height, slope per texel east, per texel south, 1), or zeros when a
+// texel is not resident.
+fn eh_height_level(level: i32, nz: i32, nx: i32, ny: i32, uv: vec2<f32>) -> vec4<f32> {
+    let p = eh_point(level, nz, nx, ny, uv);
+    let q = p.local - 0.5;
+    let i = floor(q);
+    let t = q - i;
+    let ix = i32(i.x);
+    let iy = i32(i.y);
+    if (ix >= 0 && ix < 255 && iy >= 0 && iy < 255) {
+        // all four in this tile (every sample but the tile's edge rows): its slot once, not per texel
+        let slot = eh_slot(level, p.tile.x, p.tile.y);
+        if (slot < 0) { return vec4<f32>(0.0); }
+        let o = vec2<i32>((slot % EH_PER_ROW) * 256 + ix, (slot / EH_PER_ROW) * 256 + iy);
+        let ta = eh_decode(textureLoad(earth_heights, o, 0));
+        let tb = eh_decode(textureLoad(earth_heights, o + vec2<i32>(1, 0), 0));
+        let tc = eh_decode(textureLoad(earth_heights, o + vec2<i32>(0, 1), 0));
+        let td = eh_decode(textureLoad(earth_heights, o + vec2<i32>(1, 1), 0));
+        return vec4<f32>(eh_bilinear(ta, tb, tc, td, t), 1.0);
+    }
+    let a = eh_texel(level, p.tile.x, p.tile.y, ix, iy);
+    let b = eh_texel(level, p.tile.x, p.tile.y, ix + 1, iy);
+    let c = eh_texel(level, p.tile.x, p.tile.y, ix, iy + 1);
+    let d = eh_texel(level, p.tile.x, p.tile.y, ix + 1, iy + 1);
+    if (a.y * b.y * c.y * d.y < 0.5) { return vec4<f32>(0.0); }
+    return vec4<f32>(eh_bilinear(a.x, b.x, c.x, d.x, t), 1.0);
+}
+// The height at a point, from the zoom its distance asks for (blended with the next finer one, so the height is a
+// continuous function of place and camera and neighbouring nodes agree on their shared edge), falling back to the
+// nearest resident ancestor.
+fn eh_height(level_f: f32, nz: i32, nx: i32, ny: i32, uv: vec2<f32>, cos_lat: f32) -> vec3<f32> {
+    // returns (height, its slope east, its slope north), the slopes in metres a metre
+    let texel0 = 40075016.0 * max(cos_lat, 1e-4) / 256.0; // metres a texel at zoom 0
+    let l0 = i32(floor(level_f));
+    var h = vec3<f32>(0.0);
+    var found = false;
+    for (var l = l0; l >= 0; l = l - 1) {
+        let r = eh_height_level(l, nz, nx, ny, uv);
+        if (r.w > 0.5) {
+            h = vec3<f32>(r.x, vec2<f32>(r.y, -r.z) * (f32(1 << u32(l)) / texel0));
+            found = true;
+            break;
+        }
+    }
+    let t = level_f - f32(l0);
+    if (found && t > 0.001 && l0 + 1 <= EH_MAX_LEVEL) {
+        let r = eh_height_level(l0 + 1, nz, nx, ny, uv);
+        if (r.w > 0.5) {
+            h = mix(h, vec3<f32>(r.x, vec2<f32>(r.y, -r.z) * (f32(1 << u32(l0 + 1)) / texel0)), t);
+        }
+    }
+    return h;
+}
+// Node of the mercator quadtree (conform mode 3), as EngineWgpu::SubmitEarthNode packs it:
+// conform0 = (latitude of its north edge - origin latitude, its north Gudermannian Y, its Y span, west longitude -
+// origin longitude), conform1 = (longitude span, sin(origin latitude), morph start, morph end) -- radians and
+// metres -- conform2 = (x, y as bits, 3 = mode, zoom).
+struct EarthNode {
+    dp_north: f32, y_north: f32, d_y: f32, dl_west: f32, d_lon: f32, sin_p0: f32, cos_p0: f32,
+    nz: i32, nx: i32, ny: i32,
+};
+fn earth_node(obj: Object) -> EarthNode {
+    let sp = obj.conform1.y;
+    return EarthNode(obj.conform0.x, obj.conform0.y, obj.conform0.z, obj.conform0.w, obj.conform1.x, sp,
+                     sqrt(max(1.0 - sp * sp, 0.0)), i32(round(obj.conform2.w)),
+                     bitcast<i32>(obj.conform2.x), bitcast<i32>(obj.conform2.y));
+}
+// The ground point of node `n` at (u, v), height `h` above the sea datum, camera-relative, in the origin's
+// tangent-plane frame (EarthFrame.hpp ToLocal; the y is the height less the curvature drop, as the patch meshes
+// were). From differences only -- the latitude's by the Gudermannian difference, the longitude's by haversines --
+// so a point near the camera is exact to millimetres in f32. Also returns cos(latitude) in .w.
+fn earth_node_point(n: EarthNode, uv: vec2<f32>, h: f32) -> vec4<f32> {
+    let dyv = -uv.y * n.d_y;
+    let num = 2.0 * cosh(n.y_north + dyv * 0.5) * sinh(dyv * 0.5);
+    let den = 1.0 + sinh(n.y_north + dyv) * sinh(n.y_north);
+    let dp = n.dp_north + atan2(num, den);
+    let dl = n.dl_west + uv.x * n.d_lon;
+    let cp = n.cos_p0 * cos(dp) - n.sin_p0 * sin(dp);
+    let sh = sin(dl * 0.5);
+    let hav = 2.0 * sh * sh;
+    let sq = sin(dp * 0.5);
+    let east = cp * sin(dl);
+    let north = sin(dp) + n.sin_p0 * cp * hav;
+    let drop = 2.0 * sq * sq + n.cos_p0 * cp * hav;
+    let world = vec3<f32>(EH_ANCHOR + EH_RADIUS * east, h - EH_RADIUS * drop, EH_ANCHOR + EH_RADIUS * north);
+    return vec4<f32>(world - frame.cam_pos.xyz, cp);
+}
+// How much of the sun reaches the Earth ground at world point p [0, 1]: from the finer cascade where p is inside
+// it (with a margin to blend), else the coarser, else 1. The edge is softened over about a texel of rise.
+fn earth_shadow_cascade(c: vec4<f32>, offset: f32, p: vec3<f32>, band_texel: f32) -> f32 {
+    let t = (p.xz - c.xy) / c.z - 0.5;
+    let base = floor(t);
+    let f = t - base;
+    let n = i32(c.w);
+    let i = clamp(vec2<i32>(base), vec2<i32>(0), vec2<i32>(n - 2));
+    let o = vec2<i32>(i32(offset), 0);
+    let a = textureLoad(earth_shadow_map, o + i, 0).x;
+    let b = textureLoad(earth_shadow_map, o + i + vec2<i32>(1, 0), 0).x;
+    let cc = textureLoad(earth_shadow_map, o + i + vec2<i32>(0, 1), 0).x;
+    let d = textureLoad(earth_shadow_map, o + i + vec2<i32>(1, 1), 0).x;
+    let threshold = mix(mix(a, b, f.x), mix(cc, d, f.x), f.y);
+    // a texel of rise (at this sun) of bias, so the threshold's own coarseness never shades a lit slope, and as
+    // much again of soft edge (band_texel: the texel that is measured in, see earth_terrain_lit)
+    let band = band_texel * (0.5 + earth_shadow_place.info.x) + 2.0;
+    return smoothstep(threshold - band, threshold + band, p.y + band);
+}
+fn earth_terrain_lit(p: vec3<f32>) -> f32 {
+    if (earth_shadow_place.info.y < 0.5) { return 1.0; }
+    let c0 = earth_shadow_place.c0;
+    let c1 = earth_shadow_place.c1;
+    let in0 = min(min(p.x - c0.x, p.z - c0.y), min(c0.x + c0.z * c0.w - p.x, c0.y + c0.z * c0.w - p.z));
+    let in1 = min(min(p.x - c1.x, p.z - c1.y), min(c1.x + c1.z * c1.w - p.x, c1.y + c1.z * c1.w - p.z));
+    if (in1 <= c1.z) { return 1.0; }
+    // Near the fine cascade the coarse one's bias and soft edge narrow toward the fine one's (from its own 128 m
+    // texel 2 km out to two fine texels at the edge), and the two blend over 2 km: with each keeping its own, the
+    // coarse shadows stood smaller and softer, a faint seam 4 km from the camera (2026-10-25).
+    let coarse_band = mix(2.0 * c0.z, c1.z, smoothstep(0.0, 2000.0, -in0));
+    let far = mix(1.0, earth_shadow_cascade(c1, c1.w, p, coarse_band), smoothstep(c1.z, 8.0 * c1.z, in1));
+    if (in0 <= c0.z) { return far; }
+    return mix(far, earth_shadow_cascade(c0, 0.0, p, c0.z), smoothstep(c0.z, 128.0 * c0.z, in0));
+}
+fn earth_node_level(dist: f32, cos_lat: f32) -> f32 {
+    return clamp(log2(40075016.0 * max(cos_lat, 0.01) / (256.0 * max(dist, 1.0) * EH_DETAIL)), 0.0, f32(EH_MAX_LEVEL));
+}
+// The ground vertex at (u, v) and its normal: heights from the pyramid at the zoom its distance asks for, the
+// normal from their slope on the globe's east and north there (the slope of the same four texels: three height
+// lookups a vertex for its neighbours' finite difference were 2026-10-24's 6 ms of GPU a frame).
+struct EarthNodeVertex {
+    pos: vec3<f32>,
+    normal: vec3<f32>,
+};
+fn earth_node_vertex(n: EarthNode, uv: vec2<f32>) -> EarthNodeVertex {
+    let flat = earth_node_point(n, uv, 0.0);
+    let level = earth_node_level(length(flat.xyz), flat.w);
+    let h = eh_height(level, n.nz, n.nx, n.ny, uv, flat.w);
+    // the globe's frame at the point, from the same differences as earth_node_point (GlobeNormal's derivatives)
+    let dyv = -uv.y * n.d_y;
+    let dp = n.dp_north + atan2(2.0 * cosh(n.y_north + dyv * 0.5) * sinh(dyv * 0.5), 1.0 + sinh(n.y_north + dyv) * sinh(n.y_north));
+    let dl = n.dl_west + uv.x * n.d_lon;
+    let cp = flat.w;
+    let sp = n.sin_p0 * cos(dp) + n.cos_p0 * sin(dp);
+    let sdl = sin(dl);
+    let cdl = cos(dl);
+    let up = vec3<f32>(cp * sdl, n.sin_p0 * sp + n.cos_p0 * cp * cdl, n.cos_p0 * sp - n.sin_p0 * cp * cdl);
+    let east = vec3<f32>(cdl, -n.cos_p0 * sdl, n.sin_p0 * sdl);
+    let north = vec3<f32>(-sp * sdl, n.sin_p0 * cp - n.cos_p0 * sp * cdl, n.cos_p0 * cp + n.sin_p0 * sp * cdl);
+    return EarthNodeVertex(flat.xyz + vec3<f32>(0.0, h.x, 0.0), normalize(up - h.y * east - h.z * north));
+}
+#endif
+
+#ifdef WHOLE_WORLD
+// --- (OP) Tidewater's beach sand on the whole world's beaches ------------------------------------
+// terrain.wgsl tw_beach_sand, the sand the native islands' beaches have (owner: "can you give also the
+// island the tidewave sand texture?"), on Earth near ground: pale coral sand in drifts, grain at two
+// scales, wind ripples, shell grit and a wrack line on the high-water band, damp sand below the berm,
+// swash marks and seabed ripple fields, with the same micro relief. Its noise is the same Tidewater
+// detail tile (TerrainWgpuTidewaterDetail.cpp), bound in the draw's Stage1 normal slot (EngineWgpu
+// SubmitEarthHorizon) and read through the repeating sampler. Linear albedo out.
+struct EarthTwIn {
+    dN: vec4<f32>,
+    dM: vec4<f32>,
+    dF: vec4<f32>,
+    macroB: f32,
+    mcr: f32,
+};
+struct EarthTwSand {
+    albedo: vec3<f32>,
+    slope: vec2<f32>,
+};
+fn ews_rot(p: vec2<f32>, a: f32) -> vec2<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec2<f32>(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+fn ews_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return max(mix(vec3<f32>(l), c, s), vec3<f32>(0.0));
+}
+fn ews_d(det: u32, uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    return textureSampleGrad(textures[det], samplers[0u], uv, gx, gy);
+}
+fn ews_rel_uv(rel: vec2<f32>, cam: vec2<f32>, a: f32, s: f32) -> vec2<f32> {
+    return ews_rot(rel, a) / s + fract(ews_rot(cam, a) / s);
+}
+fn ews_inputs(det: u32, abs_p: vec3<f32>, rel: vec3<f32>, dwx: vec3<f32>, dwy: vec3<f32>) -> EarthTwIn {
+    let cam = frame.cam_pos.xz;
+    var o: EarthTwIn;
+    let macroA = ews_d(det, ews_rot(abs_p.xz, 0.7) / 173.0, vec2<f32>(0.0), vec2<f32>(0.0)).w;
+    o.macroB = ews_d(det, ews_rot(abs_p.xz, 2.1) / 47.0, vec2<f32>(0.0), vec2<f32>(0.0)).w;
+    o.mcr = macroA * 0.6 + o.macroB * 0.4;
+    o.dN = ews_d(det, ews_rel_uv(rel.xz, cam, 0.0, 1.9), dwx.xz / 1.9, dwy.xz / 1.9);
+    o.dM = ews_d(det, ews_rel_uv(rel.xz, cam, 1.3, 6.7) + 0.21, ews_rot(dwx.xz, 1.3) / 6.7, ews_rot(dwy.xz, 1.3) / 6.7);
+    o.dF = ews_d(det, ews_rel_uv(rel.xz, cam, 2.4, 0.63) + 0.53, ews_rot(dwx.xz, 2.4) / 0.63, ews_rot(dwy.xz, 2.4) / 0.63);
+    return o;
+}
+// d/dx, d/dz of the detail tile's sand channel at `tile` m, by finite differences; 0 once a texel is
+// under a pixel (terrain.wgsl tw_relief)
+fn ews_relief(det: u32, rel: vec2<f32>, cam: vec2<f32>, tile: f32, dwx: vec3<f32>, dwy: vec3<f32>) -> vec2<f32> {
+    let px = max(length(dwx), length(dwy));
+    let k = 1.0 - smoothstep(tile / 512.0, tile / 128.0, px);
+    if (k <= 0.0) { return vec2<f32>(0.0); }
+    let e = 1.0 / 512.0;
+    let q = rel / tile + fract(cam / tile);
+    let gx = dwx.xz / tile;
+    let gy = dwy.xz / tile;
+    let h0 = ews_d(det, q, gx, gy).z;
+    let hx = ews_d(det, q + vec2<f32>(e, 0.0), gx, gy).z;
+    let hz = ews_d(det, q + vec2<f32>(0.0, e), gx, gy).z;
+    return vec2<f32>(hx - h0, hz - h0) / (e * tile) * k;
+}
+fn ews_ripple(rel: vec2<f32>, cam: vec2<f32>, dir: vec2<f32>, wavelength: f32, warp: f32, e: f32,
+              fp: f32, lo: f32, hi: f32) -> vec4<f32> {
+    let k = 6.2832 / wavelength;
+    let ph = dot(rel, dir) * k + fract(dot(cam, dir) / wavelength) * 6.2832 + warp;
+    let fade = 1.0 - smoothstep(lo, hi, fp * k);
+    let s = sin(ph) * 0.5 + 0.5;
+    let d = e * pow(max(s, 1e-4), e - 1.0) * 0.5 * cos(ph) * k;
+    return vec4<f32>(pow(s, e), dir * d, fade);
+}
+// abs_p: world position; rel: camera-relative position; h: height over the sea; fp: footprint (m per
+// pixel); grade: |grad h| of the ground
+fn earth_tw_sand(det: u32, abs_p: vec3<f32>, rel: vec3<f32>, h: f32, fp: f32, grade: f32,
+                 dwx: vec3<f32>, dwy: vec3<f32>) -> EarthTwSand {
+    let cam = frame.cam_pos.xz;
+    let t = ews_inputs(det, abs_p, rel, dwx, dwy);
+    let dMw = t.dM.w;
+    let dMy = t.dM.y;
+    let dMx = t.dM.x;
+    let dNw = t.dN.w;
+    let dNy = t.dN.y;
+    let macroB = t.macroB;
+    let grain = min(t.dN.z, 0.62);
+    let grainF = min(t.dF.z, 0.62);
+    let camDist = length(rel);
+
+    // beach sand: pale coral sand, drifts of warmer / coarser sand, grain
+    let dryK = smoothstep(0.8, 3.0, h);
+    var sand = mix(srgb_to_linear(vec3<f32>(0.83, 0.75, 0.6)), srgb_to_linear(vec3<f32>(0.9, 0.84, 0.72)),
+                   smoothstep(0.3, 0.72, t.mcr + dryK * 0.2));
+    sand = mix(sand, srgb_to_linear(vec3<f32>(0.84, 0.72, 0.55)), smoothstep(0.55, 0.8, dMw + (macroB - 0.5) * 0.6) * 0.45);
+    sand = sand * ((dMw - 0.5) * 0.16 + 1.0) * ((dNw - 0.5) * 0.1 + 1.0);
+    sand = sand * ((grain - 0.45) * 0.3 + 0.97) * ((grainF - 0.45) * 0.2 + 1.0);
+    let trod = smoothstep(0.52, 0.7, dNy + (dMy - 0.5) * 0.6) * dryK;
+    sand = sand * (1.0 - trod * 0.07);
+    let hw = h + (dMw - 0.5) * 0.5;
+    let wrackBand = smoothstep(1.15, 1.4, hw) * smoothstep(2.1, 1.7, hw);
+    let landW = 1.0 - smoothstep(0.12, -0.6, h);
+    let pebDensity = smoothstep(0.62, 0.85, macroB + dMw * 0.3) * 0.2 + wrackBand * smoothstep(0.3, 0.6, dMy);
+    let pebW = smoothstep(0.66, 0.8, t.dN.z) * clamp(pebDensity, 0.0, 1.0) * landW * (1.0 - smoothstep(12.0, 35.0, camDist));
+    let pebCol = mix(mix(srgb_to_linear(vec3<f32>(0.86, 0.82, 0.74)), srgb_to_linear(vec3<f32>(0.78, 0.64, 0.6)),
+                         smoothstep(0.45, 0.75, dMx)),
+                     srgb_to_linear(vec3<f32>(0.36, 0.33, 0.3)), smoothstep(0.74, 0.82, dMy));
+    sand = mix(sand, pebCol, pebW * 0.75);
+    let wrack = wrackBand * smoothstep(0.58, 0.72, dNy) * smoothstep(0.4, 0.6, macroB);
+    sand = mix(sand, srgb_to_linear(vec3<f32>(0.24, 0.18, 0.11)), wrack * 0.8);
+
+    // wind ripples on the dry sand, ~10.5 cm, fixed in the world (terrain.wgsl TWS_RIPPLE_DIR)
+    let r1 = ews_ripple(rel.xz, cam, vec2<f32>(0.8, 0.6), 0.105, dMw * 24.0 + dNw * 7.0 + macroB * 30.0, 1.6, fp, 0.6, 2.2);
+    let windK = r1.w * smoothstep(1.5, 2.2, h) * (1.0 - trod * 0.7) * smoothstep(0.2, 0.5, macroB + dMw * 0.3);
+    sand = sand * ((r1.x - 0.5) * 0.12 * windK + 1.0);
+    var slope = r1.yz * 0.005 * windK;
+
+    // seabed: lighter shallow sand, megaripple fields (~0.75 m) and wave ripples (~0.16 m)
+    let underW = smoothstep(0.12, -0.6, h);
+    let depth = -h;
+    if (underW > 0.0) {
+        var under = mix(srgb_to_linear(vec3<f32>(0.84, 0.78, 0.64)), srgb_to_linear(vec3<f32>(0.72, 0.7, 0.58)),
+                        smoothstep(1.0, 9.0, depth));
+        under = under * ((dMw - 0.5) * 0.14 + 1.0) * ((grain - 0.45) * 0.25 + 1.0);
+        let r2 = ews_ripple(rel.xz, cam, vec2<f32>(0.6, -0.8), 0.75, dMw * 16.0 + macroB * 24.0, 1.4, fp, 0.5, 2.0);
+        let r3 = ews_ripple(rel.xz, cam, vec2<f32>(0.6, -0.8), 0.16, dMw * 26.0 + dNw * 5.0, 1.5, fp, 0.6, 2.2);
+        let fieldW = smoothstep(0.42, 0.62, macroB + (dMw - 0.5) * 0.35) * smoothstep(0.9, 2.0, depth);
+        under = under * ((r2.x - 0.55) * 0.22 * fieldW * r2.w + 1.0);
+        sand = mix(sand, under, underW);
+        slope += (r3.yz * 0.012 * r3.w * smoothstep(-0.3, -0.9, h) + r2.yz * 0.035 * r2.w * fieldW) * underW;
+    }
+
+    // damp sand below the berm, darker in mottled drying patches
+    let dampMottle = smoothstep(0.3, 0.7, dMw + (dNy - 0.45) * 0.6 + (macroB - 0.5) * 0.4);
+    let damp = smoothstep(clamp(grade * 5.0, 1.9, 3.0), 0.5, h + dMw * 0.3) * mix(0.3, 0.65, dampMottle) * landW;
+    sand = mix(sand, ews_sat(sand * 0.58, 1.15) * vec3<f32>(0.97, 0.98, 1.0), damp);
+    // swash marks: thin wavy lines of grit at the limits of earlier uprushes
+    let sl = (h + dMw * 0.18 + dNw * 0.05) / 0.13;
+    let slD = abs(fract(sl) - 0.5);
+    let slW = fp * grade / 0.13 + 1e-4;
+    let swashLine = smoothstep(slW * 1.5 + 0.04, 0.0, slD) * smoothstep(0.2, 0.4, h) * smoothstep(1.6, 1.2, h)
+        * smoothstep(0.45, 0.65, dMy + (macroB - 0.5) * 0.4) * (1.0 - smoothstep(0.8, 2.0, slW * 10.0));
+    sand = mix(sand * (1.0 - swashLine * 0.3), srgb_to_linear(vec3<f32>(0.9, 0.88, 0.84)),
+               swashLine * smoothstep(0.6, 0.75, grainF) * 0.5);
+
+    slope += (ews_relief(det, rel.xz, cam, 1.9, dwx, dwy) * 0.004 + ews_relief(det, rel.xz, cam, 0.63, dwx, dwy) * 0.003)
+             * (1.0 - underW * 0.5);
+
+    var o: EarthTwSand;
+    o.albedo = max(sand, vec3<f32>(0.0));
+    o.slope = slope;
+    return o;
+}
+#endif
+
 // Baked per-pipeline (pipeline-overridable constants): the alpha-test cutout
 // threshold and whether this is a shadow-darken pipeline. Keeping them out of a
 // per-draw binding avoids a 5th bind group (wgpu's default maxBindGroups is 4).
@@ -326,6 +1004,10 @@ override is_shadow: f32 = 0.0;   // 1 = output black + shadow-strength alpha
 // MSAA; the prepass twin (fs_prepass_a2c) emits the same coverage so the masks match.
 override a2c: f32 = 0.0;
 override foliage_screen_ao: f32 = 0.0; // REN-OBJ-001, as in gpu_driven.wgsl
+// PERF-FAR-CROWN (as in gpu_driven.wgsl): leaf-card shadow filter distances, m; budget 0 = off.
+override far_crown_shadow_budget: f32 = 40.0;
+override far_crown_shadow_tent: f32 = 120.0;
+override blend_section_screen_ao: f32 = 0.0; // RFG-129
 override count_fragments: f32 = 0.0;   // REN-OBJ-003, as in gpu_driven.wgsl (colour pass only here)
 // 1 = an alpha-blended (glass) pipeline: the shared shading damps its diffuse sky-irradiance
 // ambient so transparent cockpit canopies don't wash out to the sky (and crash auto-exposure).
@@ -475,6 +1157,52 @@ fn vs_main(
     // world xz (+ frame.cam_pos) and written back camera-relative. conform2.z = mode:
     // 1 = ForestPlain bilinear plane, 2 = per-vertex ClipLand vegetation (heightmap).
     let mode = obj.conform2.z;
+#ifdef WHOLE_WORLD
+    if (mode > 2.5) {
+        // Whole world ground node (conform mode 3, EngineWgpu::SubmitEarthNode): the shared 33 x 33 grid placed on the
+        // node's piece of the globe, heights from the elevation pyramid. CDLOD morph: past the node's morph start the
+        // odd grid vertices slide onto their even neighbours' line, so at its range it is its parent's grid exactly.
+        let n = earth_node(obj);
+        let flat = earth_node_point(n, uv, 0.0);
+        let k = clamp((length(flat.xyz) - obj.conform1.z) / max(obj.conform1.w - obj.conform1.z, 1.0), 0.0, 1.0);
+        let g = uv * 32.0;
+        let muv = (g - fract(g * 0.5) * 2.0 * k) / 32.0;
+        let v = earth_node_vertex(n, muv);
+        var p = v.pos;
+        var nrm = v.normal;
+        if (obj.conform2.z > 3.25) {
+            // Inside the gameplay window (the patch heightmap, installed for this origin: mode 3.5) the ground is the
+            // one feet stand on -- Landscape::SurfaceY's triangles -- not the pyramid's z15 texels, which differ from it
+            // by a median 0.65 m on Alpine slopes (2026-10-25). Blended back to the pyramid over the window's last
+            // 40 cells, as the patch's own near mesh blended into its horizon.
+            let wxz = p.xz + frame.cam_pos.xz;
+            if (bare_surface_valid(wxz)) {
+                let t = (wxz - hm_params.origin) / hm_params.terrain_grid;
+                let last = vec2<f32>(f32(hm_params.hm_width - 1u), f32(hm_params.hm_height - 1u));
+                let edge = min(min(t.x, t.y), min(last.x - t.x, last.y - t.y));
+                let w = smoothstep(2.0, 40.0, edge);
+                if (w > 0.0) {
+                    p.y = mix(p.y, bare_surface_y(wxz) - frame.cam_pos.y, w);
+                    // the normal from a cell either side (smooth, as the patch mesh's vertex normals were): a
+                    // triangle's own slope showed every 6.25 m cell as a facet
+                    let e = hm_params.terrain_grid;
+                    let gx = bare_surface_y(wxz + vec2<f32>(e, 0.0)) - bare_surface_y(wxz - vec2<f32>(e, 0.0));
+                    let gz = bare_surface_y(wxz + vec2<f32>(0.0, e)) - bare_surface_y(wxz - vec2<f32>(0.0, e));
+                    nrm = normalize(mix(nrm, normalize(vec3<f32>(-gx, 2.0 * e, -gz)), w));
+                }
+            }
+        }
+        if (pos.y > 0.5) {
+            // a skirt vertex (EarthGroundNodes): a metre below its edge, hiding the hairline between nodes. Half a
+            // grid cell (12 m on a zoom-15 node) stood as a dark wall in clear shallow sea wherever two nodes'
+            // floors met with a small step (Helgoland, 2026-10-25).
+            p.y = p.y - 1.0;
+        }
+        // imagery: zoom-19 mercator offsets from the node's corner (the tile-mode ground shader's off19)
+        let off19 = muv * f32(1 << u32(max(19 - n.nz, 0)));
+        return finish_vertex(vec4<f32>(p, 1.0), nrm, vec3<f32>(0.0), vec3<f32>(0.0), off19, instance, 0.0, vec2<f32>(0.0));
+    }
+#endif
     // 1 for a vertex pinned onto the terrain (see VsOut.conform_w). Vertex-only knowledge;
     // fs_surface uses it to decide where its per-pixel depth re-seat applies.
     var conform_w = 0.0;
@@ -554,7 +1282,7 @@ fn vs_main(
         // value would make every plant swim as the camera walks.
         let phase_xz = world[3].xz + frame.cam_pos.xz;
         let leaf = select(select(0.0, 1.0, alpha_ref > 0.0), -1.0, foliage_kind > 2.5);
-        let sway = veg_sway_offset(pos.y, phase_xz, leaf);
+        let sway = veg_sway_offset(veg_sway_height(pos.y, foliage_kind < 1.5), phase_xz, leaf);
         world_pos = vec4<f32>(world_pos.xyz + sway, world_pos.w);
     }
     // REGRESSION GUARD (CWA stock-tree canopies): legacy leaf cards have arbitrary authored
@@ -606,6 +1334,253 @@ fn vs_skinned(
 // The colour-pass fragment. Depth is fixed-function (no frag_depth), so early-Z stays on for
 // every ordinary draw; the OnSurface variant below (fs_surface) shares this body and adds
 // only a depth output.
+// REFLECT-001 phase C -- what a classified surface mirrors: the sky env map, widened by
+// roughness with a five-tap cone (the map has one mip; phase D replaces this with a
+// prefiltered chain), and dimmed where the reflection ray meets the world instead of sky --
+// toward and below the horizon a car mirrors street, ground and trees, which the sky map
+// does not hold (the same reading RFG-168 gives window glass).
+// REFLECT-001 phase D: the sky env map carries GGX-prefiltered mips (sky/env_prefilter.rs);
+// level = roughness x max level. Pinned to env_prefilter::ENV_MIPS by a Rust test.
+const ENV_PREFILTER_MAX_LOD: f32 = 5.0;
+fn sky_env_sample_rough(dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let u = 0.5 + atan2(dir.z, dir.x) / ENV_TWO_PI;
+    let v = acos(clamp(dir.y, -1.0, 1.0)) / (ENV_TWO_PI * 0.5);
+    return textureSampleLevel(sky_env, sky_env_samp, vec2<f32>(u, v),
+                              clamp(roughness, 0.0, 1.0) * ENV_PREFILTER_MAX_LOD).rgb;
+}
+
+// Split-sum environment BRDF, Karis' analytic fit (UE4 mobile): the scale and bias that turn
+// F0 into the hemisphere-integrated specular of a GGX surface. Replaces the roughness-aware
+// Schlick and the (1-r)^1.5 fade of phase C, which only stood in for this.
+fn reflect_env_brdf(f0: vec3<f32>, roughness: f32, ndv: f32) -> vec3<f32> {
+    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * ndv)) * r.x + r.y;
+    let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    return f0 * ab.x + vec3<f32>(ab.y);
+}
+
+fn reflect_env_radiance(dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let env = sky_env_sample_rough(dir, roughness);
+    // Above the horizon: sky, a little dimmed near it where street, houses and trees stand,
+    // and desaturated by half as RFG-208 does for window glass (Reforger's probes author
+    // ReflectionDesaturation 0.5). Undesaturated, the env map's deep blue turned red cars
+    // purple at low sun (first test, 2026-10-22: Arma 1 hatchback, Arma 2 Skoda).
+    var sky = env * mix(0.6, 1.0, smoothstep(0.0, 0.45, dir.y));
+    // Phase D: 0.3 instead of 0.5 -- with sharp, correctly weighted reflections the owner wants
+    // the sky's colour back in roofs and bonnets (reference renders, 2026-10-22).
+    sky = mix(sky, vec3<f32>(dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722))), 0.3);
+    // Below it: the ground, lit the way the renderer lights the ground -- sky ambient plus sun --
+    // at a typical ground albedo. A flat dark constant made the lower half of every body panel
+    // darker than before on bright sand (first test, 2026-10-22: Peugeot white doors went grey).
+    let to_sun = -frame.sun_dir_world.xyz;
+    let ground = REFLECT_GROUND_ALBEDO *
+        (sky_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * frame.sun_ambient.w + frame.sun_diffuse.rgb * max(to_sun.y, 0.0));
+    // D.1: the first ~10 degrees above the horizon are scenery, not sky -- tree lines, houses,
+    // dunes. With sky right down to the horizon every door and sill (which face sideways and
+    // reflect exactly that band) took the brightest, bluest part of the sky and went grey or
+    // purple (reflectD-5728c24: Arma 2 Skoda sill, Arma 3 SUV). The band takes the lit ground
+    // instead, and widens with roughness the way the prefiltered sky above it does.
+    let band = 0.1 * clamp(roughness, 0.0, 1.0);
+    return mix(ground, sky, smoothstep(-0.02 - band, 0.15 + band, dir.y));
+}
+const REFLECT_GROUND_ALBEDO: f32 = 0.2;
+
+// Owner, 2026-10-23: matt surfaces reflect nothing -- no sky in the shadowed flank of a tank,
+// no ground in the sill of a military truck. Matt (1), PaintMatt (2), Rubber (10) and Plastic
+// (11) keep their diffuse body and the sun's broad highlight, and skip the environment and the
+// screen-space march entirely (which is also most of what the reflection costs).
+// reflect_class_mirrors lives in shading.wgsl (the sky-ambient split needs it too).
+
+// Phase E: march `dir` from `origin` (camera-relative metres) against this frame's depth.
+// Returns the hit in the PREVIOUS frame's image: .xy = its uv there, .z = how many pixels one
+// unit of GGX alpha spreads over at the hit (E.3: what a lobe of that roughness blurs), .w =
+// confidence (0 = no hit: keep the phase-D environment). Main scene camera only -- frame.gtao.x is GTAO's own
+// per-camera gate, 1 exactly where its depth chain is this camera's.
+fn reflect_ssr(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    if (ssr.misc.x < 0.5 || frame.gtao.x < 0.5) {
+        return vec4<f32>(0.0);
+    }
+    let dims = vec2<i32>(textureDimensions(ssr_depth, 0));
+    if (dims.x < 2 || dims.y < 2) {
+        return vec4<f32>(0.0);
+    }
+    let vp = frame.proj * frame.view;
+    // Growing steps: centimetres near the surface, metres far out -- 32 taps reach ~80 m. The
+    // start is jittered per pixel (interleaved gradient noise): with one fixed step pattern,
+    // neighbouring rows of a side panel crossed the ground between the same two taps or not,
+    // and the first phase-E run (reflectE-1f48035) drew that as zebra stripes.
+    let jitter = fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+    var t = 0.1 + 0.15 * jitter;
+    var prev_t = 0.0;
+    var crossed = false;
+    for (var i = 0; i < 32; i = i + 1) {
+        let clip = vp * vec4<f32>(origin + dir * t, 1.0);
+        if (clip.w <= 0.05) {
+            break;
+        }
+        let uv = clip.xy / clip.w * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+        if (any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0))) {
+            break;
+        }
+        let texel = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+        // First tap behind a surface: the crossing lies between this tap and the last one.
+        if (clip.w > textureLoad(ssr_depth, texel, 0).r) {
+            crossed = true;
+            break;
+        }
+        prev_t = t;
+        t = t * 1.17 + 0.1;
+        if (t > ssr.misc.w) {
+            break;
+        }
+    }
+    if (!crossed) {
+        return vec4<f32>(0.0);
+    }
+    // Bisect to the crossing, THEN judge it: a ray that went behind a thin object (a pole, a
+    // tyre seen edge-on) ends up well behind its front surface and is not a hit; one that met
+    // a surface lands on it however long the step that found it.
+    var lo = prev_t;
+    var hi = t;
+    for (var k = 0; k < 6; k = k + 1) {
+        let mid = 0.5 * (lo + hi);
+        let clip = vp * vec4<f32>(origin + dir * mid, 1.0);
+        let uv = clip.xy / max(clip.w, 0.05) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+        let texel = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+        if (clip.w > textureLoad(ssr_depth, texel, 0).r) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let hit_clip = vp * vec4<f32>(origin + dir * hi, 1.0);
+    let hit_uv = hit_clip.xy / max(hit_clip.w, 0.05) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let hit_texel = clamp(vec2<i32>(hit_uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+    let behind = hit_clip.w - textureLoad(ssr_depth, hit_texel, 0).r;
+    // Hits closer than 30 cm are the surface itself at grazing angles (depth quantisation).
+    if (hi < 0.3 || behind > 0.25 + 0.02 * hi) {
+        return vec4<f32>(0.0);
+    }
+    let prev = ssr.reproj * vec4<f32>(origin + dir * hi, 1.0);
+    if (prev.w <= 0.05) {
+        return vec4<f32>(0.0);
+    }
+    let puv = prev.xy / prev.w * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let edge = min(min(puv.x, puv.y), min(1.0 - puv.x, 1.0 - puv.y));
+    if (edge <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    // Fade at the screen edge and towards the march's reach, so the hand-over to the
+    // environment never shows as a line.
+    let w = smoothstep(0.0, 0.08, edge) * (1.0 - smoothstep(0.6 * ssr.misc.w, ssr.misc.w, hi));
+    // A lobe of alpha a spreads ~ hi * a metres at the hit; at the hit's distance from the
+    // camera that is hi * a * proj_yy * height/2 / hit_w pixels.
+    let px_per_alpha = hi * frame.proj[1][1] * 0.5 * ssr.misc.z / max(hit_clip.w, 0.1);
+    return vec4<f32>(puv, px_per_alpha, w);
+}
+
+// The previous frame's colour at a hit, blurred to the width of a lobe of this roughness.
+fn reflect_ssr_color(hit: vec4<f32>, roughness: f32) -> vec3<f32> {
+    let a = roughness * roughness;
+    let lod = clamp(log2(max(hit.z * a, 1.0)), 0.0, ssr.tune.y);
+    return max(textureSampleLevel(ssr_prev_color, ssr_samp, hit.xy, lod).rgb, vec3<f32>(0.0));
+}
+
+// How much of a lobe of this roughness the (unfiltered) screen image may stand in for.
+// E.3: with the blurred mips a rough lobe reads a correctly soft image, so it may take the
+// screen's colour up to a matt finish; only past ~0.75 does the prefiltered environment's
+// wider average serve better than a 64x-reduced screen.
+fn reflect_ssr_rough_weight(roughness: f32) -> f32 {
+    return 1.0 - smoothstep(0.45, 0.8, roughness);
+}
+
+// REFLECT-001 debug colours. View 1 = surface class (fixed palette), 2 = roughness (grey),
+// 3 = F0 / metal (red = F0 x 10, green = metal), 4 = clear coat (blue = strength, green =
+// 1 - coat roughness), 5 = source (declared / RVMAT / part rule / body rule / default).
+fn reflect_class_color(cls: u32) -> vec3<f32> {
+    switch cls {
+        case 1u: { return vec3<f32>(0.35, 0.35, 0.35); }   // matt
+        case 2u: { return vec3<f32>(0.25, 0.40, 0.15); }   // paint matt (military)
+        case 3u: { return vec3<f32>(0.90, 0.20, 0.20); }   // paint gloss
+        case 4u: { return vec3<f32>(1.00, 0.55, 0.10); }   // paint metallic
+        case 5u: { return vec3<f32>(0.95, 0.95, 1.00); }   // chrome
+        case 6u: { return vec3<f32>(0.20, 0.60, 1.00); }   // glass
+        case 7u: { return vec3<f32>(0.00, 1.00, 1.00); }   // mirror
+        case 8u: { return vec3<f32>(1.00, 1.00, 0.30); }   // lamp, glass cover
+        case 9u: { return vec3<f32>(0.80, 1.00, 0.30); }   // lamp, plastic cover
+        case 10u: { return vec3<f32>(0.05, 0.05, 0.05); }  // rubber
+        case 11u: { return vec3<f32>(0.55, 0.30, 0.65); }  // plastic
+        case 12u: { return vec3<f32>(0.60, 0.70, 0.75); }  // bare metal
+        default: { }
+    }
+    return vec3<f32>(1.0, 0.0, 1.0); // unclassified: magenta
+}
+
+// REFLECT-001 D.1 -- the section's lanes after its per-texel specular map (SMDI, RVMAT
+// SpecularDetail). Arma 1-3 paint a whole car on one atlas, so the class (paint, from the body
+// texture's name) also covered the tyres, the black trim and the dirt, and their clear coat
+// reflected the sky: grey tyres, a grey sill, a pale V3S cab (test run reflectD-5728c24,
+// 2026-10-23). SMDI G is the specular level the authors painted per texel and B the gloss
+// (frame.wgsl / gpu_driven.wgsl, measured over 40 maps): a texel the authors left without
+// specular gets no coat, no F0 and no metal; a dull one gets rougher. CWA has no such map and
+// keeps its lanes as they were.
+struct ReflLanes {
+    a: vec4<f32>,
+    b: vec4<f32>,
+    specmap: vec3<f32>, // G level, B gloss, 1 = a map was bound (debug view 6)
+};
+
+fn reflect_lanes_with_specmap(r0: vec4<f32>, r1: vec4<f32>, uv: vec2<f32>, duv_dx: vec2<f32>,
+                              duv_dy: vec2<f32>) -> ReflLanes {
+    var o: ReflLanes;
+    o.a = r0;
+    o.b = r1;
+    o.specmap = vec3<f32>(0.0);
+    if (r1.x <= 0.5) {
+        return o;
+    }
+    let refl_packed = bitcast<u32>(r1.z);
+    o.b.z = f32(refl_packed & 7u);
+    let slot = refl_packed >> 6u;
+    if (slot != 0u) {
+        // Explicit gradients: this branch is per-draw (non-uniform) control flow.
+        let s = textureSampleGrad(textures[slot], samplers[(refl_packed >> 3u) & 7u], uv, duv_dx, duv_dy);
+        let level = smoothstep(0.02, 0.25, s.g);
+        o.a.y = r0.y * level;
+        o.a.z = r0.z * level;
+        o.a.w = r0.w * level;
+        o.a.x = max(r0.x, 0.95 - 0.85 * clamp(s.b, 0.0, 1.0));
+        o.specmap = vec3<f32>(s.g, s.b, 1.0);
+    }
+    // F.3: a coated paint's base is flake and pigment -- rough (>= 0.55) whatever the class or an
+    // addon declares; the clear coat above carries the sharp reflection.
+    let cls = u32(r1.x + 0.5);
+    if ((cls == 3u || cls == 4u) && o.a.w > 0.0) {
+        o.a.x = max(o.a.x, 0.55);
+    }
+    return o;
+}
+
+fn reflect_debug_color(r0: vec4<f32>, r1: vec4<f32>, view: u32) -> vec3<f32> {
+    if (view == 1u) {
+        return reflect_class_color(u32(r1.x + 0.5));
+    }
+    if (view == 2u) {
+        return vec3<f32>(r0.x);
+    }
+    if (view == 3u) {
+        return vec3<f32>(clamp(r0.y * 10.0, 0.0, 1.0), r0.z, 0.0);
+    }
+    if (view == 4u) {
+        return vec3<f32>(0.0, r0.w * (1.0 - r1.y), r0.w);
+    }
+    let src = u32(r1.z + 0.5); // already unpacked by reflect_lanes_with_specmap
+    return vec3<f32>(select(0.0, 1.0, src == 1u || src == 4u), select(0.0, 1.0, src == 2u || src == 4u),
+                     select(0.0, 1.0, src == 3u || src == 5u)) * select(1.0, 0.5, src == 5u);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     census(0u);
@@ -869,6 +1844,243 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     // residency decision is about; the normal map shares its fate.
     mip_feedback_note(packed >> 3u, dpdx(in.uv), dpdy(in.uv));
 
+#ifdef WHOLE_WORLD
+    // Whole-world surfaces exist only in a whole-world process (shaders::shader_defs); elsewhere this
+    // branch is not compiled, so the island game pays nothing for it.
+    if ((material_flags(material) & MATFLAG_EARTH_SURFACE) != 0u) {
+        // The global sphere is outside the finite landscape heightmap. Sampling
+        // that map's cave, shadow, wetness or GI receivers would turn its curved
+        // surface black below the local datum. Marked near ground adds bounded
+        // detail and actual scene CSM/depth AO; the globe keeps global light.
+        var sample_uv = in.uv;
+        var sample_dx = boot_duv_dx;
+        var sample_dy = boot_duv_dy;
+        if (material.specular.w > 0.5) {
+            let chart = earth_near_uv(in.uv);
+            sample_uv = chart.xy;
+            sample_dx *= chart.zw;
+            sample_dy *= chart.zw;
+        }
+        var albedo = vec3<f32>(0.0);
+        var merc = vec2<f32>(-1.0); // web-mercator position, tile mode only (the night lights)
+        let tile_mode = u32(material.reflect0.z + 0.5);
+        if (tile_mode != 0u) {
+            // The tile pyramid (EarthTileCache): mode 1 = mercator offsets from reflect0.xy, 2 = the globe's
+            // equirectangular UVs, converted here.
+            var ref19 = material.reflect0.xy;
+            var off19 = in.uv;
+            if (tile_mode == 2u) {
+                let lon = in.uv.x * 360.0 - 180.0;
+                let lat = clamp(90.0 - in.uv.y * 180.0, -85.0511, 85.0511) * 3.14159265 / 180.0;
+                let m = vec2<f32>((lon + 180.0) / 360.0, (1.0 - asinh(tan(lat)) / 3.14159265) * 0.5) * 524288.0;
+                ref19 = floor(m);
+                off19 = m - ref19;
+            }
+            merc = (ref19 + off19) / 524288.0;
+            let lut = bitcast<u32>(material.reflect1.z) >> 6u;
+            let t = earth_tile_albedo(packed >> 3u, packed & 7u, lut, ref19, off19, max(length(dwx), length(dwy)));
+            albedo = t.rgb;
+        } else {
+            albedo = textureSampleGrad(textures[packed >> 3u], samplers[packed & 7u],
+                                       sample_uv, sample_dx, sample_dy).rgb;
+        }
+        // (a zero normal resolved to the face's, as every other surface does: shading.wgsl surface_normal)
+        var n = surface_normal(in.normal, in.world_pos, dwx, dwy);
+        let ground_detail = material.light_ambient.w > 0.5;
+        let distance = length(in.world_pos);
+        var reflectance = 1.0;
+        if (ground_detail) {
+            let detail = earth_ground_detail(in.world_pos + frame.cam_pos.xyz, n,
+                max(length(dwx),length(dwy)), distance, material.light_diffuse.xyz, material.light_ambient.xyz);
+            n = detail.normal;
+            reflectance = detail.reflectance;
+        }
+        // Sun height at THIS point of the globe (radial up from the planet centre, which sits a
+        // radius below the origin anchor), not at the camera: the terminator is a twilight band,
+        // not a knife edge, and the night side must not keep the camera's daytime sky light.
+        // The Earth's centre and the Earth origin's up in world coordinates: (6400, -R, 6400) and +Y in the
+        // Earth frame; from the moon frame the globe arrives through a frame transform and these come with
+        // it (EngineWgpu::SubmitEarthHorizon). Detailed near ground carries its ECEF origin there instead.
+        var earth_centre = vec3<f32>(6400.0, -6378137.0, 6400.0);
+        var origin_up = vec3<f32>(0.0, 1.0, 0.0);
+        if (!ground_detail && dot(material.light_ambient.xyz, material.light_ambient.xyz) > 0.5) {
+            earth_centre = material.light_diffuse.xyz;
+            origin_up = material.light_ambient.xyz;
+        }
+        let radial_up = normalize(in.world_pos + frame.cam_pos.xyz - earth_centre);
+        // The light on the globe: from altitude the astronomical sun (material.specular.xyz, EngineWgpu
+        // SubmitEarthHorizon), not the frame's main light, which is the moon while the origin has night --
+        // the night side seen from space was lit by it. Near the ground the frame's light as before.
+        let earth_aloft = smoothstep(12000.0, 50000.0, length(frame.cam_pos.xyz - earth_centre) - 6378137.0);
+        var sun_travel = frame.sun_dir_world.xyz;
+        if (dot(material.specular.xyz, material.specular.xyz) > 0.5) {
+            sun_travel = normalize(mix(frame.sun_dir_world.xyz, material.specular.xyz, earth_aloft) + vec3<f32>(0.0, 1.0e-6, 0.0));
+        }
+        let sun_height = dot(radial_up, -sun_travel);
+        // Mesh normals are built in the origin's flat tangent frame (up = +Y); tilt them onto the true
+        // radial up so the globe and far horizon shade as a sphere. Near the origin this is a no-op.
+        n = normalize(n + radial_up - origin_up);
+        // Snow: the same snowline and deposit the objects and trees use (the Whole World producer sets a
+        // real-world line from latitude and season), by altitude above the globe rather than the flat
+        // frame's Y, which drops with curvature and stripped distant peaks. Cliffs stay bare.
+        var surface = srgb_to_linear(albedo);
+        // The sea floor: past a few metres of water the imagery photographs the sea's surface, not its floor, and its
+        // zooms (and sources: Esri, EOX where Esri fails) disagree about the sea's colour -- under the drawn sea
+        // that showed as rings round the camera (Helgoland at 9 km, 2026-10-25). A silt seabed there, as far up as
+        // the sea is drawn (tw_water.wgsl EARTH_SEA_CEILING); above that the imagery is the ocean.
+        {
+            let floor_abs = in.world_pos + frame.cam_pos.xyz;
+            let floor_h = length(floor_abs - earth_centre) - 6378137.0;
+            let cam_alt = length(frame.cam_pos.xyz - earth_centre) - 6378137.0;
+            let floor_w = smoothstep(-6.0, -20.0, floor_h) * (1.0 - smoothstep(30000.0, 40000.0, cam_alt));
+            if (floor_w > 0.0) {
+                surface = mix(surface, vec3<f32>(0.13, 0.12, 0.09), floor_w);
+            }
+        }
+        // Beaches: Tidewater's sand (earth_tw_sand) on pale, warm, gentle ground from a few metres under
+        // the sea to a few above it -- OFP's sand on a placed island, real beaches in the imagery. The
+        // detail tile rides in the Stage1 slot (normal_map.z: bound).
+        if (ground_detail && material.normal_map.z > 0.5 && distance < 2500.0) {
+            let world_abs = in.world_pos + frame.cam_pos.xyz;
+            let h = length(world_abs - earth_centre) - 6378137.0;
+            let up = max(dot(surface_normal(in.normal, in.world_pos, dwx, dwy), vec3<f32>(0.0, 1.0, 0.0)), 0.2);
+            let grade = sqrt(max(1.0 - up * up, 0.0)) / up;
+            let lum = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
+            let sandy = smoothstep(0.30, 0.42, lum) * smoothstep(0.02, 0.07, albedo.r - albedo.b);
+            let w = sandy * smoothstep(6.0, 3.5, h) * smoothstep(-6.0, -3.0, h) * smoothstep(0.5, 0.25, grade)
+                  * (1.0 - smoothstep(1500.0, 2500.0, distance));
+            if (w > 0.001) {
+                let sand = earth_tw_sand(normal_packed >> 3u, world_abs, in.world_pos, h,
+                                         max(length(dwx), length(dwy)), grade, dwx, dwy);
+                surface = mix(surface, sand.albedo, w);
+                n = normalize(n - vec3<f32>(sand.slope.x, 0.0, sand.slope.y) * w);
+            }
+        }
+        if (frame.snow_surface.x > 0.0 || (frame.snow_surface.y >= 0.0 && frame.snow_surface.z > 0.0)) {
+            let world_abs = in.world_pos + frame.cam_pos.xyz;
+            let altitude = length(world_abs - earth_centre) - 6378137.0;
+            var depth = frame.snow_surface.x;
+            if (frame.snow_surface.y >= 0.0 && frame.snow_surface.z > 0.0) {
+                depth = max(depth, smoothstep(frame.snow_surface.y, frame.snow_surface.y + frame.snow_surface.z, altitude)
+                    * frame.snow_surface.w);
+            }
+            // Footprints and tracks (the deficit window around the camera) press into the cover: the
+            // carved snow is compacted (darker) and its walls tilt the normal, so a trail reads as depth.
+            let deficit = snow_deficit(world_abs.xz);
+            let carved = clamp(deficit / max(depth, 0.01), 0.0, 1.0);
+            // Real alpine cover clings to slopes well past the 45 degrees fresh-fall shading allows.
+            let up = dot(n, radial_up);
+            // Near ground only: on the coarse distant mesh the cover cut hard-edged white polygons over
+            // the satellite imagery, which already shows the real snow from there.
+            let cover = smoothstep(0.002, 0.04, depth) * smoothstep(0.18, 0.45, up) *
+                        (1.0 - smoothstep(1500.0, 5000.0, distance));
+            if (cover > 0.0) {
+                let footprint = max(length(dwx), length(dwy));
+                var snow_n = snow_powder_normal(world_abs, n, footprint);
+                if (deficit > 0.0) {
+                    let e = 0.125;
+                    let gx = snow_deficit(world_abs.xz + vec2<f32>(e, 0.0)) - snow_deficit(world_abs.xz - vec2<f32>(e, 0.0));
+                    let gz = snow_deficit(world_abs.xz + vec2<f32>(0.0, e)) - snow_deficit(world_abs.xz - vec2<f32>(0.0, e));
+                    snow_n = normalize(snow_n + vec3<f32>(gx, 0.0, gz) / (2.0 * e));
+                }
+                surface = mix(surface, snow_powder_albedo(world_abs, footprint, carved), cover);
+                n = normalize(mix(n, snow_n, cover));
+            }
+        }
+        let twilight = smoothstep(-0.12, 0.05, sun_height);     // sky light: gone ~7 degrees below
+        let sun_reach = smoothstep(-0.015, 0.06, sun_height);   // direct sun thins out through the air
+        let daylight = max(dot(n, -sun_travel), 0.0) * sun_reach;
+        var ambient_occlusion = 1.0;
+        var sun_occlusion = 1.0;
+        if (ground_detail && distance < 400.0) {
+            // Actual camera-relative scene CSM and depth AO, with their existing
+            // readiness guards. Never sample the finite island's cave/GI maps.
+            let receiver = 1.0 - smoothstep(200.0,400.0,distance);
+            ambient_occlusion = mix(1.0,gtao_ao(in.clip.xy),receiver);
+            sun_occlusion = 1.0 - receiver * shadow_strength(in.world_pos, n, 1.0, dwx, dwy);
+        }
+        // Cloud shadows. The deck's shadow map is marched from sea level; this ground can stand kilometres
+        // higher, so look it up where the sun ray through this point would leave sea level -- that is the
+        // same ray through the deck, and the shadow lands under its cloud instead of beside it.
+        {
+            let sun_to = -sun_travel;
+            let world = in.world_pos + frame.cam_pos.xyz;
+            let shift = sun_to.xz / max(sun_to.y, 0.05) * max(world.y, 0.0);
+            sun_occlusion = sun_occlusion * cloud_sun_shadow(world.xz - shift);
+#ifdef WHOLE_WORLD
+            // The mountains' shadows (earth_shadow.rs): the Earth ground is no shadow-map caster
+            sun_occlusion = sun_occlusion * earth_terrain_lit(world);
+#endif
+        }
+        var light = material.sun_ambient.rgb * ambient_occlusion * twilight + material.sun_diffuse.rgb * daylight * sun_occlusion;
+        var glint = vec3<f32>(0.0);
+        if (frame.sun_diffuse.w > 0.5 && (packed >> 3u) != 0u) {
+            // The producer's material light is legacy-scaled. Match the rest
+            // of the physical scene using this frame's sun and directional sky,
+            // without finite-map receivers or an artificial night-time floor.
+            // Slot zero keeps the producer's legacy plain-fallback tint.
+            // The sky irradiance is the camera's sky; from space that is not the light reaching the
+            // ground and it flattened the whole lit hemisphere. There, skylight is a small fraction of
+            // the sun, so the disc darkens toward the terminator as it does in orbital photographs.
+            let cam_altitude = length(frame.cam_pos.xyz - earth_centre) - 6378137.0;
+            let space = smoothstep(30000.0, 100000.0, cam_altitude);
+            // The frame's sun is the sun where the CAMERA is. From altitude each point of the globe
+            // gets its own: the unattenuated sun (sun_diffuse.w, SubmitEarthHorizon) through the air
+            // above THAT point, so the day side is white sunlight even while the origin is in night,
+            // and the ground reddens toward the terminator as it does in orbital photographs.
+            // Below 12 km the weight is 0 and the frame's sun is used exactly as before.
+            let local_sun = material.sun_diffuse.w * earth_sun_transmittance(sun_height,
+                length(in.world_pos + frame.cam_pos.xyz - earth_centre) - 6378137.0);
+            let sun_light = mix(frame.sun_diffuse.rgb, local_sun, smoothstep(12000.0, 50000.0, cam_altitude));
+            let sky_light = mix(sky_irradiance(n) * frame.sun_ambient.w,
+                                sun_light * 0.05 * clamp(sun_height * 2.0 + 0.2, 0.0, 1.0), space);
+            light = sky_light * ambient_occlusion * twilight + sun_light * daylight * sun_occlusion;
+            // Sun glint off the sea, from altitude only: a wind-roughened (Beckmann m 0.2) mirror,
+            // Fresnel ~0.02 at normal incidence rising toward the limb. The sea is told apart by its
+            // colour (deep blue, darker than land); the imagery carries no water mask.
+            let aloft = smoothstep(12000.0, 50000.0, cam_altitude);
+            if (aloft > 0.0) {
+                let water = smoothstep(0.02, 0.08, surface.b - max(surface.r, surface.g * 0.85))
+                          * (1.0 - smoothstep(0.12, 0.3, dot(surface, vec3<f32>(0.2126, 0.7152, 0.0722))));
+                let view = -normalize(in.world_pos);
+                let to_sun = -sun_travel;
+                let h = normalize(view + to_sun);
+                let ndh = max(dot(radial_up, h), 1e-3);
+                let ndl = max(dot(radial_up, to_sun), 0.0);
+                let ndv = max(dot(radial_up, view), 0.05);
+                let t2 = (1.0 - ndh * ndh) / (ndh * ndh);
+                let beckmann = exp(-t2 / 0.04) / (3.14159265 * 0.04 * ndh * ndh * ndh * ndh);
+                let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(h, view), 0.0), 5.0);
+                glint = local_sun * (water * aloft * beckmann * fresnel * ndl / (4.0 * ndv));
+            }
+        }
+        // Local lights -- the head torch, flares, a vehicle's lamps -- on the near ground, as the island terrain
+        // takes them (terrain.wgsl). The Earth branch had none: a diver's torch left the sea floor black.
+        if (ground_detail && distance < 200.0) {
+            light = light + lights_contrib(in.world_pos, n, vec3<f32>(1.0), vec3<f32>(1.0), linear)
+                          * (1.0 - smoothstep(150.0, 200.0, distance));
+        }
+        // City lights where the sun has set, seen from far off: an airliner's or orbit's view of the night
+        // side. Near ground they would be a glow in the soil, so they fade in from 3 to 15 km away.
+        // Scale: as an orbital night photograph is exposed, not physical. A city centre is ~3e-5 of sunlit
+        // ground (VIIRS DNB ~100 nW/cm2/sr against ~3e6), and at that the night side stayed black beside
+        // the stars; ~300 times it reads as the photographs do (night3 against night4, 2026-10-24).
+        var night_glow = vec3<f32>(0.0);
+        if (merc.x >= 0.0) {
+            let dark = 1.0 - smoothstep(-0.10, 0.02, sun_height);
+            let far = smoothstep(3000.0, 15000.0, distance);
+            if (dark * far > 0.0) {
+                night_glow = earth_night_lights(packed >> 3u, packed & 7u, bitcast<u32>(material.reflect1.z) >> 6u, merc,
+                                                max(length(dwx), length(dwy)))
+                           * (material.sun_diffuse.w * 1.0e-2 * dark * far);
+            }
+        }
+        // Ground and valley fog (layered fog) in front of the Earth surface; whole-world terrain used to
+        // skip every fog term.
+        return vec4<f32>(apply_layered_fog(surface * reflectance * light + glint + night_glow, in.world_pos), 1.0);
+    }
+#endif
+
     if ((material_flags(material) & MATFLAG_BOOT_RELIEF) != 0u) {
         let fade = 1.0 - smoothstep(4.0, 12.0, length(in.world_pos));
         if (fade <= 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
@@ -992,6 +2204,11 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     // Uniform derivatives before cutout discard. RGB only: depth, alpha,
     // shadow coverage and the prepass retain their authored values.
     base = vec4<f32>(uniform_cloth_color(base.rgb, material.local_specular.w, in.uv, uniform_uv_footprint), base.a);
+    // Mud caked on vehicles (MudCoat.hpp): replaces the paint where it covers it.
+    let vehicle_mud = vehicle_mud_cover(material.light_ambient.w,
+        vehicle_mud_height(in.world_pos + frame.cam_pos.xyz, material.sun_diffuse.w, material.light_diffuse.w),
+        in.uv, in.normal, uniform_uv_footprint);
+    base = vec4<f32>(mix(base.rgb, vehicle_mud_albedo(in.uv, vehicle_mud.y), vehicle_mud.x), base.a);
     if ((material_flags(material) & 32u) != 0u && linear > 0.5) {
         let dims = vec2<f32>(textureDimensions(monitor_scene));
         let screen_uv = in.clip.xy / dims;
@@ -1090,6 +2307,8 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     m.wet_cloth = uniform_cloth_wetness(material.local_specular.w, in.uv, uniform_uv_footprint);
     m.native_cavity = 1.0;
     m.native_ao = 1.0;
+    m.foliage_trans = 1.0;
+    m.leaf_transmission = 0.0;
 #ifdef NATIVE_LEAF_CAVITY
     if ((material_flags(material) & 1024u) != 0u && material.normal_map.z > 0.5) {
         m.native_cavity = clamp(normal_sample.a, 0.0, 1.0);
@@ -1115,6 +2334,15 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     // The per-draw path carries no specular map: this is the ~7 sections a frame that reach
     // DrawSectionTL, not the retained set. 1.0 leaves the flat constant exactly as before.
     m.spec_mask = 1.0;
+    // REFLECT-001: zero unless WGR_REFLECT / WGR_REFLECT_DEBUG classified this section.
+    m.refl_a = material.reflect0;
+    m.refl_b = material.reflect1;
+    let refl_lanes = reflect_lanes_with_specmap(material.reflect0, material.reflect1, uv, boot_duv_dx,
+                                                 boot_duv_dy);
+    m.refl_a = refl_lanes.a;
+    m.refl_b = refl_lanes.b;
+    // Caked mud is matte where it has dried and only dully glossy where wet.
+    m.spec_mask = 1.0 - vehicle_mud.x * (0.9 - 0.4 * vehicle_mud.y);
     // The direct path has no retained SMDI binding. Show the constant specular lane and its
     // normalized power, with blue = 0 to make the absence of a texel map explicit.
     let specular_debug = vec3<f32>(
@@ -1164,7 +2392,10 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     // world-space sample of the same normal map; see water_ripple_normal. Kept in step with
     // gpu_driven.wgsl's copy on purpose: DayZ water reaches the retained path in practice, but
     // the two paths must not disagree about what a water surface looks like.
+    // RFG-164: a reflective GLASS pane (native Enfusion window glass) is a flat mirror, not water:
+    // it takes no ripple.
     if ((material_flags(material) & MATFLAG_REFLECTIVE) != 0u && frame.wateranim.y > 0.0
+        && (material_flags(material) & MATFLAG_GLASS) == 0u
         && !matdbg_flag(MATDBG_DISABLE_FRESNEL_ENV)) {
         let t = frame.wateranim.x;
         shading_normal = water_ripple_normal(
@@ -1172,6 +2403,18 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
             water_drift(WATER_DRIFT_DIR_A, WATER_DRIFT_SPEED_A, WATER_RIPPLE_PERIOD_A, t),
             water_drift(WATER_DRIFT_DIR_B, WATER_DRIFT_SPEED_B, WATER_RIPPLE_PERIOD_B, t),
             frame.wateranim.y);
+    }
+    // REFLECT-001 phase B debug views (WGR_REFLECT_DEBUG on the CPU side writes reflect1.w).
+    // Zero for every draw unless that switch is set, so this branch never changes a normal frame.
+    let reflect_view = u32(material.reflect1.w + 0.5);
+    if (reflect_view == 6u) {
+        // D.1: the specular map as the reflection reads it -- red = level (G), green = gloss
+        // (B), blue = a map is bound. Black = classified section without a map (CWA, OFP).
+        return vec4<f32>(refl_lanes.specmap, 1.0);
+    }
+    // View 7 (phase E, screen-space reflection) is drawn in the reflection block below.
+    if (reflect_view != 0u && reflect_view != 7u) {
+        return vec4<f32>(reflect_debug_color(refl_lanes.a, refl_lanes.b, reflect_view), 1.0);
     }
     // Debug views are before shared lighting, fog and environment reflection. That keeps the
     // outputs useful for isolating source/material mistakes instead of mixing them with exposure.
@@ -1233,23 +2476,27 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
         veg_cutout, translucent > 0.5 && (material_flags(material) & MATFLAG_GLASS) != 0u, veg_cutout,
         material.sun_ambient.w > 0.5,
         (material_flags(material) & MATFLAG_COCKPIT) != 0u, in.clip.xy,
-        !(veg_cutout && foliage_screen_ao < 0.5),
+        !(veg_cutout && foliage_screen_ao < 0.5) &&
+            !(translucent > 0.5 && (material_flags(material) & MATFLAG_BLEND_SECTION) != 0u &&
+              blend_section_screen_ao < 0.5),
         direct_snow_receiver(in), 0.0,
         direct_tree_snow_cover(in),
         ground_surface,
         select(0.0, snow_depth(in.world_pos.xz + frame.cam_pos.xz), ground_surface),
+        vec2<f32>(far_crown_shadow_budget, far_crown_shadow_tent),
     );
     if (material.local_specular.w == -1.0) {
         // Only exact authored animated stock muzzle sections receive this value.
         // Evaluate shade uniformly first: its texture derivatives stay valid.
         // The flame itself is radiance, not diffuse geometry receiving sun/SH.
         rgb = stock_muzzle_flash_radiance(base.rgb, linear);
+        // The flash draws ADDITIVELY (EngineWgpu): the air between it and the camera
+        // is already in the destination, so fog may only attenuate the emission.
+        // fog(rgb) - fog(0) is exactly rgb * transmittance for either fog model.
         if (frame.params.fog_enabled >= 1.5) {
-            rgb = apply_fog(rgb, in.world_pos);
+            rgb = max(apply_fog(rgb, in.world_pos) - apply_fog(vec3<f32>(0.0), in.world_pos), vec3<f32>(0.0));
         } else {
-            var fog_rgb = frame.fog_color.rgb;
-            if (linear > 0.5) { fog_rgb = srgb_to_linear(fog_rgb); }
-            rgb = mix(fog_rgb, rgb, in.fog);
+            rgb = rgb * in.fog;
         }
     }
     // REN-ATM-001: the per-draw twin of gpu_driven.wgsl's atmosphere census -- same words, same
@@ -1275,13 +2522,128 @@ fn shade_fragment(in: VsOut, ground_surface: bool) -> vec4<f32> {
     // the per-draw path's own per-instance debug lane is a legacy of the material-debug
     // slice and would give the panel two switches for one checkbox.
     var out_rgb = rgb;
+    var out_a2 = out_a;
     if ((material_flags(material) & MATFLAG_REFLECTIVE) != 0u && linear > 0.5
         && !matdbg_flag(MATDBG_DISABLE_FRESNEL_ENV)) {
-        out_rgb = env_reflection(out_rgb, shading_normal, in.world_pos, in.fog);
+        if (translucent > 0.5) {
+            // RFG-137: a translucent reflective surface (a river over its bed). The reflection
+            // sits ON TOP of the film, so it is not scaled by the film's alpha:
+            //   out = env*F + (1-F) * (a*shaded + (1-a)*bed)
+            // which standard alpha blending gives with A = 1-(1-F)(1-a) and src = (env*F +
+            // (1-F)*a*shaded) / A. Scaling a mix() by the film alpha instead capped every
+            // reflection at a -- a grazing river would never mirror the sky.
+            let view_dir = normalize(-in.world_pos);
+            let n = select(-shading_normal, shading_normal, dot(shading_normal, view_dir) >= 0.0);
+            let daylight = cave_daylight(in.world_pos + frame.cam_pos.xyz);
+            // RFG-164: glass (MATFLAG_GLASS on a reflective draw) reflects by the curve Reforger's
+            // window_glass.emat authors -- FresnelBias 0.05, FresnelPower 1.333 -- read as
+            // bias + (1 - bias) * (1 - cos)^power. Far stronger off-axis than water's Schlick:
+            // 0.24 at 45 degrees, which is why Reforger's panes read as sky mirrors.
+            let cos_vn = clamp(dot(n, view_dir), 0.0, 1.0);
+            var fres = env_fresnel(cos_vn);
+            if ((material_flags(material) & MATFLAG_GLASS) != 0u) {
+                fres = GLASS_FRESNEL_BIAS + (1.0 - GLASS_FRESNEL_BIAS) * pow(1.0 - cos_vn, GLASS_FRESNEL_POWER);
+            }
+            let f = fres * clamp(in.fog, 0.0, 1.0) * daylight;
+            let refl_dir = reflect(-view_dir, n);
+            var env = sky_env_sample(refl_dir);
+            if ((material_flags(material) & MATFLAG_GLASS) != 0u) {
+                // RFG-168: a window mirrors the street, not open sky: near the horizon its
+                // reflection meets houses, trees and ground, which the sky map does not hold.
+                // The first build mirrored a clean horizon gradient in every pane (bright blue
+                // windows; Reforger's read dark with a soft sheen).
+                env = env * mix(0.25, 1.0, smoothstep(0.05, 0.6, refl_dir.y));
+                // RFG-208: and desaturated by half, as Reforger's environment probes author it
+                // (ProbeHouse_Base: ReflectionDesaturation 0.5). The sky map alone tinted every
+                // pane blue; Reforger's read neutral grey (houseNear).
+                env = mix(env, vec3<f32>(dot(env, vec3<f32>(0.2126, 0.7152, 0.0722))), 0.5);
+            }
+            let a = clamp(out_a, 0.0, 1.0);
+            let a_out = 1.0 - (1.0 - f) * (1.0 - a);
+            out_rgb = (env * f + (1.0 - f) * a * out_rgb) / max(a_out, 1e-4);
+            out_a2 = a_out;
+        } else {
+            out_rgb = env_reflection(out_rgb, shading_normal, in.world_pos, in.fog);
+        }
+    }
+    // REFLECT-001 phase C: environment reflection of classified surfaces (base layer + clear
+    // coat). Skipped where DZ-003 above already mirrored the sky, and on LDR targets for the
+    // reason given there. Occluded by GTAO and the cave fade like any other sky light.
+    if (reflect_classified(m, linear) && reflect_class_mirrors(m)
+        && (material_flags(material) & MATFLAG_REFLECTIVE) == 0u
+        && !matdbg_flag(MATDBG_DISABLE_FRESNEL_ENV)) {
+        let view_dir = normalize(-in.world_pos);
+        let n = select(-shading_normal, shading_normal, dot(shading_normal, view_dir) >= 0.0);
+        // Fresnel from the GEOMETRIC normal, the reflected direction from the mapped one. With
+        // the mapped normal in both, a normal map that tilts far from the surface (Arma 3's
+        // C_SUV_01_F, C_Offroad_01_F) gave grazing Fresnel across whole panels: the red SUV came
+        // out a white mirror in the clean run of 2026-10-22, while the Hatchback was fine.
+        let gn = select(-geometric_normal, geometric_normal, dot(geometric_normal, view_dir) >= 0.0);
+        let ndv = clamp(dot(gn, view_dir), 1e-4, 1.0);
+        // The reflected direction keeps only part of the normal map's tilt (ssr.tune.x, 0.35 by
+        // default). Vehicle normal maps carry dents, dirt and panel detail, not the mirror
+        // flatness of a lacquered panel: at full strength Arma 3's C_SUV_01_F aimed its sides,
+        // tyres and shaded flanks at the sky and came out blue-grey (D.1 run, 2026-10-23).
+        let n_refl = normalize(mix(gn, n, clamp(ssr.tune.x, 0.0, 1.0)));
+        let refl_dir = reflect(-view_dir, n_refl);
+        let rough = clamp(m.refl_a.x, 0.0, 1.0);
+        let coat = clamp(m.refl_a.w, 0.0, 1.0);
+        let albedo_lin = srgb_to_linear(base.rgb);
+        let occ = gtao_ao(in.clip.xy) * cave_daylight(in.world_pos + frame.cam_pos.xyz) * clamp(in.fog, 0.0, 1.0);
+        // Phase D: prefiltered environment (sharp for the clear coat, blurred for a rough base)
+        // weighted by the split-sum environment BRDF.
+        let coat_rough = clamp(m.refl_b.y, 0.0, 1.0);
+        // Under a clear coat the paint's own reflection sees light that already refracted into
+        // the lacquer: the paint/lacquer interface has almost no index jump, so no grazing
+        // Fresnel rise. Evaluating the base at normal incidence keeps the coat as the only
+        // layer that brightens towards the edge -- the reference renders' doors stay green
+        // where the base's own rise had turned a green Peugeot's sills sand-beige.
+        let fb = reflect_env_brdf(reflect_base_reflectance(m, albedo_lin), rough,
+                                  select(ndv, 1.0, coat > 0.0));
+        let fc = reflect_env_brdf(vec3<f32>(0.04), coat_rough, ndv).x * coat;
+        // Phase E: what the world in front of the surface shows (trees, houses, other
+        // vehicles, the ground), where the screen has it; the prefiltered sky elsewhere. The
+        // sky part keeps the sky's occlusion, the hit is a real surface and only takes fog.
+        let ssr_hit = reflect_ssr(in.world_pos + gn * 0.02, refl_dir, in.clip.xy);
+        let fog_v = clamp(in.fog, 0.0, 1.0);
+        let ssr_base = reflect_ssr_color(ssr_hit, rough) * fog_v;
+        let ssr_coat = reflect_ssr_color(ssr_hit, coat_rough) * fog_v;
+        let wb = ssr_hit.w * reflect_ssr_rough_weight(rough);
+        let wc = ssr_hit.w * reflect_ssr_rough_weight(coat_rough);
+        if (u32(material.reflect1.w + 0.5) == 7u) {
+            // What the march found, at its confidence; dark blue where it found nothing.
+            return vec4<f32>(mix(vec3<f32>(0.0, 0.0, 0.12), ssr_coat, ssr_hit.w), 1.0);
+        }
+        let env_base = mix(reflect_env_radiance(refl_dir, rough) * occ, ssr_base, wb);
+        let env_coat = mix(reflect_env_radiance(refl_dir, coat_rough) * occ, ssr_coat, wc);
+        let spec = env_base * fb * (1.0 - fc) + env_coat * fc;
+        // What the reflection takes, the diffuse body no longer scatters (energy, roughly).
+        let keep = (1.0 - fc * occ) *
+            (1.0 - max(fb.r, max(fb.g, fb.b)) * occ * (1.0 - clamp(m.refl_a.z, 0.0, 1.0)));
+        if (translucent > 0.5) {
+            // A pane over what is behind it: the reflection sits on top of the film (RFG-137's form).
+            let f = clamp(max(fb.r, max(fb.g, fb.b)) * (1.0 - fc) + fc, 0.0, 1.0) * occ;
+            var a = clamp(out_a2, 0.0, 1.0);
+            var film = out_rgb;
+            if (u32(m.refl_b.x + 0.5) == 6u) {
+                // F.4: window glass absorbs, it does not scatter. A 2001 pane texture is a light
+                // tint at ~60 % coverage (the Peugeot's skl.paa: 196/155/142, alpha 147); lit like
+                // paint it became an opaque milky sheet in sunlight, with or without reflections,
+                // where the owner's reference renders look through the glass at the seats. Read
+                // the texture as a filter: a dark tint over ~two thirds of what is behind it, and
+                // the Fresnel reflection above that.
+                film = out_rgb * 0.15;
+                a = a * 0.55;
+            }
+            let a_out = 1.0 - (1.0 - f) * (1.0 - a);
+            out_rgb = (spec + (1.0 - f) * a * film) / max(a_out, 1e-4);
+            out_a2 = a_out;
+        } else {
+            out_rgb = out_rgb * keep + spec;
+        }
     }
     // MAT-051: a glass pane keeps a minimum presence head-on. Applied AFTER the
     // reflection so the floor composites the reflected colour, not the bare albedo.
-    var out_a2 = out_a;
     if ((material_flags(material) & MATFLAG_GLASS) != 0u) {
         out_a2 = max(out_a2, GLASS_MIN_ALPHA);
     }
@@ -1329,7 +2691,13 @@ fn surface_scattering(pos: vec3<f32>) -> vec3<f32> {
             cloud = mix(visibility, 1.0, smoothstep(0.85, 1.0, edge));
         }
         let terrain = terrain_sun_shadow(world.xz, world.y);
+        // The god rays' own lookup (shadow.wgsl csm_occlusion_point); WGR_SURFACE_RAYS_FILTER=1
+        // restores the receiver filter here for an A/B.
+#ifdef SURFACE_RAYS_RECEIVER_FILTER
         let object = shadow_strength(rel, sun, 1.0, vec3<f32>(0.0), vec3<f32>(0.0));
+#else
+        let object = csm_occlusion_point(rel);
+#endif
         scatter = scatter + transmit * cloud * (1.0 - max(terrain, object)) * (1.0 - segment);
         transmit = transmit * segment;
         previous = next;

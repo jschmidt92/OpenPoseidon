@@ -55,18 +55,46 @@ corrosion_import_crate(
     PROFILE ${_wgr_cargo_profile}
     ${_wgr_cargo_features}
 )
+# POSEIDON_CPU_LEVEL (top-level CMakeLists.txt): the renderer follows the C++ instruction level.
+if(POSEIDON_CPU_LEVEL STREQUAL "x86-64-v3")
+    corrosion_add_target_rustflags(wgpu_renderer -Ctarget-cpu=x86-64-v3)
+endif()
 
 add_library(WgpuRenderer STATIC
     EngineWgpu.cpp
+    EngineWgpuEarth.cpp
     EngineWgpuRetailPages.cpp
     EngineWgpuRetailInstances.cpp
     EngineWgpuRetailWorld.cpp
     EngineWgpuRetailWorldInstances.cpp
     EngineWgpuTextInput.cpp
+    EngineWgpuReflect.cpp
     GraphicsBackendWgpu.cpp
     TerrainWgpu.cpp
     EarthTerrainStream.cpp
+    EarthBuildingStream.cpp
+    EarthContentSource.cpp
+    EarthFeatureStream.cpp
+    EarthWorldgen.cpp
+    EarthSurfaceStream.cpp
+    EarthIslands.cpp
+    EarthImageryTiles.cpp
+    EarthHeightCache.cpp
+    EarthGroundNodes.cpp
+    EarthLandCover.cpp
+    EarthOverture.cpp
+    EarthTileCache.cpp
+    FishSchools.cpp
+    BirdFlocks.cpp
+    ReefLife.cpp
+    BeachCritters.cpp
+    BeachDebris.cpp
+    ProceduralTrees.cpp
+    EarthTreeDetail.cpp
     TerrainWgpuEnfusionClutter.cpp
+    TerrainWgpuNativeClutterMeshes.cpp
+    TerrainWgpuTidewaterGround.cpp
+    TerrainWgpuTidewaterDetail.cpp
     TerrainWgpuEnfusionSurface.cpp
     WaterWgpu.cpp
     TextureWgpu.cpp

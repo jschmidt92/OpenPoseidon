@@ -48,6 +48,7 @@ VertexTable::~VertexTable()
 
 void VertexTable::AllocTables(int nPos)
 {
+    _authoredTangentVertices.Clear();
     _pos.Realloc(nPos);
     _pos.Resize(nPos);
     _clip.Realloc(nPos);
@@ -73,6 +74,7 @@ void VertexTable::Reserve(int nPos)
 
 void VertexTable::Resize(int nPos)
 {
+    _authoredTangentVertices.Clear();
     _pos.Resize(nPos);
     _clip.Resize(nPos);
     _norm.Resize(nPos);
@@ -99,11 +101,13 @@ void VertexTable::ReleaseTables()
     _tangent.Clear();
     _binormal.Clear();
     _hasTangentFrame = false;
+    _authoredTangentVertices.Clear();
     _orig.Clear();
     _origClip.Clear();
 }
 void VertexTable::ReallocTable(int nPos)
 {
+    _authoredTangentVertices.Clear();
     // no need to release before alocating - we reuse content if possible
     _pos.Realloc(nPos);
     _pos.Resize(nPos);
@@ -121,6 +125,7 @@ void VertexTable::ReallocTable(int nPos)
 
 void VertexTable::Init(int nPos)
 {
+    _authoredTangentVertices.Clear();
     _pos.Init(nPos), _pos.Resize(nPos);
     _tex.Init(nPos), _tex.Resize(nPos);
     _clip.Init(nPos), _clip.Resize(nPos);
@@ -139,6 +144,7 @@ void VertexTable::DoConstruct(const VertexTable& src)
     _tangent = src._tangent;
     _binormal = src._binormal;
     _hasTangentFrame = src._hasTangentFrame;
+    _authoredTangentVertices = src._authoredTangentVertices;
     _orHints = src._orHints;
     _andHints = src._andHints;
 
@@ -267,6 +273,44 @@ int VertexTable::AddVertex(Vector3Par pos, Vector3Par norm, ClipFlags clip, floa
     _tex[vIndex].v = v;
     reused = false;
     return vIndex;
+}
+
+int VertexTable::FindVertexAmong(Vector3Par pos, Vector3Par norm, ClipFlags clip, float u, float v,
+                                 const int* candidates, int nCandidates, float precP, float precN) const
+{
+    // Exactly the tests (and their order) of AddVertex(..., v2p, pIndex) above.
+    precP *= precP;
+    precN *= precN;
+    float precTex = 0.005;
+    for (int ic = 0; ic < nCandidates; ic++)
+    {
+        const int i = candidates[ic];
+        if (_clip[i] != clip)
+        {
+            continue;
+        }
+        const V3& posI = _pos[i];
+        const V3& normI = _norm[i];
+        if (posI.Distance2(pos) > precP)
+        {
+            continue;
+        }
+        if (normI.Distance2(norm) > precN)
+        {
+            continue;
+        }
+        const UVPair& uv = _tex[i];
+        if (fabs(u - uv.u) > precTex)
+        {
+            continue;
+        }
+        if (fabs(v - uv.v) > precTex)
+        {
+            continue;
+        }
+        return i;
+    }
+    return -1;
 }
 
 int VertexTable::AddVertexFast // no duplicate check

@@ -15,7 +15,7 @@ namespace Poseidon
 {
 namespace
 {
-constexpr int kContextControlsVersion = 6;
+constexpr int kContextControlsVersion = 9;
 constexpr int kGamepadButtonA = 0;
 constexpr int kGamepadButtonB = 1;
 constexpr int kGamepadButtonX = 2;
@@ -189,12 +189,27 @@ void ApplyDriverGamepadDefaults(InputProfile& profile)
 void ApplyContextDefaults(InputContext ctx, InputProfile& profile)
 {
     ApplyCommonGamepadDefaults(profile);
+    // Leaning, jumping and the swim keys are on-foot only; elsewhere Q/E/Z/Space keep their vehicle meaning.
+    if (ctx != InputContext::Infantry)
+    {
+        for (UserAction a : {UALeanLeft, UALeanRight, UAJump, UADive, UASurface})
+            profile.ClearBindings(a);
+    }
+    else
+    {
+        // On foot Space jumps; switching weapons keeps its other default, Right Ctrl.
+        profile.Unbind(UAToggleWeapons, InputCode::Key(SDL_SCANCODE_SPACE));
+    }
 
     switch (ctx)
     {
         case InputContext::Infantry:
             ApplyInfantryGamepadDefaults(profile);
             ApplyFreelookDefaults(profile);
+            profile.Unbind(UAInventory, InputCode::Key(SDL_SCANCODE_O));
+            profile.Bind(UAInventory, InputCode::Key(SDL_SCANCODE_TAB));
+            profile.Unbind(UALockTargets, InputCode::Key(SDL_SCANCODE_TAB));
+            profile.Bind(UALockTargets, InputCode::Key(SDL_SCANCODE_O));
             break;
         case InputContext::CarDriver:
             ApplyDriverGamepadDefaults(profile);
@@ -216,6 +231,34 @@ bool IsKeyboardMouseBinding(const InputBinding& binding)
         return true;
     const int device = InputBindingDevice(binding.code.toLegacy());
     return device == INPUT_DEVICE_KEYBOARD || device == INPUT_DEVICE_MOUSE || device == INPUT_DEVICE_MOUSE_AXIS;
+}
+
+void MigrateInfantryInventoryKey(InputProfile& profile)
+{
+    const InputBinding oldInventory(InputCode::Key(SDL_SCANCODE_O));
+    const InputBinding oldTarget(InputCode::Key(SDL_SCANCODE_TAB));
+    const auto& inventory = profile.GetBindingEntries(UAInventory);
+    // Only upgrade the old single default. Keep custom/chorded/cleared actions.
+    if (inventory.size() != 1 || !(inventory[0] == oldInventory))
+        return;
+    for (int action = 0; action < UAN; ++action)
+    {
+        for (const auto& binding : profile.GetBindingEntries(static_cast<UserAction>(action)))
+        {
+            if (binding.code == oldTarget.code &&
+                !(action == UALockTargets && binding == oldTarget))
+                return;
+            if (action != UAInventory && action != UALockTargets && binding.code == oldInventory.code)
+                return;
+        }
+    }
+    profile.ClearBindings(UAInventory);
+    profile.Bind(UAInventory, oldTarget);
+    if (profile.HasBinding(UALockTargets, oldTarget))
+    {
+        profile.Unbind(UALockTargets, oldTarget);
+        profile.Bind(UALockTargets, oldInventory);
+    }
 }
 
 void AddMapWheelToEmptySlot(InputProfile& profile, UserAction action, InputCode wheel)
@@ -282,6 +325,13 @@ bool ContextControlsConfig::Load(const std::string& path)
         {
             profile.LoadDefaults();
             ApplyContextDefaults(ctx, profile);
+            if (ctx == InputContext::Infantry)
+            {
+                // Seed the historical inventory key before loading old overrides;
+                // the guarded migration below resolves the complete profile.
+                profile.ClearBindings(UAInventory);
+                profile.Bind(UAInventory, InputCode::Key(SDL_SCANCODE_O));
+            }
         }
         else if (version < 6)
         {
@@ -328,6 +378,40 @@ bool ContextControlsConfig::Load(const std::string& path)
         {
             AddMapWheelToEmptySlot(profile, UAMapZoomIn, InputCode::MouseWheelDown());
             AddMapWheelToEmptySlot(profile, UAMapZoomOut, InputCode::MouseWheelUp());
+        }
+        if (version < 7 && ctx == InputContext::Infantry)
+            MigrateInfantryInventoryKey(profile);
+        // v8 added corner peeking. A saved v7 profile has no lean rows: give the on-foot
+        // profile the Q/E defaults unless the player already listed the actions.
+        if (version < 8 && ctx == InputContext::Infantry)
+        {
+            if (profile.GetBindingEntries(UALeanLeft).empty())
+                profile.Bind(UALeanLeft, InputCode::Key(SDL_SCANCODE_Q));
+            if (profile.GetBindingEntries(UALeanRight).empty())
+                profile.Bind(UALeanRight, InputCode::Key(SDL_SCANCODE_E));
+        }
+        // v9 added the jump (Space on foot, weapon switching keeps Right Ctrl) and the swim keys of their own
+        // (dive Z / Page Down, surface Q / Page Up). Only actions the file does not list get them, and Space moves
+        // off weapon switching only when it is still there as the default and the jump takes it.
+        if (version < 9 && ctx == InputContext::Infantry)
+        {
+            const InputBinding space(InputCode::Key(SDL_SCANCODE_SPACE));
+            if (profile.GetBindingEntries(UAJump).empty())
+            {
+                profile.Bind(UAJump, space);
+                if (profile.HasBinding(UAToggleWeapons, space))
+                    profile.Unbind(UAToggleWeapons, InputCode::Key(SDL_SCANCODE_SPACE));
+            }
+            if (profile.GetBindingEntries(UADive).empty())
+            {
+                profile.Bind(UADive, InputCode::Key(SDL_SCANCODE_Z));
+                profile.Bind(UADive, InputCode::Key(SDL_SCANCODE_PAGEDOWN));
+            }
+            if (profile.GetBindingEntries(UASurface).empty())
+            {
+                profile.Bind(UASurface, InputCode::Key(SDL_SCANCODE_Q));
+                profile.Bind(UASurface, InputCode::Key(SDL_SCANCODE_PAGEUP));
+            }
         }
     }
 

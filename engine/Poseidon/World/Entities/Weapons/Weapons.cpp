@@ -2,6 +2,7 @@
 
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <Poseidon/World/Entities/Weapons/Weapons.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/AI/VehicleAI.hpp>
 #include <Poseidon/AI/AI.hpp>
@@ -400,6 +401,15 @@ void MagazineType::Init(const char* name)
             _modes[i]->Init(cls >> mode);
         }
     }
+    // AI-XRAY-003: mark ammo thrown by hand (see AmmoType::thrown)
+    for (int i = 0; i < n; i++)
+    {
+        const AmmoType* ammo = _modes[i]->_ammo;
+        if (ammo && ammo->_simulation == AmmoShotShell && _initSpeed < 30)
+        {
+            const_cast<AmmoType*>(ammo)->thrown = true;
+        }
+    }
 
     entry = cls.FindEntry("useAction");
     if (entry)
@@ -453,6 +463,21 @@ void MuzzleType::Init(const ParamEntry& cls, const WeaponType* weapon)
     _displayName.Bind(cls >> "displayName");
     _magazineReloadTime = cls >> "magazineReloadTime";
     GetValue(_sound, cls >> "drySound");
+    if (const ParamEntry* shot = cls.FindEntry("a3SoundShot"); shot && shot->IsArray())
+        GetValue(_shotSound, *shot);
+    // --arma1: the Arma 1 weapon's own shot sound, for its main muzzle and its grenade launcher
+    else if (weapon)
+    {
+        // which muzzle of the weapon this is: the weapon itself ("this") or its place in muzzles[]
+        int muzzleIndex = stricmp(cls.GetName(), weapon->GetName()) == 0 ? 0 : -1;
+        if (muzzleIndex < 0 && weapon->_parClass)
+            if (const ParamEntry* muzzles = weapon->_parClass->FindEntry("muzzles"); muzzles && muzzles->IsArray())
+                for (int i = 0; i < muzzles->GetSize() && muzzleIndex < 0; i++)
+                    if (stricmp(((RStringB)(*muzzles)[i]).Data(), cls.GetName()) == 0)
+                        muzzleIndex = i;
+        if (const ParamEntry* shot = Arma1Compat::Arma1ShotSound(weapon->GetName(), muzzleIndex))
+            GetValue(_shotSound, *shot);
+    }
     _soundContinuous = cls >> "soundContinuous";
     GetValue(_reloadSound, cls >> "reloadSound");
     GetValue(_reloadMagazineSound, cls >> "reloadMagazineSound");
@@ -483,6 +508,12 @@ void MuzzleType::Init(const ParamEntry& cls, const WeaponType* weapon)
 
     _opticsFlare = cls >> "opticsFlare";
     _forceOptics = cls >> "forceOptics";
+    {
+        const ParamEntry* optics3D = cls.FindEntry("optics3D");
+        _optics3D = optics3D && (int)*optics3D != 0;
+        const ParamEntry* zoomInit = cls.FindEntry("opticsZoomInit");
+        _opticsZoomInit = zoomInit ? (float)*zoomInit : -1.0f;
+    }
 
     _muzzlePos = VZero;
     _muzzleDir = VForward;
@@ -504,6 +535,56 @@ void MuzzleType::Init(const ParamEntry& cls, const WeaponType* weapon)
             _magazines[i] = MagazineTypes.New(magazine);
         }
     }
+    // --arma1: the Arma 1 magazines generated on a CWA magazine this muzzle takes
+    // (A1x_5Rnd_762x51_M24 on M21) fit it as well. Nothing without --arma1.
+    for (int i = 0, listed = _magazines.Size(); i < listed; i++)
+    {
+        if (!_magazines[i])
+        {
+            continue;
+        }
+        for (const RString& extra : Arma1Compat::GeneratedMagazinesFor(_magazines[i]->GetName()))
+        {
+            if (weapon && !Arma1Compat::GeneratedMagazineFits(weapon->GetName(), extra))
+            {
+                continue;
+            }
+            bool present = false;
+            for (int k = 0; k < _magazines.Size() && !present; k++)
+            {
+                present = _magazines[k] && stricmp(_magazines[k]->GetName(), extra) == 0;
+            }
+            if (!present)
+            {
+                _magazines.Add(MagazineTypes.New(extra));
+            }
+        }
+    }
+    // --arma1: the main muzzle of a generated A1x_ weapon takes the magazines its Arma 1
+    // weapon lists, whatever CWA magazine they ride on (A1x_15Rnd_9x19_M9 on the Beretta,
+    // whose muzzle takes BerettaMag). Other muzzles (M203) keep the carrier's list.
+    if (weapon && stricmp(cls.GetName(), weapon->GetName()) == 0)
+    {
+        for (const RString& extra : Arma1Compat::ListedGeneratedMagazines(weapon->GetName()))
+        {
+            bool present = false;
+            for (int k = 0; k < _magazines.Size() && !present; k++)
+            {
+                present = _magazines[k] && stricmp(_magazines[k]->GetName(), extra) == 0;
+            }
+            if (present)
+            {
+                continue;
+            }
+            // a magazine needs a mode for every mode of the muzzle (a magazine on M16
+            // rounds has two, CWA's G36a muzzle three): the slot would read none
+            Ref<MagazineType> type = MagazineTypes.New(extra);
+            if (type && type->_modes.Size() >= (cls >> "modes").GetSize())
+            {
+                _magazines.Add(type);
+            }
+        }
+    }
     if (_magazines.Size() > 0)
     {
         _typicalMagazine = _magazines[0];
@@ -512,11 +593,59 @@ void MuzzleType::Init(const ParamEntry& cls, const WeaponType* weapon)
     _nModes = (cls >> "modes").GetSize();
 }
 
+void Poseidon::AddMagazineToMuzzlesTaking(const char* baseMagazine, const char* magazine)
+{
+    Ref<MagazineType> added;
+    for (int w = 0; w < WeaponTypes.Size(); w++)
+    {
+        WeaponType* weapon = WeaponTypes.Get(w);
+        if (!weapon)
+        {
+            continue;
+        }
+        for (int m = 0; m < weapon->_muzzles.Size(); m++)
+        {
+            MuzzleType* muzzle = weapon->_muzzles[m];
+            if (!muzzle)
+            {
+                continue;
+            }
+            bool takesBase = false;
+            bool takesNew = false;
+            for (int k = 0; k < muzzle->_magazines.Size(); k++)
+            {
+                const MagazineType* type = muzzle->_magazines[k];
+                if (!type)
+                {
+                    continue;
+                }
+                takesBase = takesBase || stricmp(type->GetName(), baseMagazine) == 0;
+                takesNew = takesNew || stricmp(type->GetName(), magazine) == 0;
+            }
+            // the main muzzle of an A1x_ weapon also takes what its Arma 1 weapon lists
+            const bool listed = !takesBase && stricmp(muzzle->GetName(), weapon->GetName()) == 0 &&
+                                Arma1Compat::WeaponListsGeneratedMagazine(weapon->GetName(), magazine);
+            if ((takesBase || listed) && !takesNew && Arma1Compat::GeneratedMagazineFits(weapon->GetName(), magazine))
+            {
+                if (!added)
+                {
+                    added = MagazineTypes.New(magazine);
+                }
+                if (listed && (!added || added->_modes.Size() < muzzle->_nModes))
+                {
+                    continue; // no mode for every slot of this muzzle
+                }
+                muzzle->_magazines.Add(added);
+            }
+        }
+    }
+}
+
 void MuzzleType::InitShape(const WeaponType* weapon)
 {
     const ParamEntry& cls = *_parClass;
 
-    RStringB oModelName = cls >> "modelOptics";
+    RStringB oModelName = _armaOptics.GetLength() > 0 ? RStringB(_armaOptics) : RStringB(cls >> "modelOptics");
     _opticsModel = oModelName.GetLength() > 0 ? Shapes.New(GetShapeName(oModelName), true, false) : nullptr;
     if (_opticsModel && _opticsModel->NLevels() > 0)
     {
@@ -567,6 +696,9 @@ void MuzzleType::InitShape(const WeaponType* weapon)
                 Vector3 vEnd = mem->NamedPosition(end);
                 _cartridgeOutVel = (vEnd - _cartridgeOutPos) * 50;
             }
+            _hasArmaEye = _armaCamera.GetLength() > 0 && mem->FindNamedSel(_armaCamera) >= 0;
+            if (_hasArmaEye)
+                _armaEyePos = mem->NamedPosition(_armaCamera);
         }
     }
 }
@@ -610,6 +742,12 @@ void WeaponType::InitShape() const
             _model->SetAutoCenter(false);
             _model->CalculateMinMax();
             _animFire.Init(_model, "zasleh", nullptr);
+            _hasEyePos = false;
+            if (Shape* mem = _model->MemoryLevel(); mem && mem->FindNamedSel("eye") >= 0)
+            {
+                _eyePos = mem->NamedPosition("eye");
+                _hasEyePos = true;
+            }
 
             if (_parClass->FindEntry("revolving") && _parClass->FindEntry("revolvingAxis"))
             {
@@ -781,6 +919,52 @@ void WeaponType::Init(const char* name)
             _muzzles[i]->Init(cls >> muzzle, this);
         }
     }
+    // An Arma 2 weapon on a CWA weapon with several muzzles (the M4A1 HWS GL on
+    // M16GrenadeLauncher, C2B) declares its 3D sights on itself, where the inherited
+    // muzzle classes do not see them: the first muzzle, the rifle, looks through them.
+    if (n > 1 && stricmp((RStringB)(cls >> "muzzles")[0], "this") != 0)
+        if (const ParamEntry* optics3D = cls.FindEntry("optics3D"); optics3D && (int)*optics3D != 0)
+        {
+            MuzzleType* rifle = _muzzles[0];
+            rifle->_optics3D = true;
+            const auto take = [&](const char* key, float& value) {
+                if (const ParamEntry* e = cls.FindEntry(key); e && !e->IsClass() && !e->IsArray())
+                    value = (float)*e;
+            };
+            take("opticsZoomMin", rifle->_opticsZoomMin);
+            take("opticsZoomMax", rifle->_opticsZoomMax);
+            take("opticsZoomInit", rifle->_opticsZoomInit);
+            take("distanceZoomMin", rifle->_distanceZoomMin);
+            take("distanceZoomMax", rifle->_distanceZoomMax);
+        }
+    // --arma1: each muzzle looks through the Arma 1 muzzle's own sight -- the ACOG rifles'
+    // rifle muzzle through optika_ACOG (Arma 1's 2D scope; the M16A4 ACOG GL's view was
+    // blocked by its own 3D model, the M4A1 M203 ACOG showed CWA's sight), the M203 from
+    // "GL eye" along the weapon
+    if (n > 1)
+        for (int i = 0; i < n; i++)
+        {
+            const Arma1Compat::Arma1Sight sight = Arma1Compat::Arma1MuzzleSight(GetName(), i);
+            if (!sight.valid)
+                continue;
+            MuzzleType* m = _muzzles[i];
+            if (!sight.optics.empty())
+            {
+                m->_armaOptics = sight.optics.c_str();
+                m->_optics3D = false;
+            }
+            else if (!sight.camera.empty())
+            {
+                m->_armaCamera = sight.camera.c_str();
+                m->_optics3D = true;
+            }
+            if (sight.zoomInit > 0)
+                m->_opticsZoomInit = sight.zoomInit;
+            if (sight.zoomMin > 0)
+                m->_opticsZoomMin = sight.zoomMin;
+            if (sight.zoomMax > 0)
+                m->_opticsZoomMax = sight.zoomMax;
+        }
 }
 
 LSError WeaponType::Serialize(ParamArchive& ar)

@@ -483,7 +483,7 @@ impl GodRays {
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -530,7 +530,7 @@ impl GodRays {
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -615,6 +615,10 @@ impl GodRays {
             && self.settings.density > 0.0
             && sky.control[0] != 0.0
             && sun_elevation_fade(sky.sun_dir[1]) > 0.001
+            // Whole world (cloud4.w) with the camera above the air (night_zenith.w is its true altitude):
+            // there is nothing to scatter. The march reads each sample's local height as height above
+            // sea level, which at the moon (its own frame, local height ~0) lit a sea-level haze.
+            && !(sky.cloud4[3] > 0.5 && sky.night_zenith[3] > 100_000.0)
     }
 
     fn ensure_target(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -876,6 +880,7 @@ mod tests {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()

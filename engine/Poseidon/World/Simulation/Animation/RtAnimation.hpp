@@ -52,9 +52,9 @@ class AnimationRTWeights
 
 	void Init( Shape *shape );
 	void AddSelection( Shape *shape, int selIndex, int matrixIndex );
-	// FACE-002: move every vertex of a named selection ONTO `matrixIndex` at full weight,
-	// discarding whatever it was bound to. Unlike AddSelection this does not blend -- the
-	// face rig needs the whole offset, not a share of it. Returns the matrix index those
+	// FACE-002: move every vertex of a named selection ONTO `matrixIndex`: a vertex bound to
+	// one bone moves at full weight; a blended vertex moves only its parent bone's share and
+	// keeps its other bones (so a lip skinned to torso + neck still follows the neck). Returns the matrix index those
 	// vertices were bound to before (the most common one), or -1 if the selection is empty,
 	// unweighted, or does not agree on a single parent bone. Vertices whose bone already
 	// lies in [faceLo,faceHi) belong to an earlier face group and are left with it.
@@ -63,6 +63,7 @@ class AnimationRTWeights
 	void Normalize();
 	bool IsSimple() const {return _isSimple;}
 	const AnimationRTWeight &operator [] ( int i )const {return _data[i];}
+	int Size() const {return _data.Size();}
 	const AnimationRTWeight *Data() const {return _data.Data();}
 
 };
@@ -301,10 +302,12 @@ class AnimationRT: public RefCount, public CLDLink
 	(
 		Matrix4 &mat, float time, const AnimationRTWeight &wgt
 	) const;
+	// `origin`: where the source model's origin lies in the shape's coordinates
+	// (LODShape::AnimationOrigin); the pose is applied about it. Zero for OFP shapes.
 	Vector3 Point
 	(
 		const WeightInfo &lWeights, LODShape *lShape, int level,
-		float time, int index
+		float time, int index, Vector3Par origin = VZero
 	) const;
 	const AnimationRTName &GetName() const {return _name;}
 	const char *Name() const {return _name.name;}

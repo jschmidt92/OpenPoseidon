@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Poseidon/World/Entities/Vehicles/Vehicle.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 
 namespace Poseidon
 {
@@ -109,6 +110,9 @@ class CameraVehicle : public CameraHolder
     bool _altitudeSpeedScaling;
     bool _reportedWorldBounds;
     bool _mouseLookRequiresRightButton;
+    // free-fly pan/tilt rate (rad/s), eased toward the input (CameraHold.cpp, FreeFlyLookTime)
+    float _lookHeadRate = 0.0f;
+    float _lookDiveRate = 0.0f;
 
   public:
     Vector3 GetTarget() const;
@@ -117,12 +121,24 @@ class CameraVehicle : public CameraHolder
     ~CameraVehicle() override;
 
     void ResetTargets();
+    //! A manual camera's own fov (what keypad zoom drives), set directly.
+    void SetManualFov(float fov) { _lastFov = _minFov = _maxFov = fov; }
+    //! Harness only (POSEIDON_FREEFLY_DRIFT): a constant velocity applied inside Simulate, i.e.
+    //! per simulation tick exactly as keyboard flight moves the camera.
+    void SetHarnessDrift(Vector3Par metresPerSecond) { _harnessDrift = metresPerSecond; }
+    Vector3 _harnessDrift = VZero;
+    // Test harness: turn about the vertical at this many radians per second (pans, for temporal
+    // upscaler/grass motion probes a translating camera cannot reproduce).
+    void SetHarnessYawRate(float radiansPerSecond) { _harnessYawRate = radiansPerSecond; }
+    float _harnessYawRate = 0.0f;
     // Debug free-fly can opt into Game Master-style speed scaling.
     void SetAltitudeSpeedScaling(bool enabled) { _altitudeSpeedScaling = enabled; }
     void SetMouseLookRequiresRightButton(bool enabled) { _mouseLookRequiresRightButton = enabled; }
     void SetCrossHairs(bool enabled) { _crossHairs = enabled; }
 
     void Simulate(float deltaT, SimulationImportance prec) override;
+    // Whole world: switch between the Earth and moon frames / re-centre on the moon (EarthMoonFrame.hpp).
+    bool ReframeEarthMoon(Vector3& position, const EarthStreaming::Location& earthLocation);
 
     bool OcclusionFire() const override { return false; }
     bool OcclusionView() const override { return false; }

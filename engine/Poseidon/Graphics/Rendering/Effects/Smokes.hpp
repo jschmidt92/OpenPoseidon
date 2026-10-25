@@ -350,6 +350,7 @@ struct CloudletShadowSample
     float radius = 0.0f;
     float density = 0.0f;
     float heightAboveGround = 0.0f;
+    float albedo = -1.0f; //!< FIRE-002: scattering albedo, -1 = the renderer's default
 };
 //! Returns false for anything that is not a legacy cloudlet, or is too faint to matter.
 bool SampleCloudletShadow(const Entity* entity, CloudletShadowSample& out);
@@ -370,6 +371,7 @@ class CloudletSource: public SerializeClass
 	bool _smokeShadow = true;
 	float _cloudletGrowUp;
 	float _cloudletFadeIn;
+	float _handoffFadeIn = 0;
 	float _cloudletFadeOut;
 	float _cloudletAccY;
 	float _cloudletMinYSpeed;
@@ -391,6 +393,10 @@ class CloudletSource: public SerializeClass
 	void SetInterval( float interval ){_interval=interval;}
 	void SetShape( LODShapeWithShadow *shape ){_cloudletShape=shape;}
 	void SetAlpha( float alpha ) {_cloudletAlpha=alpha;}
+	//! FIRE-001: while a volumetric plume (FireVolumes) is drawn over this source, its puffs fade in
+	//! over at least this long, so they appear where the plume leaves the volume's box instead of
+	//! piling the old look over the new one at the source. 0: the configured fade-in.
+	void SetHandoffFadeIn( float seconds ) {_handoffFadeIn=seconds;}
 	void SetSmokeShadow(bool enabled) {_smokeShadow = enabled;}
 	void SetSize( float size ) {_cloudletSize=size;}
 	void SetTimes( float duration, float animPeriod )
@@ -487,11 +493,21 @@ class WeaponCloudsSource: public DustSource
 
 	protected:
 	float _timeToLive;
+	//! Deceleration (m/s^2) of a puff's sideways blast speed towards its drift target, and
+	//! whether that target is the wind (rifle smoke) or still air (the legacy 0, 0).
+	float _sideFriction = 1.5f;
+	bool _windDrift = false;
 
 	private:
 	void Init();
 
 	public:
+	//! Rifle smoke: the retail config gives infantry a 50 ms puff, which never reads as
+	//! smoke. This makes it a thin grey puff that brakes from the muzzle blast within
+	//! ~1.5 m, swells, rises slowly and drifts with the wind for ~1.4 s. The emission
+	//! interval is left as configured, so the shared RNG is drawn exactly as before.
+	void SetRifleSmoke();
+	static bool RifleSmokeEnabled();
 	WeaponCloudsSource( float interval=0.05 ); // basic shape
 	WeaponCloudsSource( LODShapeWithShadow *shape, float interval );
 	void Simulate
@@ -572,6 +588,9 @@ class SmokeSourceVehicle: public Entity,public SmokeSource
 	float _minExplosionFactor,_maxExplosionFactor;
 	Poseidon::Foundation::Time _explosionTime;
 	bool _exploded;
+	// FIRE-002: seconds this source has been smoking (the wreck's delayed ignition when there was no
+	// fireball); the address one byte in is the owner key of the wreck's black column
+	float _burnAge = 0;
 	
 	public:
 	SmokeSourceVehicle
@@ -632,6 +651,7 @@ class Explosion: public Vehicle
 	Ref<LightPoint> _light;
 	float _minLightTime;
 	OLink<Vehicle> _owner; // who owned the shot
+	bool _fireVolumeSpawned = false; // FIRE-001: the volumetric burst, once
 
 	public:
 	Explosion
@@ -656,6 +676,9 @@ class Explosion: public Vehicle
 	TMError TransferMsg(NetworkMessageContext &ctx) override;
 
 	USE_FAST_ALLOCATOR;
+
+	// its own class id: without one dyn_cast<Explosion> answers yes for every object of its base
+	USE_CASTING(base)
 };
 
 class Crater: public Smoke
@@ -846,6 +869,9 @@ class ObjectDestructed: public Vehicle
 	TMError TransferMsg(NetworkMessageContext &ctx) override;
 
 	USE_FAST_ALLOCATOR;
+
+	// its own class id: without one dyn_cast<ObjectDestructed> answers yes for every object of its base
+	USE_CASTING(base)
 };
 
 

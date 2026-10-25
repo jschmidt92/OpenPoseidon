@@ -122,6 +122,7 @@ mod tests {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             },
         )) else {
             eprintln!("skip: no adapter");
@@ -202,7 +203,7 @@ pub fn create_device(
             &extensions,
             features,
             limits,
-            &wgpu::MemoryHints::default(),
+            &crate::device_memory_hints(),
             family_index,
             0,
         )
@@ -215,6 +216,7 @@ pub fn create_device(
                 label: Some("wgr_device_dlss"),
                 required_features: features,
                 required_limits: limits.clone(),
+                memory_hints: crate::device_memory_hints(),
                 ..Default::default()
             },
         )

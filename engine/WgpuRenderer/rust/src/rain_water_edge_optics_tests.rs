@@ -39,7 +39,7 @@ fn actual_edge_probe_contract_and_csv_refusals() {
     let terrain=include_str!("terrain/terrain.wgsl");let water=include_str!("rain_water.wgsl").replace("\r\n","\n");
     // The actual coat now filters a cone around the same disturbed-soil normal;
     // its directions, rather than one sharp mirror ray, query the sky.
-    assert!(terrain.contains("let moist_n = geometric_n;"));
+    assert!(terrain.contains("let moist_n = normalize(geometric_n + vec3<f32>(-bump.x, 0.0, -bump.y));"));
     assert!(terrain.contains("soil_wet_environment_samples(view, moist_n,"));
     assert!(terrain.contains("ground_sky_reflection(samples[i].xyz)"));
     assert!(water.contains("if (standing > 0.0) {\n        scene=rain_water_scene_reflection"));
@@ -72,7 +72,7 @@ fn actual_gpu_recorded_edge_direction_and_retained_interface_eligibility() {
     encoder.copy_buffer_to_buffer(&output,0,&staging,0,bytes);queue.submit([encoder.finish()]);
     let(tx,rx)=std::sync::mpsc::channel();staging.slice(..).map_async(wgpu::MapMode::Read,move|r|tx.send(r).unwrap());
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();rx.recv().unwrap().unwrap();
-    let data=staging.slice(..).get_mapped_range();let values:&[[f32;4]]=bytemuck::cast_slice(&data);
+    let data=staging.slice(..).get_mapped_range().expect("wgpu: mapped range of a mapped buffer");let values:&[[f32;4]]=bytemuck::cast_slice(&data);
     let mut downward=0;let mut standing=0;let mut wet=0;let mut logged=0;
     for (i,e) in rows.iter().enumerate() {
         let view=(glam::Vec3::from_array(e.eye[..3].try_into().unwrap())-glam::Vec3::from_array(e.surface[..3].try_into().unwrap())).normalize();

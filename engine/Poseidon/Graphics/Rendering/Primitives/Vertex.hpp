@@ -142,6 +142,9 @@ protected:
     AutoArray<Vector3> _tangent;
     AutoArray<Vector3> _binormal;
     bool _hasTangentFrame = false;
+    // Optional CPU provenance, allocated only by the authored-frame importer.
+    // Generated and authored axes can coexist; admission must inspect references.
+    AutoArray<unsigned char> _authoredTangentVertices;
 
 	AutoArray<UVPair> _tex;
 	// Second UV set (ODOL/MLOD `tex1`), OPTIONAL: empty on every legacy shape, sized
@@ -284,6 +287,18 @@ public:
 		const int *candidates, int nCandidates, bool &reused,
 		float precP = 0.005, float precN = 0.05
 		);
+	// LOAD-001: the match AddVertex(..., v2p, pIndex) makes -- same clip, position, normal and uv
+	// tolerances, lowest index wins -- searched only over `candidates`, which the caller
+	// guarantees are exactly the existing vertices of Objektiv point pIndex, in ascending order.
+	// Returns -1 when none matches. The full scan is O(vertices) per call, O(n^2) per LOD: a
+	// 282k-vertex MLOD took 140 s to load through it.
+	int FindVertexAmong
+		(
+		Vector3Par pos, Vector3Par norm, ClipFlags clip,
+		float u, float v,
+		const int *candidates, int nCandidates,
+		float precP = 0.005, float precN = 0.05
+		) const;
 	// add vertex, no duplicate check
 	int AddVertexFast
 		(
@@ -299,6 +314,14 @@ public:
     Vector3 &SetTangent(int i) { return _tangent[i]; }
     Vector3Val Binormal(int i) const { return _binormal[i]; }
     Vector3 &SetBinormal(int i) { return _binormal[i]; }
+    void ResizeAuthoredTangentVertices(int count) {
+        _authoredTangentVertices.Resize(count);
+        for (int i=0;i<count;++i) _authoredTangentVertices[i]=0;
+    }
+    void SetAuthoredTangentVertex(int i, bool value) { _authoredTangentVertices[i]=value?1:0; }
+    bool HasAuthoredTangentVertex(int i) const {
+        return i>=0 && i<_authoredTangentVertices.Size() && _authoredTangentVertices[i]!=0;
+    }
     bool HasTangentFrame() const { return _hasTangentFrame; }
     void SetHasTangentFrame(bool value) { _hasTangentFrame = value; }
 	Vector3Val OrigPos(int i) const { return _orig[i]; }

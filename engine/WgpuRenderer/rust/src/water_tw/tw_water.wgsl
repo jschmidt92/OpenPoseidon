@@ -28,7 +28,7 @@
 // * The per-cascade shallow-water attenuation reads the live cascade sizes (Tidewater bakes the
 //   defaults in); identical unless the Water tab's cascade scale is moved off 1.
 
-#import frame::{frame, reverse_z, fog_factor, apply_fog, terrain_sun_shadow, cloud_sun_shadow}
+#import frame::{frame, reverse_z, fog_factor, apply_fog, terrain_sun_shadow, cloud_sun_shadow, sky_irradiance}
 #import shadow::shadow_strength
 #import color::srgb_to_linear
 
@@ -69,6 +69,83 @@ struct OceanParams {
 @group(1) @binding(19) var<storage, read> breakersCrest: array<vec4<f32>>; // breaker crest records (tw_lip.wgsl)
 @group(1) @binding(23) var causticsFineTex: texture_2d<f32>;  // W5b caustics (caustics.rs)
 @group(1) @binding(24) var causticsBroadTex: texture_2d<f32>;
+// (OP) Whole World: the sea floor beyond the heightmap's window (TwWater::set_far_floor): world heights on a coarse
+// grid, placed by (origin x, origin z, cell, samples a side; 0 = none).
+@group(1) @binding(28) var farFloorTex: texture_2d<f32>;
+@group(1) @binding(29) var<uniform> farFloor: vec4<f32>;
+
+// Earth presentation belongs to the material: the wake kernel also consumes
+// tw_common.wgsl, but deliberately has no TwSurface binding.
+fn earthWater() -> bool { return tw.detail.w > 0.5; }
+// The Earth sea is drawn to EARTH_SEA_CEILING (camera metres; WaterWgpu::DrawEarthWater's EarthSeaCeiling), fading
+// into the imagery from EARTH_SEA_FADE_START.
+const EARTH_SEA_FADE_START: f32 = 30000.0;
+const EARTH_SEA_CEILING: f32 = 40000.0;
+fn earthWaterDrop(xz: vec2<f32>) -> f32 {
+    if (!earthWater()) { return 0.0; }
+    let d = xz - vec2<f32>(6400.0);
+    let r2 = dot(d, d);
+    let radius = 6378137.0;
+    return r2 / (radius + sqrt(max(radius * radius - r2, 0.0)));
+}
+fn waterLevelAt(xz: vec2<f32>) -> f32 { return tw.sea.x - earthWaterDrop(xz); }
+fn earthWaterNormal(xz: vec2<f32>) -> vec3<f32> {
+    if (!earthWater()) { return vec3<f32>(0.0, 1.0, 0.0); }
+    let p = xz - vec2<f32>(6400.0);
+    return normalize(vec3<f32>(p.x, 6378137.0 - earthWaterDrop(xz), p.y));
+}
+fn earthMaterialCorner(ix: i32, iz: i32) -> f32 {
+    let corner = clamp(vec2<i32>(ix, iz), vec2<i32>(0), vec2<i32>(i32(cf.hm_width) - 1, i32(cf.hm_height) - 1));
+    // The ground as drawn: since 2026-10-24 the streamed heights carry the real sea floor (EarthTerrainStream::
+    // WithSeaDepth) and keep low land dry, so the old -5..0.5 m 'open sea, 200 m down' stand-in is gone here too.
+    return hm_load(corner.x, corner.y);
+}
+// The far floor at xz: (height, 1), or (0, 0) outside it or without one.
+fn farFloorAt(xz: vec2<f32>) -> vec2<f32> {
+    let n = farFloor.w;
+    if (n < 2.0) { return vec2<f32>(0.0); }
+    let t = (xz - farFloor.xy) / max(farFloor.z, 1e-3);
+    if (any(t < vec2<f32>(0.0)) || any(t > vec2<f32>(n - 1.0))) { return vec2<f32>(0.0); }
+    let base = min(floor(t), vec2<f32>(n - 2.0));
+    let f = t - base;
+    let i = vec2<i32>(base);
+    let a = textureLoad(farFloorTex, i, 0).x;
+    let b = textureLoad(farFloorTex, i + vec2<i32>(1, 0), 0).x;
+    let c = textureLoad(farFloorTex, i + vec2<i32>(0, 1), 0).x;
+    let d = textureLoad(farFloorTex, i + vec2<i32>(1, 1), 0).x;
+    return vec2<f32>(mix(mix(a, b, f.x), mix(c, d, f.x), f.y), 1.0);
+}
+fn materialTerrainHeightAt(xz: vec2<f32>) -> f32 {
+    if (!earthWater() || cf.enabled <= 0.5 || cf.hm_width < 2u || cf.hm_height < 2u) {
+        return terrainHeightAt(xz);
+    }
+    // Lower corners before interpolation, exactly as the opaque near mesh.
+    // Classifying an interpolated height instead leaves a depth discontinuity
+    // across mixed land/ocean triangles and makes offshore pixels shallow surf.
+    let t = (xz - cf.origin) / max(cf.terrain_grid, 1e-4);
+    let base = floor(t);
+    let f = t - base;
+    let ix = i32(base.x); let iz = i32(base.y);
+    let a = earthMaterialCorner(ix, iz); let b = earthMaterialCorner(ix + 1, iz);
+    let c = earthMaterialCorner(ix, iz + 1); let d = earthMaterialCorner(ix + 1, iz + 1);
+    let lower = a + (c - a) * f.y + (b - a) * f.x;
+    let upper = c + (b - d) - (c - d) * f.x - (b - d) * f.y;
+    let h = select(upper, lower, f.x + f.y <= 1.0);
+    // Preserve the existing finite off-map transition, with Earth's curved
+    // datum. Clamped dry edge texels must not run out to the water horizon.
+    let size = vec2<f32>(f32(cf.hm_width - 1u), f32(cf.hm_height - 1u)) * cf.terrain_grid;
+    let r = xz - cf.origin;
+    // Beyond the window: the far floor (Whole World's real sea depth), handed over inside the window's last 400 m
+    // so the seam has no crease; without one the old 200 m stand-in outside it -- that stand-in drew the window as
+    // a bright rectangle on a shallow sea (Helgoland, 2026-10-25).
+    let far = farFloorAt(xz);
+    if (far.y > 0.5) {
+        let inside = min(min(r.x, r.y), min(size.x - r.x, size.y - r.y));
+        return mix(far.x, h, smoothstep(0.0, 400.0, inside));
+    }
+    let outside = length(max(max(-r, r - size), vec2<f32>(0.0)));
+    return mix(h, min(h, waterLevelAt(xz) - 200.0), smoothstep(0.0, 400.0, outside));
+}
 
 // ------------------------------------------------------------------ CDLOD.js
 
@@ -132,8 +209,8 @@ struct TwDisp {
 };
 
 fn twDisplace(worldXZ: vec2<f32>, spacing: f32) -> TwDisp {
-    let seaLevel = tw.sea.x;
-    let ground = terrainHeightAt(worldXZ);
+    let seaLevel = waterLevelAt(worldXZ);
+    let ground = materialTerrainHeightAt(worldXZ);
     let depth = seaLevel - ground;
 
     var disp = vec3<f32>(0.0);
@@ -155,7 +232,7 @@ fn twDisplace(worldXZ: vec2<f32>, spacing: f32) -> TwDisp {
     disp *= tw.surface.x;
 
     var extra = vec3<f32>(0.0);
-    var shoreN = vec3<f32>(0.0, 1.0, 0.0);
+    var shoreN = earthWaterNormal(worldXZ);
     var shoreFoam = 0.0;
     var surfMask = vec2<f32>(0.0); // clear plunging face, whitewater roller relief (m)
     // Offshore of WATER_SHORE_DEEP the shore waves have faded out completely (their envelope is 0
@@ -274,7 +351,11 @@ fn seaDetailSample(xz: vec2<f32>, footprint: f32) -> SeaDetailSample {
     let streakFar = 1.0 - smoothstep(2.0, 8.0, footprint);
     let streak = smoothstep(0.68, 0.82, st) * smoothstep(0.4, 0.62, breakUp) * freshWind * tw.detail.z * streakFar;
 
-    let rough = mix(0.5, 1.5, gust) * (1.0 - slick * 0.8) * (1.0 - streak / max(tw.detail.z, 1e-3) * 0.45);
+    // (OP, 2026-10-13) the windrows no longer touch the surface at all: as foam they were white worms,
+    // left in the roughness they drew thin dark creases across the whole sea once the wind passed
+    // ~10 m/s (owner: "remove these darker lines ... they look like shit"; gone with windrow 0 at his
+    // pose). `streak` is still reported for the debug views.
+    let rough = mix(0.5, 1.5, gust) * (1.0 - slick * 0.8);
     return SeaDetailSample(rough, gust, slick, streak);
 }
 
@@ -290,6 +371,8 @@ struct WaterSurfaceFrag {
     aeration: f32,
     gust: f32,
     slick: f32,
+    // (OP) blood in the water, 0..1 (tw_impact.wgsl bloodAmount)
+    blood: f32,
     // the surf-zone foam look (SurfFoam, with the shore simulation on)
     foamInfo: SurfFoamInfo,
 };
@@ -339,6 +422,18 @@ fn rotorWashSlopes(worldXZ: vec2<f32>, footprint: f32) -> vec2<f32> {
         slopes += delta/max(distance,0.001) * (wave*envelope*rotor.w*0.14*domainFade);
     }
     return slopes * min(1.0,0.32/max(length(slopes),0.001));
+}
+
+// The area mean of the lace (`detail` in waterSurfaceFragment) at a coverage, 0..1 in steps of
+// 0.05, measured over the full-resolution foam pattern: what a pixel covering metres of lace shows.
+// The lace thresholds a pattern centred on 0.49, so it stays nearly clear up to a coverage of 0.3
+// and its brightest is 0.82. Guarded against the pattern by fft_cover_tests.rs
+// (`lace_expected_table_matches_the_pattern`).
+fn laceExpected(c: f32) -> f32 {
+    var g = array<f32, 21>(0.0, 0.0, 0.001, 0.005, 0.018, 0.046, 0.09, 0.154, 0.234, 0.325, 0.417, 0.506, 0.586, 0.655, 0.711, 0.755, 0.785, 0.804, 0.815, 0.821, 0.823);
+    let x = sat(c) * 20.0;
+    let i = min(u32(x), 19u);
+    return mix(g[i], g[i + 1u], x - f32(i));
 }
 
 fn waterSurfaceFragment(lagXZ: vec2<f32>, footprint: f32, depth: f32, vertexFoam: f32, shoreN: vec3<f32>, shoreFoam: f32, extraFoam: f32, surfMask: vec2<f32>, simIn: f32, sf: SurfFoamCtx) -> WaterSurfaceFrag {
@@ -422,21 +517,64 @@ fn waterSurfaceFragment(lagXZ: vec2<f32>, footprint: f32, depth: f32, vertexFoam
 
     // whitecaps: persistent (per vertex) + fresh where the surface is compressed right now;
     // more of them inside gusts, plus windrow lines in fresh wind
+    // OP: the per-pixel term only sharpens a cap the persistent (per-vertex) foam already draws.
+    // On its own it is a thin line along every compressed crest ridge -- at a rough sea's
+    // choppiness, white worms all over the water (owner, 2026-10-12); the debug view (25) showed
+    // the vertex foam as soft patches and every worm in the per-pixel coverage.
+    // whitecaps: persistent (per vertex) + fresh where the surface is compressed right now; more of
+    // them inside gusts -- island-expansion's WaterSurface.js, synced on the owner's request
+    // (2026-10-13). OP keeps one departure the owner asked for: no windrow lines (Tidewater adds
+    // det.streak * 0.5 here, drawn as thin white lines across the sea in fresh wind).
     let fresh = sat((ocean.p0.y - 0.15 - jac) * 2.0);
     var whitecaps = vertexFoam + fresh;
-    whitecaps = whitecaps * mix(0.5, 1.5, det.gust) + det.streak * 0.5;
-    let coverage = sat((foamSum + whitecaps) * tw.surface.z);
+    whitecaps = whitecaps * mix(0.5, 1.5, det.gust);
+    var capCover = whitecaps * tw.surface.z;
+    // OP: whitecaps as patches on the crests (see water_tw::WHITECAP_PATCH): the low foam a rough
+    // sea leaves on every wave goes to nothing instead of to the lace pattern's thinnest veins,
+    // and a crest that is breaking reads as a solid cap that frays at its edge.
+    let capPatches = tw.absorption.w > 0.0;
+    if (capPatches) {
+        // open water only: in the surf and on the swash sheet the shore foam draws the white water,
+        // and the (attenuated) FFT foam there, which this threshold sits far below, turned the uprush
+        // into solid white blobs running up the sand
+        capCover = smoothstep(tw.absorption.w, tw.scattering.w, capCover) * smoothstep(1.0, 4.0, depth);
+    }
+    let coverage = sat(foamSum * tw.surface.z + capCover);
+    // the cover the lace pattern below draws: everything but the caps in patch mode
+    let laceCover = select(coverage, sat(foamSum * tw.surface.z), capPatches);
 
     let fuv = lagXZ * tw.surface.w;
     let p1 = textureSample(waterFoamTex, smpAniso4Repeat, fuv);
     let r2 = vec2<f32>(fuv.x * 0.8 - fuv.y * 0.6, fuv.x * 0.6 + fuv.y * 0.8);
     let p2 = textureSample(waterFoamTex, smpAniso4Repeat, r2 * 2.37 + vec2<f32>(0.31, 0.77));
     let pattern = p1.x * 0.62 + p2.x * 0.38;
-    let thresh = 1.05 - coverage * 1.1;
+    let thresh = 1.05 - laceCover * 1.1;
     let soft = 0.06 + footprint * 0.1;
     let detail = smoothstep(thresh - soft, thresh + soft, pattern) * (p1.y * 0.25 + 0.8);
     let far = smoothstep(0.15, 1.2, footprint);
-    var foam = mix(detail, coverage * 0.85, far);
+    // (OP, 2026-10-13) far off, the white the lace WOULD show at this coverage, not the coverage:
+    // `laceCover * 0.85` drew a light sea up to 9x whiter than the lace it stands for (a 30 m/s
+    // gale went white as milk with distance while close up it read as dark water with caps)
+    var foam = mix(detail, laceExpected(laceCover), far);
+    if (capPatches) {
+        // a cap is solid white water with a ragged edge -- never a translucent veil (owner: "looks
+        // like a white oil film") and never the lace's veins. The edge is the slow mottle, the
+        // bubbles speckle its rim; a far cap stays white because its edge only softens with the
+        // pixel footprint, it does not fade.
+        // the fringe tears into streaks down the wind, not round floes: the mottle read on a
+        // wind-aligned coordinate stretched 4:1
+        let wdir = tw.wind.xy;
+        let wuv = vec2<f32>(dot(lagXZ, wdir) * 0.25, dot(lagXZ, vec2<f32>(-wdir.y, wdir.x))) * tw.surface.w;
+        let tear = textureSample(waterFoamTex, smpAniso4Repeat, wuv * 1.7 + vec2<f32>(0.21, 0.63)).z;
+        let rag = capCover * (0.45 + 1.1 * mix(p1.z, tear, 0.6)) + (p1.y - 0.4) * 0.12;
+        // a dense core whose rim the lace eats into, so a cap frays like foam instead of ending in a
+        // sheet's hard edge (the floes of the first attempt); the core is where the crest breaks now
+        let capSoft = min(0.25 + footprint * 0.05, 0.4); // unclamped, a far pixel turned the horizon white
+        let body = smoothstep(0.5 - capSoft, 0.5 + capSoft, rag);
+        // the core is opaque (owner: "white caps need to be whiter"); only the rim is lace
+        let cap = sat(body * 1.45 - (1.0 - pattern) * 0.75) * mix(p1.y * 0.2 + 0.85, 1.0, smoothstep(0.7, 1.0, body));
+        foam = max(foam, cap);
+    }
 
     var o: WaterSurfaceFrag;
     o.foamInfo = SurfFoamInfo(foam, sat(coverage), 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -459,6 +597,7 @@ fn waterSurfaceFragment(lagXZ: vec2<f32>, footprint: f32, depth: f32, vertexFoam
     o.aeration = sat(aeration);
     o.gust = det.gust;
     o.slick = det.slick;
+    o.blood = bloodAmount(lagXZ);
     return o;
 }
 
@@ -610,20 +749,53 @@ fn _waterSSR(posV: vec3<f32>, Rv: vec3<f32>, y0: f32, ry: f32) -> vec4<f32> {
 
 // ------------------------------------------------------------------ the material
 
+// (OP) Tidewater draws no sea inside its boat's hull (SceneRenderer hull mask: a pre-pass of the hull volume,
+// and the surface behind its nearest face discarded). Here the hull volume is tested directly: a point of the
+// surface inside a masked hull's open cockpit and wheelhouse (Tidewater's lobster boat, below its gunwale) is not
+// drawn -- from any camera, the cockpit included. Its cockpit sole stands 0.35 m over the waterline, under
+// every swell's crest. Lanes: mod.rs hull_mask_lanes.
+fn insideHull(p: vec3<f32>) -> bool {
+    for (var i = 0; i < 2; i++) {
+        let h3 = tw.hulls[i * 4 + 3];
+        if (h3.z < 0.5) { continue; }
+        let h0 = tw.hulls[i * 4];
+        let h1 = tw.hulls[i * 4 + 1];
+        let h2 = tw.hulls[i * 4 + 2];
+        let d = p - h0.xyz;
+        let lz = dot(d, h1.xyz);
+        if (lz <= h1.w || lz >= h2.w) { continue; }
+        let ly = dot(d, h2.xyz);
+        let t = (lz - h1.w) / (h2.w - h1.w);
+        let sheer = mix(h3.x, h3.y, t);
+        if (ly < -0.8 || ly > sheer) { continue; }
+        // The mask spans the open cockpit and the wheelhouse only (transom to house front, where the hull is
+        // still near its full breadth: HullLines.sheerX 0.88 of the beam at the transom, 0.92 at the house
+        // front); forward of it the foredeck closes the hull over the water. The flare: the waterline is 0.83
+        // of the sheer's breadth (2.42 m against 2.9 m), the bottom narrower still. Kept well inside the shell,
+        // so the sea just outside the hull is never cut.
+        let plan = mix(0.88, 0.92, t);
+        let flare = select(mix(0.83, 0.3, clamp(-ly / 0.5, 0.0, 1.0)), mix(0.83, 1.0, clamp(ly / sheer, 0.0, 1.0)), ly >= 0.0);
+        let lx = abs(dot(d, cross(h2.xyz, h1.xyz)));
+        if (lx < h0.w * plan * flare - 0.08) { return true; }
+    }
+    return false;
+}
+
 @fragment
 fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let rel = in.rel;
     let pos = rel + frame.cam_pos.xyz;
+    if (insideHull(pos)) { discard; }
     let screenUV = in.clip.xy / vec2<f32>(textureDimensions(waterSceneDepth));
     let posV = twView(vec4<f32>(rel, 1.0));
     let lagXZ = in.lagXZ;
-    let vDepth = in.seaDepth;
+    let groundH = materialTerrainHeightAt(pos.xz);
+    let vDepth = select(in.seaDepth, waterLevelAt(pos.xz) - groundH, earthWater());
     let vHeight = in.waveH;
     // derivatives in uniform control flow
     let footprint = max(length(fwidth(lagXZ)), 1e-4);
     let dwx = dpdx(rel);
     let dwy = dpdy(rel);
-    let groundH = terrainHeightAt(pos.xz);
     var thickness = pos.y - groundH;
 
     let dist = length(rel);
@@ -643,9 +815,24 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         }
         horizon = srgb_to_linear(horizon);
     }
-    let csm = shadow_strength(rel, vec3<f32>(0.0, 1.0, 0.0), fogK, dwx, dwy);
-    let ter = terrain_sun_shadow(pos.xz, pos.y) * fogK;
-    var sunLight = sunDiffuse * PI * (1.0 - max(csm, ter)) * cloud_sun_shadow(pos.xz);
+    if (linear > 0.5 && frame.sun_diffuse.w > 0.5) {
+        // Match physical Earth land's directional sky irradiance. The legacy
+        // flat ambient RGB is an artistic sun-scaled fill, not sky radiance;
+        // feeding it to the water volume/foam produces an ambient wash.
+        // (OP, 2026-10-12) on every physical world, not only Earth: on stock worlds the fill is ~30x
+        // the sun, and it lit the water's in-scatter and the foam into neon turquoise and glowing caps.
+        let skyN = select(vec3<f32>(0.0, 1.0, 0.0), earthWaterNormal(pos.xz), earthWater());
+        skyIrr = sky_irradiance(skyN) * frame.sun_ambient.w;
+    }
+    var csm = 0.0;
+    var ter = 0.0;
+    var cloudShadow = 1.0;
+    if (!earthWater()) {
+        csm = shadow_strength(rel, vec3<f32>(0.0, 1.0, 0.0), fogK, dwx, dwy);
+        ter = terrain_sun_shadow(pos.xz, pos.y) * fogK;
+        cloudShadow = cloud_sun_shadow(pos.xz);
+    }
+    var sunLight = sunDiffuse * PI * (1.0 - max(csm, ter)) * cloudShadow;
 
     // water film thickness at this pixel and the distance to the swash front (ShoreWaves.swashEdge):
     // the sheet ends exactly on its analytic leading edge, not on the mesh triangles
@@ -710,7 +897,13 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
     // the eye was within 1.5 m of the flat sea above it (the flat blue sheet at the waterline), and
     // as seen from above when it was just under it.
     let seenFromAbove = !front;
-    let viewFromBelow = select(camH < 0.0, !seenFromAbove, nearSurface && !folded);
+    // (OP, 2026-10-12) away from the lens, a point is seen from below only when the eye is under
+    // the water AND the point lies above the eye. It was "the eye is under the water" alone, so a crest
+    // passing over a swimmer's eye turned the whole distant sea, seen through that crest from above,
+    // into the view from below: total internal reflection, the water's own teal in-scatter, a teal band
+    // along the horizon at the waterline (owner's "turquoise in high waves").
+    let farFromBelow = camH < 0.0 && pos.y > frame.cam_pos.y;
+    let viewFromBelow = select(farFromBelow, !seenFromAbove, nearSurface && !folded);
     let Nup = surf.normal;
     let Nside = select(Nup, -Nup, viewFromBelow);
     let Nview = normalize(Nside + V * max(-dot(Nside, V) + 0.03, 0.0));
@@ -741,8 +934,8 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         // taken here from central differences of OP's heightmap.
         let edgeW = max((1.0 - smoothstep(0.0, 0.006, thickness)) * uprush, lipW);
         let e = 0.5;
-        let gradH = vec2<f32>(terrainHeightAt(pos.xz + vec2<f32>(e, 0.0)) - terrainHeightAt(pos.xz - vec2<f32>(e, 0.0)),
-                              terrainHeightAt(pos.xz + vec2<f32>(0.0, e)) - terrainHeightAt(pos.xz - vec2<f32>(0.0, e))) / (2.0 * e);
+        let gradH = vec2<f32>(materialTerrainHeightAt(pos.xz + vec2<f32>(e, 0.0)) - materialTerrainHeightAt(pos.xz - vec2<f32>(e, 0.0)),
+                              materialTerrainHeightAt(pos.xz + vec2<f32>(0.0, e)) - materialTerrainHeightAt(pos.xz - vec2<f32>(0.0, e))) / (2.0 * e);
         let uphill = normalize(gradH + vec2<f32>(1e-5, 0.0));
         let N = normalize(Nview + vec3<f32>(uphill.x, 0.0, uphill.y) * (edgeW * edgeW * 0.7));
         let NdV = max(dot(N, V), 1e-4);
@@ -789,8 +982,8 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         let L0 = max(pos.y - groundH, 0.0) / tDown;
         var Lt = L0;
         if (L0 < 100.0) {
-            let L1 = max(pos.y - terrainHeightAt(pos.xz + Tv.xz * min(L0, 200.0)), 0.0) / tDown;
-            Lt = max(pos.y - terrainHeightAt(pos.xz + Tv.xz * min(L1 * 0.5 + L0 * 0.5, 200.0)), 0.0) / tDown;
+            let L1 = max(pos.y - materialTerrainHeightAt(pos.xz + Tv.xz * min(L0, 200.0)), 0.0) / tDown;
+            Lt = max(pos.y - materialTerrainHeightAt(pos.xz + Tv.xz * min(L1 * 0.5 + L0 * 0.5, 200.0)), 0.0) / tDown;
         }
         let Lter = clamp(Lt, 0.0, 400.0);
         // thin breaking crests: the refracted ray leaves through the back of the wave into the sky
@@ -837,9 +1030,10 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         let sandK = mix(1.0, sat(simState.x * 2.5) * 1.8 + 0.45, simIn);
         // surf zone: sand and bubbles stirred up by the breakers (see ShoreWaves.surfMedium)
         let surfMed = shoreSurfMedium(pos.xz, vDepth);
-        let sigA = tw.absorption.rgb + surfMed.absorb * sandK;
+        // (OP) a whale's blood: it takes the green and blue out of the light and scatters back a dark red
+        let sigA = tw.absorption.rgb + surfMed.absorb * sandK + surf.blood * vec3<f32>(0.25, 2.6, 2.3);
         // (bubble plumes are shallow and patchy: a moderate scatterer, milky turquoise rather than a glow)
-        let sigS = tw.scattering.rgb + surfMed.scatter * sandK + aer * 1.6;
+        let sigS = tw.scattering.rgb + surfMed.scatter * sandK + aer * 1.6 + surf.blood * vec3<f32>(0.1, 0.004, 0.004);
         let sigT = sigA + sigS;
 
         // (W3f) Light reaching what lies under the water. OP lights its sea bed (and anything else
@@ -892,7 +1086,8 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         let lH = normalize(vec2<f32>(L.x, L.z) + 1e-5);
         let back = pow(sat(dot(vH, -lH) * 0.6 + 0.4), 2.5);
         let crest = sat(vHeight * 0.9 + 0.1) * (sat((1.0 - N.y) * 4.0) + 0.25);
-        let sssCol = vec3<f32>(0.12, 0.55, 0.45) * 0.06;
+        // (OP) temperate green, not Tidewater's tropical cyan (0.12, 0.55, 0.45): see tw_lip.wgsl tint
+        let sssCol = vec3<f32>(0.13, 0.36, 0.30) * 0.06;
         let sss = sunLight * sssCol * back * crest * tw.material0.y * smoothstep(0.0, 0.25, L.y);
 
         // (W3j) the water's own glow (light scattered inside it toward the eye) x the Water tab's
@@ -903,13 +1098,31 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         let glowK = tw.material1.w;
         let transmitted = sceneCol * Tview * (1.0 - 0.3 * lipW) + (inSun + inAmb + sss) * glowK;
 
-        // ---- foam: bright diffuse scatterer (albedo ~0.85), wrapped sun + sky irradiance
-        var foamLit = (sunLight * (max(dot(N, L), 0.0) * 0.75 + 0.25) * INV_PI + skyIrr * 0.95) * 0.85;
-        if (simOn) { foamLit = surfFoamLight(surf.foamInfo, foamGrad, N, L, V, sunLight, skyIrr); }
-        let foamCol = foamLit * tw.material0.z;
+        // ---- foam: diffuse scatterer, wrapped sun + sky irradiance
+        // Tidewater's 0.85 (owner: "white caps must not be gray"). The glow (owner, 2026-10-12) was
+        // never the albedo: it was the legacy flat ambient (foamSky below), ~30x the sun here.
+        let foamAlbedo = 0.85;
+        // OP: the foam's sky light is the sky's own irradiance (SH, E/PI) wherever the frame is
+        // physical, not the legacy flat ambient (an artistic sun-scaled fill, ~30x the sun here):
+        // with it every cap clipped past white and bloomed (owner, 2026-10-12). Earth water already
+        // reads the SH sky for the same reason (above).
+        var foamSky = skyIrr;
+        if (linear > 0.5 && frame.sun_diffuse.w > 0.5) {
+            foamSky = sky_irradiance(N) * frame.sun_ambient.w;
+        }
+        var foamLit = (sunLight * (max(dot(N, L), 0.0) * 0.75 + 0.25) * INV_PI + foamSky * 0.95) * foamAlbedo;
+        if (simOn) { foamLit = surfFoamLight(surf.foamInfo, foamGrad, N, L, V, sunLight, foamSky); }
+        // (foam on bloody water is pink)
+        let foamCol = foamLit * tw.material0.z * mix(vec3<f32>(1.0), vec3<f32>(0.95, 0.42, 0.4), surf.blood);
 
         let rim = smoothstep(0.0, 0.025, frontD) * smoothstep(0.1, 0.035, frontD) * uprush;
-        let water = mix(transmitted, reflCol, F) + sunSpec + skyRefl * (0.22 * rim);
+        var water = mix(transmitted, reflCol, F) + sunSpec + skyRefl * (0.22 * rim);
+        // (OP) blood at the surface: a dark red film over the water that dulls its reflection (the medium terms
+        // above only colour what is seen through the water, which at a grazing view is almost nothing)
+        if (surf.blood > 0.001) {
+            let bloodLit = (sunLight * (max(dot(N, L), 0.0) * 0.6 + 0.2) * INV_PI + skyIrr * 0.9) * vec3<f32>(0.055, 0.004, 0.0035);
+            water = mix(water, bloodLit + sunSpec * 0.5, surf.blood * 0.85);
+        }
         dbgRefl = reflCol * F + sunSpec;
         dbgTrans = sceneCol * Tview * (1.0 - F);
         dbgIn = (inSun + inAmb + sss) * glowK * (1.0 - F);
@@ -927,10 +1140,20 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
     } else {
         // ================= BELOW WATER (looking up at the surface) =================
         let N = Nview;
-        let NdV = max(dot(N, V), 1e-4);
-        let F = fresnelDielectric(NdV, 1.0 / IOR);
-        let Tt = refract(-V, N, IOR);
+        // (OP, 2026-10-12) the Snell window shimmers: fine ripples the FFT mesh does not resolve bend
+        // the refracted sky near the eye (it read as undistorted sky through a clean hole)
+        let ripT = tw.sea.y;
+        let rip = vec2<f32>(sin(lagXZ.x * 3.1 + ripT * 1.7 + sin(lagXZ.y * 2.3)), cos(lagXZ.y * 2.9 - ripT * 1.3 + sin(lagXZ.x * 1.9)))
+            + 0.5 * vec2<f32>(sin(lagXZ.y * 7.3 - ripT * 2.9), cos(lagXZ.x * 6.7 + ripT * 3.1));
+        let Nr = normalize(N + vec3<f32>(rip.x, 0.0, rip.y) * 0.09 * smoothstep(30.0, 2.0, dist));
+        let Tt = refract(-V, Nr, IOR);
         let tValid = dot(Tt, Tt) > 0.5;
+        // (OP, 2026-10-13) the mirror share from the SAME normal the ray is refracted through, and all
+        // mirror where that ray cannot leave the water. It came from the unrippled normal: wherever the
+        // ripple tipped a ray past the critical angle the shader still let (1 - F) through and, with no
+        // refracted ray, showed the zenith sky -- bright sky and clouds across the total-reflection
+        // band just under the surface (owner: clouds visible at 0.7 m, gone at 2.5 m)
+        let F = select(1.0, fresnelDielectric(max(dot(Nr, V), 1e-4), 1.0 / IOR), tValid);
         let Td = normalize(select(vec3<f32>(0.0, 1.0, 0.0), Tt, tValid));
         let skyT = min(sky_env_sample(Td), vec3<f32>(60.0));
 
@@ -999,6 +1222,24 @@ fn fs_tidewater(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) v
         res = dbgUnder * 2.0;
     } else if (dbg == 23) {
         res = dbgLight * vec3<f32>(0.1, 1.0, 1.0);
+    }
+    if (earthWater()) {
+        // Source coverage is not a rectangular ocean boundary. Existing CDLOD
+        // geometry follows the sphere; reject its hidden far side analytically.
+        // Match the pipeline's GreaterEqual reverse-Z test against the opaque
+        // snapshot explicitly: unknown source height must never override land.
+        // Seen from below (the camera under the sea: free flight dives), every point of the surface faces
+        // away; rejecting those as the planet's far side removed the whole underside, and the view up went
+        // straight through to the open sky. The far side is out of sight from under the water anyway.
+        let camBelow = frame.cam_pos.y < waterLevelAt(frame.cam_pos.xz);
+        if (thickness <= 0.0 || (!camBelow && dot(earthWaterNormal(pos.xz), -rel) <= 0.0) ||
+            in.clip.z < _waterSceneDepthAt(screenUV)) { discard; }
+        // From high up the sea becomes the imagery (WaterWgpu::DrawEarthWater stops drawing it at the top of
+        // this band). It did so from 6-8 km, where the imagery's zooms (and its sources: Esri, EOX where Esri
+        // fails) disagree about the sea's colour and drew rings round the camera (Helgoland at 9 km, 2026-10-25).
+        let fade = 1.0 - smoothstep(EARTH_SEA_FADE_START, EARTH_SEA_CEILING, frame.cam_pos.y);
+        let base = textureSampleLevel(waterSceneColor, smpLinearClamp, screenUV, 0.0).rgb;
+        res = mix(base, res, fade);
     }
     return vec4<f32>(res, 1.0);
 }

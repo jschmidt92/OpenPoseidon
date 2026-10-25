@@ -1,3 +1,4 @@
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Application.hpp>
 
 #include <Poseidon/Core/Config/EngineConfig.hpp>
@@ -12,6 +13,7 @@
 
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/AI/VehicleAI.hpp>
 #include <Poseidon/AI/AI.hpp>
@@ -42,6 +44,9 @@
 #include <Poseidon/Foundation/Enums/EnumNames.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
 #include <Poseidon/Foundation/Framework/Log.hpp>
+#include <cctype>
+#include <cstring>
+#include <string>
 #include <Poseidon/Foundation/Math/Math3D.hpp>
 #include <Poseidon/Foundation/Math/Math3DP.hpp>
 #include <Poseidon/Foundation/Math/MathDefs.hpp>
@@ -71,6 +76,7 @@ namespace Poseidon
 #include <Poseidon/Foundation/Platform/VersionNo.h>
 
 #include <Poseidon/Game/Commands/GameStateExtCommon.hpp>
+#include <Poseidon/World/Scene/ScriptLight.hpp>
 
 GameValue ObjBehaviour(const GameState* state, GameValuePar oper1)
 {
@@ -544,7 +550,9 @@ GameValue ListCountUnknown(const GameState* state, GameValuePar oper1, GameValue
     return (float)ListCountSideH(oper2, GetObject(oper1), &AICenter::IsUnknown);
 }
 
-GameValue ObjGetType(const GameState* state, GameValuePar oper1)
+// The engine's class name of an object; vehicles imported from an Arma 1/2 config carry
+// the generated "A1x_" prefix here.
+RString ObjGetTypeRaw(GameValuePar oper1)
 {
     Object* obj = GetObject(oper1);
     Entity* ent = dyn_cast<Entity>(obj);
@@ -557,6 +565,16 @@ GameValue ObjGetType(const GameState* state, GameValuePar oper1)
             type = etype->GetName();
         }
     }
+    return type;
+}
+
+GameValue ObjGetType(const GameState* state, GameValuePar oper1)
+{
+    RString type = ObjGetTypeRaw(oper1);
+    // Scripts compare typeOf with the mission's own class names ("T72_INS"), not the
+    // name the import gave the class.
+    if (Poseidon::Arma1Compat::Active() && _strnicmp(type, "A1x_", 4) == 0)
+        type = RString((const char*)type + 4);
     return type;
 }
 
@@ -1012,6 +1030,13 @@ GameValue GrpSetIdentity(const GameState* state, GameValuePar oper1, GameValuePa
             name = array[0];
             color = array[1];
             break;
+        case 1:
+            // Arma 2: setGroupId ["Fist"] -- a free group name; CWA's group identities
+            // come from CfgWorlds >> GroupNames, so the call is accepted and changes nothing.
+            if (array[0].GetType() == GameString)
+                return NOTHING;
+            state->TypeError(GameString, array[0].GetType());
+            return NOTHING;
         default:
             state->SetError(EvalDim, array.Size(), 3);
             return NOTHING;
@@ -1363,6 +1388,38 @@ GameValue VehTarget(const GameState* state, GameValuePar oper1, GameValuePar ope
 
 DEFINE_COMMAND(Target)
 
+// Arma 1 and later name the action command's actions in one word ("getInDriver",
+// "moveToPilot", "takeWeapon"); this engine's names are OFP's, some with spaces ("GETIN
+// DRIVER", "TAKE WEAPON"). Without Arma data nothing changes; with it, an unknown name is
+// matched again with spaces and case ignored, the pilot seat read as the driver's and a
+// turret as the gunner's (Arma 1's GetInTurret/MoveToTurret name a turret path this
+// engine does not have -- the gunner's seat stands in, a marked deviation).
+static UIActionType ResolveActionName(const char* name)
+{
+    UIActionType type = GetEnumValue<UIActionType>(name);
+    // an unknown name comes back as -1 (f3eb88c2's log), not as INT_MIN
+    if (static_cast<int>(type) >= 0 || Poseidon::Arma1Compat::Generation() < 1 || !name)
+        return type;
+    const auto squash = [](const char* text) {
+        std::string out;
+        for (const char* c = text; *c; c++)
+            if (*c != ' ' && *c != '_')
+                out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*c))));
+        return out;
+    };
+    std::string want = squash(name);
+    const auto replace = [&](const char* from, const char* to) {
+        if (const size_t at = want.find(from); at != std::string::npos)
+            want.replace(at, strlen(from), to);
+    };
+    replace("pilot", "driver");
+    replace("turret", "gunner");
+    for (const EnumName* e = GetEnumNames(UIActionType()); e && e->name.GetLength() > 0; e++)
+        if (squash(e->name) == want)
+            return static_cast<UIActionType>(e->value);
+    return type;
+}
+
 GameValue VehProcessAction(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     EntityAI* veh = dyn_cast<EntityAI>(GetObject(oper1));
@@ -1396,8 +1453,8 @@ GameValue VehProcessAction(const GameState* state, GameValuePar oper1, GameValue
         case 1:
         {
             GameStringType type = array[0];
-            action.type = GetEnumValue<UIActionType>((const char*)type);
-            if (action.type == INT_MIN)
+            action.type = ResolveActionName((const char*)type);
+            if (action.type == INT_MIN || static_cast<int>(action.type) < 0)
             {
                 action.type = ATNone;
             }
@@ -1410,6 +1467,8 @@ GameValue VehProcessAction(const GameState* state, GameValuePar oper1, GameValue
     }
 }
 
+void Arma2SetUserActionArguments(Poseidon::EntityAI* veh, int id, GameValuePar arguments); // GameStateExtA2.cpp
+
 GameValue VehAddUserAction(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     EntityAI* veh = dyn_cast<EntityAI>(GetObject(oper1));
@@ -1419,7 +1478,9 @@ GameValue VehAddUserAction(const GameState* state, GameValuePar oper1, GameValue
     }
 
     const GameArrayType& array = oper2;
-    if (array.Size() != 2)
+    // Arma 2: [title, script, arguments, priority, showWindow, hideOnUse, shortcut, condition]
+    const bool arma2 = Poseidon::Arma1Compat::Generation() >= 2;
+    if (array.Size() != 2 && !(arma2 && array.Size() > 2))
     {
         state->SetError(EvalDim, array.Size(), 2);
         return -1.0f;
@@ -1434,7 +1495,27 @@ GameValue VehAddUserAction(const GameState* state, GameValuePar oper1, GameValue
         state->TypeError(GameString, array[1].GetType());
         return -1.0f;
     }
-    return (float)veh->AddUserAction(array[0], array[1]);
+    RString title = array[0];
+    if (arma2)
+    {
+        // Arma 2/3 titles are structured text (`<t color='#FFFFFF'>Test</t>`); the action menu
+        // here draws plain text, so the tags go and the text stays.
+        const std::string in = (const char*)title;
+        std::string out;
+        for (size_t i = 0; i < in.size(); i++)
+        {
+            const size_t close = in[i] == '<' ? in.find('>', i) : std::string::npos;
+            if (close == std::string::npos)
+                out.push_back(in[i]);
+            else
+                i = close;
+        }
+        title = RString(out.c_str());
+    }
+    const int id = veh->AddUserAction(title, array[1]);
+    if (arma2 && array.Size() > 2)
+        Arma2SetUserActionArguments(veh, id, array[2]);
+    return (float)id;
 }
 
 GameValue VehRemoveUserAction(const GameState* state, GameValuePar oper1, GameValuePar oper2)
@@ -1706,9 +1787,29 @@ GameValue ObjSetPos(const GameState* state, GameValuePar oper1, GameValuePar ope
     {
         return NOTHING;
     }
+    // LGT-SCRIPT-001: a "#lightpoint" has no shape to place on the surface; Arma puts it at
+    // the given height above ground
+    if (Poseidon::ScriptLight* light = dyn_cast<Poseidon::ScriptLight>(obj1))
+    {
+        pos[1] += GLandscape ? GLandscape->SurfaceYAboveWater(pos[0], pos[2]) : 0.0f;
+        light->MoveTo(pos);
+        return NOTHING;
+    }
     if (obj1->GetType() == Primary || obj1->GetType() == Network)
     {
         return NOTHING;
+    }
+
+    // Scripted scenery (camCreate'd temporary objects, e.g. the Earth ICBM's missile 100 km up) never
+    // stands on the ground; only grounded objects need resident Earth ground under them.
+    if (EarthStreaming::Enabled() && !EarthStreaming::OnMoon && obj1->GetType() != Temporary)
+    {
+        const auto ground = EarthStreaming::Locations().Ground();
+        if (!ground || !ground->Contains(pos.X(), pos.Z(), std::max(2.0f, obj1->GetRadius())))
+        {
+            LOG_WARN(World, "setPos refused: Earth near ground not resident at [{},{}]", pos.X(), pos.Z());
+            return NOTHING;
+        }
     }
 
     // let vehicle adjust position

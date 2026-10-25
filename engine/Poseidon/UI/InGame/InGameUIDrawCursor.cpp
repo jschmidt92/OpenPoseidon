@@ -7,6 +7,7 @@
 #include <Poseidon/World/Entities/Weapons/GrenadeFuse.hpp>
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/AI/AI.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
 #include <Poseidon/UI/InGame/InGameUIImpl.hpp>
 #include <Poseidon/UI/Controls/CursorLayout.hpp>
@@ -125,6 +126,33 @@ bool InGameUI::DrawMouseCursor(const Camera& camera, AIUnit* unit, bool td)
     // assign cursor direction
     // LOG_DEBUG(UI, "World {:.1f},{:.1f},{:.1f}",_worldCursor[0],_worldCursor[1],_worldCursor[2]);
     // Matrix4Val camInvTransform=camera.GetInvTransform();
+
+    // PIM-RECOIL: apply the permanent part of the recoil to the AIM itself.
+    //
+    // It has to land on the cursor rather than on the weapon: the aiming simulation drives
+    // the gun toward the cursor every frame, so anything added to the weapon's rotation is
+    // pulled straight back out. Moving the cursor is what makes the climb persist and puts
+    // the correction on the player, which is the whole point - Arma 3's `permanent` works
+    // the same way, and it is why holding the trigger there walks your aim off the target.
+    if (Man* rman = dyn_cast<Man>(vehicle))
+    {
+        float rPitch = 0.0f, rYaw = 0.0f;
+        if (rman->TakeRecoilPermanent(rPitch, rYaw))
+        {
+            Vector3 cd = GetCursorDirection();
+            if (cd.SquareSize() > 1e-6f)
+            {
+                // Rotated in MODEL space - the same frame _gunXRot / _gunYRot live in, so
+                // pitch is about the soldier's right and yaw about his up, and the climb
+                // stays vertical on screen whichever way he is facing.
+                Vector3 cdM = vehicle->DirectionWorldToModel(cd);
+                cdM = Matrix3(MRotationY, rYaw) * (Matrix3(MRotationX, -rPitch) * cdM);
+                cd = vehicle->DirectionModelToWorld(cdM);
+                cd.Normalize();
+                SetCursorDirection(cd);
+            }
+        }
+    }
 
     Vector3 curDir = GetCursorDirection();
     vehicle->LimitCursor(GWorld->GetCameraType(), curDir);
@@ -1077,8 +1105,8 @@ void InGameUI::DrawCombatAssists(const Camera& camera, EntityAI* vehicle)
     Vector3 direction = GetCursorDirection();
     if (weapon >= 0 && weapon < man->NMagazineSlots()) direction = man->GetWeaponDirection(weapon);
     const PackedColor color(Color(0.90f, 0.94f, 0.90f, 0.95f));
-    if (BearingReadoutEnabled())
-        GEngine->DrawTextF(Point2DFloat(0.455f, 0.59f), 0.020f, _font24, color,
+    if (BearingReadoutEnabled() && GWorld->HasCompass())
+        GEngine->DrawTextF(Point2DFloat(0.455f, 0.35f), 0.020f, _font24, color,
                           "Bearing %03d", CombatAssists::BearingDegrees(direction.X(), direction.Z()));
 
     if (!GrenadeRangeEnabled() || weapon < 0 || weapon >= man->NMagazineSlots())
@@ -1582,7 +1610,15 @@ void InGameUI::DrawHUD(const Camera& camera, EntityAI* vehicle, CameraType cam)
                 PoseidonAssert(mis->_action == Mission::Arcade);
                 int& index = group->GetCurrent()->_fsm->Var(0);
                 int& waiting = group->GetCurrent()->_fsm->Var(4);
-                if (index < group->NWaypoints())
+                // An Arma mission's hidden waypoint ("showWP" NEVER, or EASY outside cadet mode)
+                // is not drawn here either, as the map already does: Arma 2 missions hide most of
+                // theirs and guide the player with their own markers and tasks. CWA missions keep
+                // the old behaviour (an OFP 1.0 mission reads its "show" flag as NEVER).
+                const bool wpShow =
+                    index < group->NWaypoints() &&
+                    (!Arma1Compat::Active() || group->GetWaypoint(index).showWP == ShowAlways ||
+                     (group->GetWaypoint(index).showWP == ShowEasy && USER_CONFIG.easyMode));
+                if (wpShow)
                 {
                     const ArcadeWaypointInfo& wInfo = group->GetWaypoint(index);
                     int type = wInfo.type;
@@ -1612,7 +1648,11 @@ void InGameUI::DrawHUD(const Camera& camera, EntityAI* vehicle, CameraType cam)
                         }
                         else
                         {
-                            description = LocalizeString(IDS_AC_MOVE + type - ACMOVE);
+                            // only the waypoint types have a name; anything else (an undefined
+                            // type, say) indexed the strings before them and read
+                            // "%s %s %s killed in action (%s)"
+                            description = LocalizeString(type >= ACMOVE && type < ACN ? IDS_AC_MOVE + type - ACMOVE
+                                                                                      : IDS_AC_MOVE);
                         }
                     }
 

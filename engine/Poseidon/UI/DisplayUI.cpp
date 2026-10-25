@@ -21,10 +21,12 @@
 #include <Poseidon/Foundation/Strings/StrFormat.hpp>
 
 #include <Poseidon/Game/Scripting/Scripts.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 
 #include <SDL3/SDL_scancode.h>
 #include <Poseidon/Foundation/Common/Win.h>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_keyboard.h>
 
 #include <ctype.h>
 #include <limits.h>
@@ -71,6 +73,8 @@
 #include <Poseidon/Core/Global.hpp>
 
 extern bool AutoTest;
+
+void Arma3MissionStart(); // GameStateExtA3Functions.cpp (--arma3)
 
 namespace Poseidon
 {
@@ -128,9 +132,25 @@ void RunInitScript()
         GWorld->SimulateScripts();
     }
 
+    // Arma 3: the function library's start sequence (preInit, modules, initServer /
+    // initPlayerLocal / initPlayerServer, postInit, then init.sqf).
+    if (Arma1Compat::Generation() == 3)
+    {
+        ::Arma3MissionStart();
+        GWorld->SimulateScripts();
+        return;
+    }
+
     // Also run init.sqf if present (SQF format, unscheduled execution)
     RString initSqf = GetMissionDirectory() + RString("init.sqf");
-    if (QIFStreamB::FileExist(initSqf))
+    if (Arma1Compat::Active() && QIFStreamB::FileExist(initSqf))
+    {
+        // Arma 1 runs init.sqf scheduled (execVM): comments, sleep and waitUntil work.
+        if (GameState* gs = GWorld->GetGameState())
+            gs->Execute("[] execVM \"init.sqf\"");
+        GWorld->SimulateScripts();
+    }
+    else if (QIFStreamB::FileExist(initSqf))
     {
         QIFStreamB in;
         in.AutoOpen(initSqf);
@@ -185,6 +205,16 @@ RString GetKeyName(int dikCode)
 {
     if (InputBindingIsDoubleTap(dikCode))
         return RString("2x ") + GetKeyName(InputBindingBaseCode(dikCode));
+
+    // Letter keys are bound by position (scancode); name them as the active keyboard layout prints them, so the
+    // key under QWERTY's Z reads "Y" on a German keyboard.
+    if (dikCode >= SDL_SCANCODE_A && dikCode <= SDL_SCANCODE_Z)
+    {
+        const SDL_Keycode key = SDL_GetKeyFromScancode(static_cast<SDL_Scancode>(dikCode), SDL_KMOD_NONE, false);
+        const char* name = key != SDLK_UNKNOWN ? SDL_GetKeyName(key) : nullptr;
+        if (name && *name)
+            return RString(name);
+    }
 
     switch (dikCode)
     {

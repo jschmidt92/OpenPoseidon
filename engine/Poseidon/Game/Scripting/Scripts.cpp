@@ -1,6 +1,15 @@
 
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Game/Scripting/Scripts.hpp>
+#include <algorithm>
+#include <chrono>
+#include <exception>
+#include <cstdlib>
+#include <functional>
+#include <vector>
+#include <Poseidon/Game/Scripting/Coroutine.hpp>
+#include <string>
 #include <Poseidon/IO/Streams/QBStream.hpp>
 #include <Poseidon/Game/Commands/GameStateExt.hpp>
 #include <Poseidon/AI/AI.hpp>
@@ -25,6 +34,13 @@ RString FindScript(RString name);
 
 namespace Poseidon
 {
+struct ScriptFiber;
+bool InScheduledScript();
+void ScheduledYield();
+void ScheduledSleep(float seconds);
+bool ScriptFiberDone(const ScriptFiber* f);
+void ScriptFiberTerminate(ScriptFiber* f);
+void DestroyScriptFiber(ScriptFiber* f);
 #define DIAG_DEBUG 0 // script debug level (0..90)
 
 #if _MSC_VER >= 1300
@@ -200,6 +216,7 @@ Script::~Script()
 #if SCRIPTS_DEBUGGING
     DoneDebugger();
 #endif
+    DestroyScriptFiber(_fiber);
 }
 
 static void Trim(RString& str)
@@ -406,6 +423,8 @@ static Script* CurrentScript = nullptr;
 
 bool Script::IsTerminated() const
 {
+    if (_fiber)
+        return ScriptFiberDone(_fiber);
     return _currentLine >= _lines.Size();
 }
 
@@ -432,6 +451,8 @@ bool Script::SimulateBody()
     }
 #endif
 
+    if (_fiber)
+        return SimulateFiber();
     GameState* gstate = GWorld->GetGameState();
     gstate->VarSetLocal("_this", _argument, true);
 // if simulate body takes too long, interrupt it
@@ -484,6 +505,10 @@ bool Script::SimulateBody()
         LOG_DEBUG(Script, "Script paused after {} ms", time - timeStart);
     }
 #endif
+    // Arma 2 spawned code may reassign _this ("_this = _this select 0; waitUntil {...}");
+    // keep what it assigned for the next step instead of restoring the spawn argument.
+    if (Poseidon::Arma1Compat::Generation() >= 2)
+        _argument = gstate->VarGet("_this");
     return _currentLine >= _lines.Size();
 }
 
@@ -499,9 +524,14 @@ bool Script::Simulate(float deltaT)
         CurrentScript = this;
         GameState* gstate = GWorld->GetGameState();
         gstate->BeginContext(&_vars);
-        gstate->VarSet("_time", _time); // make sure there is such variable
+        // SQS keeps the script's clock in _time; in a scheduled SQF script _time is an
+        // ordinary local the script owns (fn_halo: _time = time, then time - _time).
+        if (!_fiber)
+            gstate->VarSet("_time", _time); // make sure there is such variable
         ret = SimulateBody();
-        _time = gstate->VarGet("_time");
+        GameState::s_breakTarget.clear(); // a breakTo whose scope was never found
+        if (!_fiber)
+            _time = gstate->VarGet("_time");
         gstate->EndContext();
         CurrentScript = nullptr;
     }
@@ -522,10 +552,15 @@ bool Script::OnSimulate()
         CurrentScript = this;
         GameState* gstate = GWorld->GetGameState();
         gstate->BeginContext(&_vars);
-        gstate->VarSet("_time", _time);
+        if (!_fiber)
+            gstate->VarSet("_time", _time);
         ret = SimulateBody();
-        _time = gstate->VarGet("_time");
-        _baseTime = Glob.time - _time;
+        GameState::s_breakTarget.clear(); // a breakTo whose scope was never found
+        if (!_fiber)
+        {
+            _time = gstate->VarGet("_time");
+            _baseTime = Glob.time - _time;
+        }
         gstate->EndContext();
         CurrentScript = nullptr;
     }
@@ -566,6 +601,8 @@ void Script::GoTo(RString label)
 void Script::Exit()
 {
     _currentLine = _lines.Size();
+    if (_fiber)
+        ScriptFiberTerminate(_fiber);
 }
 
 #define NOTHING GameValue()
@@ -603,4 +640,968 @@ GameValue ScriptGoto(const GameState* state, GameValuePar oper1)
         CurrentScript->GoTo(oper1);
     }
     return NOTHING;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled SQF for Arma 1 content: spawn / execVM / terminate / scriptDone.
+// ---------------------------------------------------------------------------
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace Poseidon
+{
+namespace
+{
+std::map<int, LLink<Script>>& ScriptHandles()
+{
+    static std::map<int, LLink<Script>> handles;
+    return handles;
+}
+
+int NextScriptHandle()
+{
+    static int next = 0;
+    // Drop finished/destroyed scripts so the table stays small.
+    auto& handles = ScriptHandles();
+    for (auto it = handles.begin(); it != handles.end();)
+    {
+        if (!it->second || it->second->IsTerminated())
+            it = handles.erase(it);
+        else
+            ++it;
+    }
+    return ++next;
+}
+
+// Removes // and /* */ comments outside string literals.
+std::string StripSqfComments(const std::string& code)
+{
+    std::string out;
+    out.reserve(code.size());
+    char quote = 0;
+    for (size_t i = 0; i < code.size(); i++)
+    {
+        const char c = code[i];
+        if (quote)
+        {
+            out.push_back(c);
+            if (c == quote)
+                quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+        {
+            quote = c;
+            out.push_back(c);
+            continue;
+        }
+        if (c == '/' && i + 1 < code.size() && code[i + 1] == '/')
+        {
+            while (i < code.size() && code[i] != '\n')
+                i++;
+            out.push_back('\n');
+            continue;
+        }
+        if (c == '/' && i + 1 < code.size() && code[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < code.size() && !(code[i] == '*' && code[i + 1] == '/'))
+                i++;
+            i++;
+            out.push_back(' ');
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Splits SQF into top-level statements (';' outside strings and brackets).
+std::vector<std::string> SplitSqfStatements(const std::string& code)
+{
+    std::vector<std::string> statements;
+    std::string current;
+    int depth = 0;
+    char quote = 0;
+    for (const char c : code)
+    {
+        if (quote)
+        {
+            current.push_back(c);
+            if (c == quote)
+                quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+            quote = c;
+        else if (c == '{' || c == '[' || c == '(')
+            depth++;
+        else if ((c == '}' || c == ']' || c == ')') && depth > 0)
+            depth--;
+        else if ((c == ';' || c == ',') && depth == 0)
+        {
+            statements.push_back(current);
+            current.clear();
+            continue;
+        }
+        current.push_back(c);
+    }
+    statements.push_back(current);
+    std::vector<std::string> trimmed;
+    for (std::string& s : statements)
+    {
+        size_t b = 0, e = s.size();
+        while (b < e && isspace(static_cast<unsigned char>(s[b])))
+            b++;
+        while (e > b && isspace(static_cast<unsigned char>(s[e - 1])))
+            e--;
+        if (e > b)
+            trimmed.push_back(s.substr(b, e - b));
+    }
+    return trimmed;
+}
+
+bool StartsWithWord(const std::string& s, const char* word, std::string& rest)
+{
+    const size_t n = strlen(word);
+    if (s.size() <= n || _strnicmp(s.c_str(), word, n) != 0)
+        return false;
+    const char next = s[n];
+    if (isalnum(static_cast<unsigned char>(next)) || next == '_')
+        return false;
+    size_t b = n;
+    while (b < s.size() && isspace(static_cast<unsigned char>(s[b])))
+        b++;
+    rest = s.substr(b);
+    return true;
+}
+
+// "{ body }" -> "body" when the braces enclose the whole text.
+bool UnwrapBraces(const std::string& s, std::string& body)
+{
+    if (s.size() < 2 || s.front() != '{' || s.back() != '}')
+        return false;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        const char c = s[i];
+        if (quote)
+        {
+            if (c == quote)
+                quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+            quote = c;
+        else if (c == '{')
+            depth++;
+        else if (c == '}' && --depth == 0 && i + 1 != s.size())
+            return false;
+    }
+    body = s.substr(1, s.size() - 2);
+    return true;
+}
+
+// The balanced {..} / (..) / [..] starting at s[pos] (pos at the opening bracket); its inner
+// text in `inner`, pos moved past the closing bracket.
+bool TakeBracketed(const std::string& s, size_t& pos, char open, char close, std::string& inner)
+{
+    while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos])))
+        pos++;
+    if (pos >= s.size() || s[pos] != open)
+        return false;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = pos; i < s.size(); i++)
+    {
+        const char c = s[i];
+        if (quote)
+        {
+            if (c == quote)
+                quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+            quote = c;
+        else if (c == open)
+            depth++;
+        else if (c == close && --depth == 0)
+        {
+            inner = s.substr(pos + 1, i - pos - 1);
+            pos = i + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TakeWord(const std::string& s, size_t& pos, const char* word)
+{
+    while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos])))
+        pos++;
+    const size_t n = strlen(word);
+    if (s.size() - pos < n || _strnicmp(s.c_str() + pos, word, n) != 0)
+        return false;
+    if (pos + n < s.size() && (isalnum(static_cast<unsigned char>(s[pos + n])) || s[pos + n] == '_'))
+        return false;
+    pos += n;
+    return true;
+}
+
+bool AtEnd(const std::string& s, size_t pos)
+{
+    while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos])))
+        pos++;
+    return pos >= s.size();
+}
+
+// Does the code contain sleep or waitUntil (outside strings, as whole words)?
+bool HasSuspension(const std::string& s)
+{
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        const char c = s[i];
+        if (quote)
+        {
+            if (c == quote)
+                quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+        {
+            quote = c;
+            continue;
+        }
+        if (i > 0 && (isalnum(static_cast<unsigned char>(s[i - 1])) || s[i - 1] == '_'))
+            continue;
+        size_t p = i;
+        if (TakeWord(s, p, "sleep") || TakeWord(s, p, "waitUntil"))
+            return true;
+    }
+    return false;
+}
+
+struct SqfCase
+{
+    std::vector<std::string> values; // empty: default
+    std::string code;
+};
+
+struct SqfControl
+{
+    enum Kind
+    {
+        While,
+        If,
+        For,
+        Switch,
+        ExitWith,
+        ForEach
+    } kind = While;
+    std::string condition, body, elseBody, init, step;
+    std::vector<SqfCase> cases; // Switch; condition holds the switched value
+};
+
+// "case v: {code}" / "case v" (falls through) / "default {code}"
+bool ParseSwitchBody(const std::string& body, std::vector<SqfCase>& cases)
+{
+    std::vector<std::string> pending;
+    for (const std::string& statement : SplitSqfStatements(body))
+    {
+        std::string rest;
+        if (StartsWithWord(statement, "default", rest))
+        {
+            std::string code;
+            if (!UnwrapBraces(rest, code))
+                return false;
+            cases.push_back({{}, code});
+            continue;
+        }
+        if (!StartsWithWord(statement, "case", rest))
+            return false;
+        // the ':' at bracket depth 0 outside strings separates value and code
+        int depth = 0;
+        char quote = 0;
+        size_t colon = std::string::npos;
+        for (size_t i = 0; i < rest.size() && colon == std::string::npos; i++)
+        {
+            const char c = rest[i];
+            if (quote)
+            {
+                if (c == quote)
+                    quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'')
+                quote = c;
+            else if (c == '(' || c == '[' || c == '{')
+                depth++;
+            else if (c == ')' || c == ']' || c == '}')
+                depth--;
+            else if (c == ':' && depth == 0)
+                colon = i;
+        }
+        if (colon == std::string::npos)
+        {
+            pending.push_back(rest); // falls through to the next case with code
+            continue;
+        }
+        std::string code;
+        size_t b = colon + 1;
+        while (b < rest.size() && isspace(static_cast<unsigned char>(rest[b])))
+            b++;
+        if (!UnwrapBraces(rest.substr(b), code))
+            return false;
+        pending.push_back(rest.substr(0, colon));
+        cases.push_back({pending, code});
+        pending.clear();
+    }
+    return true;
+}
+
+// while {c} do {b} | if (c) then {a} [else {b}] | for "_v" from a to b [step s] do {b} |
+// for [{i},{c},{s}] do {b}
+bool ParseSqfControl(const std::string& s, SqfControl& out)
+{
+    size_t pos = 0;
+    if (TakeWord(s, pos, "while"))
+    {
+        out.kind = SqfControl::While;
+        return TakeBracketed(s, pos, '{', '}', out.condition) && TakeWord(s, pos, "do") &&
+               TakeBracketed(s, pos, '{', '}', out.body) && AtEnd(s, pos);
+    }
+    pos = 0;
+    if (TakeWord(s, pos, "if"))
+    {
+        size_t probe = pos;
+        std::string c, b;
+        if (TakeBracketed(s, probe, '(', ')', c) && TakeWord(s, probe, "exitWith") &&
+            TakeBracketed(s, probe, '{', '}', b) && AtEnd(s, probe))
+        {
+            out.kind = SqfControl::ExitWith;
+            out.condition = c;
+            out.body = b;
+            return true;
+        }
+        out.kind = SqfControl::If;
+        if (!TakeBracketed(s, pos, '(', ')', out.condition) || !TakeWord(s, pos, "then") ||
+            !TakeBracketed(s, pos, '{', '}', out.body))
+            return false;
+        if (TakeWord(s, pos, "else") && !TakeBracketed(s, pos, '{', '}', out.elseBody))
+            return false;
+        return AtEnd(s, pos);
+    }
+    pos = 0;
+    {
+        // {body} forEach list
+        std::string b;
+        size_t probe = 0;
+        if (TakeBracketed(s, probe, '{', '}', b) && TakeWord(s, probe, "forEach"))
+        {
+            out.kind = SqfControl::ForEach;
+            out.body = b;
+            out.condition = s.substr(probe); // the list expression
+            return !AtEnd(s, probe);
+        }
+    }
+    pos = 0;
+    if (TakeWord(s, pos, "switch"))
+    {
+        out.kind = SqfControl::Switch;
+        return TakeBracketed(s, pos, '(', ')', out.condition) && TakeWord(s, pos, "do") &&
+               TakeBracketed(s, pos, '{', '}', out.body) && AtEnd(s, pos) && ParseSwitchBody(out.body, out.cases);
+    }
+    pos = 0;
+    if (!TakeWord(s, pos, "for"))
+        return false;
+    out.kind = SqfControl::For;
+    std::string inner;
+    if (TakeBracketed(s, pos, '[', ']', inner))
+    {
+        const std::vector<std::string> parts = SplitSqfStatements(inner); // splits at ','
+        std::string a, b, c;
+        if (parts.size() != 3 || !UnwrapBraces(parts[0], a) || !UnwrapBraces(parts[1], b) ||
+            !UnwrapBraces(parts[2], c))
+            return false;
+        out.init = a;
+        out.condition = b;
+        out.step = c;
+        return TakeWord(s, pos, "do") && TakeBracketed(s, pos, '{', '}', out.body) && AtEnd(s, pos);
+    }
+    // for "_v" from a to b [step s] do {body}
+    while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos])))
+        pos++;
+    if (pos >= s.size() || s[pos] != '"')
+        return false;
+    const size_t close = s.find('"', pos + 1);
+    if (close == std::string::npos)
+        return false;
+    const std::string var = s.substr(pos + 1, close - pos - 1);
+    pos = close + 1;
+    if (!TakeWord(s, pos, "from"))
+        return false;
+    const auto until = [&s](size_t from, const char* word) -> size_t
+    {
+        for (size_t i = from; i < s.size(); i++)
+        {
+            size_t p = i;
+            if ((i == 0 || isspace(static_cast<unsigned char>(s[i - 1]))) && TakeWord(s, p, word))
+                return i;
+        }
+        return std::string::npos;
+    };
+    const size_t toAt = until(pos, "to");
+    const size_t doAt = until(pos, "do");
+    if (toAt == std::string::npos || doAt == std::string::npos || doAt < toAt)
+        return false;
+    const std::string from = s.substr(pos, toAt - pos);
+    size_t stepAt = until(toAt, "step");
+    if (stepAt != std::string::npos && stepAt > doAt)
+        stepAt = std::string::npos;
+    size_t p = toAt + 2;
+    const std::string to = s.substr(p, (stepAt != std::string::npos ? stepAt : doAt) - p);
+    std::string stepValue = "1";
+    if (stepAt != std::string::npos)
+        stepValue = s.substr(stepAt + 4, doAt - stepAt - 4);
+    pos = doAt + 2;
+    if (!TakeBracketed(s, pos, '{', '}', out.body) || !AtEnd(s, pos))
+        return false;
+    out.init = var + " = (" + from + ")";
+    out.condition = "if ((" + stepValue + ") >= 0) then {" + var + " <= (" + to + ")} else {" + var + " >= (" + to + ")}";
+    out.step = var + " = " + var + " + (" + stepValue + ")";
+    return true;
+}
+} // namespace
+
+Script* Script::FindByHandle(int handle)
+{
+    const auto found = ScriptHandles().find(handle);
+    return found == ScriptHandles().end() ? nullptr : found->second.GetLink();
+}
+
+// ---------------------------------------------------------------------------
+// Arma 2 scheduled code (spawn / execVM) on a stack of its own.
+//
+// Arma 2 suspends a script anywhere -- a sleep inside a function called from inside a
+// while loop is ordinary code there (BIS_fnc_UnitPlay, the scene functions, ...). The
+// line compiler above can only suspend at statements it sees. With --arma2 each
+// scheduled script instead runs as a coroutine (a Windows fiber / POSIX ucontext): sleep
+// and waitUntil switch back to the frame and the script continues exactly where it was
+// on a later one. Only one runs at a time, on the main thread; the evaluator contexts it
+// has open are taken off the shared stack while it waits.
+// ---------------------------------------------------------------------------
+struct ScriptFiber
+{
+    Script* script = nullptr;
+    RString code;
+    bool started = false;
+    bool done = false;
+    bool terminate = false;
+    int baseLevel = 0;
+    std::vector<Ref<GameEvaluator>> contexts;
+    Coroutine::Handle* coroutine = nullptr;
+    std::chrono::steady_clock::time_point sliceStart;
+    // Game time when it last gave the frame back. Arma 2 resumes a scheduled script in a
+    // later frame at the earliest, so `time` always moves across a sleep or a yield
+    // (scripts divide by that difference: fn_halo's _fpsCoef).
+    float suspendedAt = -1.0f;
+
+    static void SuspendFor(ScriptFiber& f, float seconds)
+    {
+        f.script->_suspendedUntil = f.script->_time + std::max(seconds, 0.0f);
+    }
+
+    static void Run(void* param)
+    {
+        ScriptFiber& f = *static_cast<ScriptFiber*>(param);
+        GameState* gstate = GWorld->GetGameState();
+        // The fiber's own context on top of the frame's: everything it opens is above
+        // baseLevel and travels with it while it waits.
+        const int level = gstate->ContextLevel();
+        gstate->BeginContext(&f.script->_vars);
+        gstate->VarSetLocal("_this", f.script->_argument, true);
+        // Nothing may unwind out of a coroutine: its stack has no caller to catch it.
+        try
+        {
+            gstate->EvaluateMultiple(f.code);
+            GameState::s_breakTarget.clear(); // a breakTo whose scope was never found
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERROR(Script, "script '{}' stopped by an exception: {}", (const char*)f.script->_name, e.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR(Script, "script '{}' stopped by an exception", (const char*)f.script->_name);
+        }
+        while (gstate->ContextLevel() > level)
+            gstate->EndContext();
+        f.done = true;
+    }
+};
+
+namespace
+{
+ScriptFiber* GRunningFiber = nullptr;
+unsigned GFiberYields = 0;
+bool GScriptTimeStands = false; // SetScriptTimeStands
+constexpr size_t FiberStackSize = 16u << 20; // reserved, committed as used
+
+unsigned FiberYieldCount()
+{
+    return GFiberYields;
+}
+
+} // namespace
+
+bool ScriptFiberDone(const ScriptFiber* f)
+{
+    return f->done || f->terminate;
+}
+
+void ScriptFiberTerminate(ScriptFiber* f)
+{
+    f->terminate = true;
+}
+
+void ForgetScriptSwitches(const void* owner); // GameStateExt.cpp
+
+// The scheduled script running now (null outside one): what the script commands that keep
+// state across statements (switch/case) key it by.
+const void* CurrentScriptFiber()
+{
+    return GRunningFiber;
+}
+
+void DestroyScriptFiber(ScriptFiber* f)
+{
+    if (!f || f == GRunningFiber)
+        return;
+    // a script dropped inside a switch body leaves its switch behind; its stack is not
+    // unwound, so the switch must not be reached through it any more
+    ForgetScriptSwitches(f);
+    Coroutine::Destroy(f->coroutine);
+    delete f;
+}
+
+void SetScriptTimeStands(bool stands)
+{
+    GScriptTimeStands = stands;
+}
+
+// True when the code being evaluated runs as a scheduled Arma 2 script.
+bool InScheduledScript()
+{
+    return GRunningFiber != nullptr;
+}
+
+// Gives the frame back; the script continues here on a later simulation step.
+void ScheduledYield()
+{
+    ScriptFiber* f = GRunningFiber;
+    if (!f)
+        return;
+    GFiberYields++;
+    f->suspendedAt = Glob.time.toFloat();
+    Coroutine::Suspend(f->coroutine);
+    f->sliceStart = std::chrono::steady_clock::now();
+}
+
+// sleep in scheduled code: resume once the script's clock has advanced by `seconds`
+void ScheduledSleep(float seconds)
+{
+    ScriptFiber* f = GRunningFiber;
+    if (!f)
+        return;
+    ScriptFiber::SuspendFor(*f, seconds);
+    ScheduledYield();
+}
+
+// A scheduled loop that keeps the frame longer than Arma 2's ~3 ms slice gives it back.
+void ScheduledTick()
+{
+    ScriptFiber* f = GRunningFiber;
+    if (f && std::chrono::steady_clock::now() - f->sliceStart > std::chrono::milliseconds(3))
+        ScheduledYield();
+}
+
+bool Script::SimulateFiber()
+{
+    ScriptFiber& f = *_fiber;
+    if (f.done || f.terminate)
+        return true;
+    if (GRunningFiber)
+        return false; // a scheduled script does not run another one inside itself
+    if (f.started && !GScriptTimeStands && Glob.time.toFloat() == f.suspendedAt)
+        return false; // not again in the frame it gave back
+    GameState* gstate = GWorld->GetGameState();
+    if (!f.started)
+    {
+        f.started = true;
+        GameState::s_scheduledYields = FiberYieldCount;
+        GameState::s_scheduledTick = ScheduledTick;
+        f.coroutine = Coroutine::Create(ScriptFiber::Run, &f, FiberStackSize);
+        if (!f.coroutine)
+        {
+            LOG_ERROR(Script, "could not create a coroutine for '{}'", (const char*)_name);
+            f.done = true;
+            return true;
+        }
+    }
+    f.baseLevel = gstate->ContextLevel();
+    gstate->AttachContexts(f.contexts);
+    GRunningFiber = &f;
+    f.sliceStart = std::chrono::steady_clock::now();
+    Coroutine::Resume(f.coroutine);
+    GRunningFiber = nullptr;
+    gstate->DetachContextsAbove(f.baseLevel, f.contexts);
+    return f.done;
+}
+
+Script* Script::CreateFiberScript(RString name, RString code, GameValuePar argument)
+{
+    Script* script = new Script();
+    script->_argument = argument;
+    script->_maxLinesAtOnce = 100;
+    script->_name = name;
+    script->_handle = NextScriptHandle();
+    ScriptHandles()[script->_handle] = script;
+    script->_fiber = new ScriptFiber();
+    script->_fiber->script = script;
+    script->_fiber->code = code;
+    return script;
+}
+
+Script* Script::CreateFromCode(RString name, RString code, GameValuePar argument)
+{
+    // Arma 2: a coroutine, so suspension works anywhere (OP_A2_FIBERS=0: line compiler)
+    static const bool fibers = [] {
+        const char* e = std::getenv("OP_A2_FIBERS");
+        return !(e && *e == '0');
+    }();
+    if (fibers && Arma1Compat::Generation() >= 2)
+        return CreateFiberScript(name, code, argument);
+    Script* script = new Script();
+    script->_argument = argument;
+    script->_maxLinesAtOnce = 100;
+    script->_name = name;
+    script->_handle = NextScriptHandle();
+    ScriptHandles()[script->_handle] = script;
+
+    static RString empty("");
+    const auto addLine = [script](RString waitUntil, RString suspendUntil, RString statement)
+    {
+        const int i = script->_lines.Add();
+        script->_lines[i].waitUntil = waitUntil;
+        script->_lines[i].suspendUntil = suspendUntil;
+        script->_lines[i].condition = empty;
+        script->_lines[i].statement = statement;
+    };
+
+    // Scheduled code may suspend anywhere: a sleep/waitUntil inside while, if or for is
+    // compiled into script lines with labels and gotos (the same machinery SQS uses), so
+    // the loop yields to the frame instead of spinning unscheduled.
+    int labelCount = 0;
+    const auto newLabel = [&labelCount]() { return "__a1l" + std::to_string(labelCount++); };
+    const auto placeLabel = [script](const std::string& name)
+    {
+        const int i = script->_labels.Add();
+        script->_labels[i].name = RString(name.c_str());
+        script->_labels[i].line = script->_lines.Size();
+    };
+    const auto addCondLine = [script](const std::string& condition, const std::string& statement)
+    {
+        const int i = script->_lines.Add();
+        script->_lines[i].condition = RString(condition.c_str());
+        script->_lines[i].statement = RString(statement.c_str());
+    };
+    const auto addGoto = [&addCondLine](const std::string& label) { addCondLine("", "goto \"" + label + "\""); };
+
+    std::vector<std::string> loopExits; // where exitWith leaves to (innermost loop)
+    std::vector<std::pair<std::string, std::string>> forEachVars; // (list, index) of compiled forEach loops
+    const std::string scriptEnd = newLabel();
+    std::function<void(const std::string&)> emit;
+    const auto emitBlock = [&emit](const std::string& code)
+    {
+        for (const std::string& statement : SplitSqfStatements(code))
+            emit(statement);
+    };
+    emit = [&](const std::string& statement)
+    {
+        std::string rest;
+        std::string body;
+        SqfControl control;
+        if (StartsWithWord(statement, "waitUntil", rest) && UnwrapBraces(rest, body))
+        {
+            // A multi-statement condition evaluates as code; its value is the last statement's.
+            const std::vector<std::string> parts = SplitSqfStatements(body);
+            const std::string condition = parts.size() <= 1 ? body : "call {" + body + "}";
+            addLine(RString(condition.c_str()), empty, empty);
+        }
+        else if (StartsWithWord(statement, "sleep", rest))
+        {
+            const std::string wait = "__waituntil = _time+(" + rest + ")";
+            addLine(empty, empty, RString(wait.c_str()));
+            addLine(empty, RString("__waituntil"), empty);
+        }
+        else if (ParseSqfControl(statement, control) && control.kind == SqfControl::ExitWith)
+        {
+            // exitWith leaves the innermost compiled scope (loop body, if/switch branch);
+            // at the top level of the script it ends the script, as in Arma.
+            const std::string skip = newLabel();
+            addCondLine("!(" + control.condition + ")", "goto \"" + skip + "\"");
+            emitBlock(control.body);
+            addGoto(loopExits.empty() ? scriptEnd : loopExits.back());
+            placeLabel(skip);
+        }
+        else if (HasSuspension(statement) && ParseSqfControl(statement, control) &&
+                 control.kind != SqfControl::ExitWith)
+        {
+            const std::string top = newLabel();
+            const std::string next = newLabel();
+            switch (control.kind)
+            {
+                case SqfControl::While:
+                    placeLabel(top);
+                    addCondLine("!(" + control.condition + ")", "goto \"" + next + "\"");
+                    loopExits.push_back(next);
+                    emitBlock(control.body);
+                    loopExits.pop_back();
+                    addGoto(top);
+                    placeLabel(next);
+                    break;
+                case SqfControl::ExitWith:
+                    break;
+                case SqfControl::ForEach:
+                {
+                    const std::string id = std::to_string(labelCount);
+                    const std::string list = "_a1felist" + id;
+                    const std::string index = "_a1feindex" + id;
+                    addCondLine("", list + " = (" + control.condition + "); " + index + " = 0");
+                    placeLabel(top);
+                    addCondLine("!(" + index + " < count " + list + ")", "goto \"" + next + "\"");
+                    addCondLine("", "_x = " + list + " select " + index);
+                    loopExits.push_back(next);
+                    forEachVars.emplace_back(list, index);
+                    emitBlock(control.body);
+                    forEachVars.pop_back();
+                    loopExits.pop_back();
+                    addCondLine("", index + " = " + index + " + 1");
+                    addGoto(top);
+                    placeLabel(next);
+                    // an enclosing compiled forEach gets its own _x back
+                    if (!forEachVars.empty())
+                        addCondLine("", "if (" + forEachVars.back().second + " < count " + forEachVars.back().first +
+                                            ") then {_x = " + forEachVars.back().first + " select " +
+                                            forEachVars.back().second + "}");
+                    break;
+                }
+                case SqfControl::If:
+                {
+                    const std::string otherwise = newLabel();
+                    addCondLine("!(" + control.condition + ")", "goto \"" + otherwise + "\"");
+                    loopExits.push_back(next);
+                    emitBlock(control.body);
+                    addGoto(next);
+                    placeLabel(otherwise);
+                    emitBlock(control.elseBody);
+                    loopExits.pop_back();
+                    placeLabel(next);
+                    break;
+                }
+                case SqfControl::Switch:
+                {
+                    const std::string value = "_a1switch" + std::to_string(labelCount);
+                    addCondLine("", value + " = (" + control.condition + ")");
+                    const SqfCase* fallback = nullptr;
+                    for (const SqfCase& c : control.cases)
+                    {
+                        if (c.values.empty())
+                        {
+                            fallback = &c;
+                            continue;
+                        }
+                        std::string match;
+                        for (const std::string& v : c.values)
+                            match += (match.empty() ? "" : " || ") + std::string("(") + value + " == (" + v + "))";
+                        const std::string skip = newLabel();
+                        addCondLine("!(" + match + ")", "goto \"" + skip + "\"");
+                        emitBlock(c.code);
+                        addGoto(next);
+                        placeLabel(skip);
+                    }
+                    if (fallback)
+                        emitBlock(fallback->code);
+                    placeLabel(next);
+                    break;
+                }
+                case SqfControl::For:
+                    addCondLine("", control.init);
+                    placeLabel(top);
+                    addCondLine("!(" + control.condition + ")", "goto \"" + next + "\"");
+                    loopExits.push_back(next);
+                    emitBlock(control.body);
+                    loopExits.pop_back();
+                    addCondLine("", control.step);
+                    addGoto(top);
+                    placeLabel(next);
+                    break;
+            }
+        }
+        else
+        {
+            addLine(empty, empty, RString(statement.c_str()));
+        }
+    };
+    emitBlock(StripSqfComments(code.Data()));
+    placeLabel(scriptEnd);
+    return script;
+}
+
+} // namespace Poseidon
+
+GameValue ScriptSpawn(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    using namespace Poseidon;
+    Script* script = Script::CreateFromCode("spawn", oper2, oper1);
+    GWorld->AddScript(script);
+    return GameValue(static_cast<float>(script->GetHandle()));
+}
+
+bool PreprocessScriptFile(const char* name, std::string& out); // GameStateExtWorldConfig.cpp
+
+GameValue ScriptExecVM(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    using namespace Poseidon;
+    RString name = oper2;
+    QIFStreamB in;
+    std::string code;
+    // Arma 2 scripts rely on #include / #define: run them through the preprocessor
+    // preprocessFile uses. Arma 1 content keeps the plain read below.
+    if (Arma1Compat::Generation() >= 2 && PreprocessScriptFile(name, code))
+    {
+        // preprocessed; '#line' markers and the like are dropped below
+    }
+    else if (OpenScript(in, name))
+    {
+        while (true)
+        {
+            const int c = in.get();
+            if (in.eof() || in.fail() || c < 0)
+                break;
+            code.push_back(static_cast<char>(c));
+        }
+    }
+    else
+    {
+        LOG_WARN(Script, "execVM: script '{}' not found", (const char*)name);
+    }
+    // Preprocessor directives are not expanded here; report them instead of guessing.
+    if (Arma1Compat::Generation() < 2 &&
+        (code.find("#include") != std::string::npos || code.find("#define") != std::string::npos))
+        LOG_WARN(Script, "execVM '{}': preprocessor directives are not supported and were ignored",
+                 (const char*)name);
+    std::string filtered;
+    size_t pos = 0;
+    while (pos < code.size())
+    {
+        size_t end = code.find('\n', pos);
+        if (end == std::string::npos)
+            end = code.size();
+        std::string line = code.substr(pos, end - pos);
+        size_t b = 0;
+        while (b < line.size() && isspace(static_cast<unsigned char>(line[b])))
+            b++;
+        if (b >= line.size() || line[b] != '#')
+            filtered += line + "\n";
+        pos = end + 1;
+    }
+    Script* script = Script::CreateFromCode(name, RString(filtered.c_str()), oper1);
+    GWorld->AddScript(script);
+    return GameValue(static_cast<float>(script->GetHandle()));
+}
+
+GameValue ScriptTerminate(const GameState* state, GameValuePar oper1)
+{
+    using namespace Poseidon;
+    if (Script* script = Script::FindByHandle(static_cast<int>(static_cast<float>(oper1))))
+        script->Exit();
+    return GameValue();
+}
+
+GameValue ScriptIsDone(const GameState* state, GameValuePar oper1)
+{
+    using namespace Poseidon;
+    Script* script = Script::FindByHandle(static_cast<int>(static_cast<float>(oper1)));
+    return GameValue(!script || script->IsTerminated());
+}
+
+GameValue ScriptWaitUntilUnscheduled(const GameState* state, GameValuePar oper1)
+{
+    using namespace Poseidon;
+    if (InScheduledScript())
+    {
+        // scheduled: check once per simulation step until it holds
+        for (;;)
+        {
+            if (GWorld->GetGameState()->EvaluateBool(RString(oper1)))
+                return GameValue(true);
+            ScheduledYield();
+        }
+    }
+    static bool reported = false;
+    if (!reported)
+    {
+        reported = true;
+        LOG_WARN(Script, "waitUntil outside the top level of spawned code cannot suspend; evaluated once: {}",
+                 (const char*)RString(oper1));
+    }
+    return GameValue(GWorld->GetGameState()->EvaluateBool(RString(oper1)));
+}
+
+GameValue ScriptSleepUnscheduled(const GameState* state, GameValuePar oper1)
+{
+    if (Poseidon::InScheduledScript())
+    {
+        Poseidon::ScheduledSleep(static_cast<float>(oper1));
+        return GameValue();
+    }
+    static bool reported = false;
+    if (!reported)
+    {
+        reported = true;
+        LOG_WARN(Script, "sleep outside the top level of spawned code cannot suspend; ignored");
+    }
+    return GameValue();
+}
+
+GameValue PreloadCameraReady(const GameState* state, GameValuePar oper1)
+{
+    // Streaming loads the scene around the camera on demand; nothing to wait for.
+    return GameValue(true);
+}
+
+GameValue PreloadObjectReady(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    return GameValue(true);
+}
+
+GameValue CampaignKeyActive(const GameState* state, GameValuePar oper1)
+{
+    return GameValue(Poseidon::Arma1Compat::IsKeyActive((const char*)RString(oper1)));
+}
+
+GameValue CampaignKeyActivate(const GameState* state, GameValuePar oper1)
+{
+    Poseidon::Arma1Compat::ActivateKey((const char*)RString(oper1));
+    return GameValue();
+}
+
+GameValue ScriptExecVMUnary(const GameState* state, GameValuePar oper1)
+{
+    return ScriptExecVM(state, GameValue(), oper1);
 }

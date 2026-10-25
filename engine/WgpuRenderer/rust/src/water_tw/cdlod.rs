@@ -34,6 +34,13 @@ pub const MAX_INSTANCES: usize = 1500;
 pub const MIN_Y: f32 = -25.0;
 pub const MAX_Y: f32 = 25.0;
 
+const EARTH_RADIUS: f64 = 6_378_137.0;
+const EARTH_ANCHOR: f64 = 6400.0;
+fn earth_drop(x: f64, z: f64) -> f64 {
+    let r2 = (x - EARTH_ANCHOR).powi(2) + (z - EARTH_ANCHOR).powi(2);
+    r2 / (EARTH_RADIUS + (EARTH_RADIUS * EARTH_RADIUS - r2).max(0.0).sqrt())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Cdlod {
     pub ranges: [f32; LEVELS],
@@ -98,17 +105,51 @@ pub struct Selection<'a> {
     cam: glam::DVec3,
     sea: f64,
     planes: Option<SidePlanes>,
+    curved_earth: bool,
+    /// (OP) how far the drawn surface reaches out of a node's flat box: sideways (m) and as a
+    /// factor on the vertical bounds (see `displacement`)
+    margin_xz: f64,
+    scale_y: f64,
     pub nodes: Vec<[f32; 4]>,
 }
 
 impl<'a> Selection<'a> {
     pub fn new(cdlod: &'a Cdlod, cam: glam::DVec3, sea: f32, planes: Option<SidePlanes>) -> Self {
-        Self { cdlod, cam, sea: sea as f64, planes, nodes: Vec::with_capacity(256) }
+        Self { cdlod, cam, sea: sea as f64, planes, curved_earth: false, margin_xz: 0.0, scale_y: 1.0, nodes: Vec::with_capacity(256) }
+    }
+
+    /// (OP) The frame's amplitude and choppiness: the surface is drawn displaced sideways by up to
+    /// ~5 m x choppiness x amplitude and vertically by the amplitude, so a node's culling box grows
+    /// by that much. With the flat box a node whose displaced water was on screen was culled from
+    /// its undisplaced footprint, and its square showed the background through the sea (owner,
+    /// 2026-10-13: "for high water amplitude like 3 I see patches of water that are not rendered
+    /// and remain white squares").
+    pub fn displacement(mut self, amplitude: f32, choppiness: f32) -> Self {
+        let a = amplitude.max(0.0) as f64;
+        self.margin_xz = 5.0 * a * (choppiness.max(0.5) as f64);
+        self.scale_y = a.max(1.0);
+        self
+    }
+
+    /// Earth presentation only: conservative spherical height bounds. The
+    /// native OFP selection keeps its original flat sea boxes and budgets.
+    pub fn curved_earth(mut self, enabled: bool) -> Self {
+        self.curved_earth = enabled;
+        self
     }
 
     fn rel_box(&self, x: f64, z: f64, size: f64) -> (glam::Vec3, glam::Vec3) {
-        let min = glam::DVec3::new(x, self.sea + MIN_Y as f64, z) - self.cam;
-        let max = glam::DVec3::new(x + size, self.sea + MAX_Y as f64, z + size) - self.cam;
+        let (mut min_y, mut max_y) = (self.sea + MIN_Y as f64 * self.scale_y, self.sea + MAX_Y as f64 * self.scale_y);
+        if self.curved_earth {
+            let near_x = EARTH_ANCHOR.clamp(x, x + size);
+            let near_z = EARTH_ANCHOR.clamp(z, z + size);
+            let far_x = if (x - EARTH_ANCHOR).abs() > (x + size - EARTH_ANCHOR).abs() { x } else { x + size };
+            let far_z = if (z - EARTH_ANCHOR).abs() > (z + size - EARTH_ANCHOR).abs() { z } else { z + size };
+            min_y -= earth_drop(far_x, far_z);
+            max_y -= earth_drop(near_x, near_z);
+        }
+        let min = glam::DVec3::new(x, min_y, z) - self.cam;
+        let max = glam::DVec3::new(x + size, max_y, z + size) - self.cam;
         (min.as_vec3(), max.as_vec3())
     }
 
@@ -122,7 +163,9 @@ impl<'a> Selection<'a> {
         match &self.planes {
             None => true,
             Some(p) => {
-                let (min, max) = self.rel_box(x, z, size);
+                // the margin widens only the visibility test, not the LOD ranges
+                let m = self.margin_xz;
+                let (min, max) = self.rel_box(x - m, z - m, size + 2.0 * m);
                 p.box_visible(min, max)
             }
         }
@@ -225,6 +268,72 @@ mod tests {
         assert!((c.morph[0][2] - 0.25).abs() < 1e-6);
         // level 1: start = 20 + (40 - 20) * 0.66
         assert!((c.morph[1][0] - 33.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn earth_bounds_enclose_the_curved_surface_without_flat_sea_culling() {
+        let c = Cdlod::default();
+        let cam = glam::DVec3::new(8000.0, 1000.0, 4800.0);
+        let earth = Selection::new(&c, cam, 0.0, None).curved_earth(true);
+        for (x,z,size) in [(0.0,0.0,16384.0),(90000.0,-20000.0,32768.0),(-200000.0,90000.0,65536.0)] {
+            let (min,max) = earth.rel_box(x,z,size);
+            for fx in [0.0,0.5,1.0] { for fz in [0.0,0.5,1.0] {
+                let y = -earth_drop(x+fx*size,z+fz*size) - cam.y;
+                assert!(y >= min.y as f64 && y <= max.y as f64);
+            }}
+        }
+        // A view whose upper plane is below y=-500 sees distant curved sea,
+        // while flat +/-25 m bounds would incorrectly reject the entire node.
+        let planes = SidePlanes([[0.0,-1.0,0.0,-500.0];4]);
+        let flat = Selection::new(&c,glam::DVec3::ZERO,0.0,Some(planes));
+        let curved = Selection::new(&c,glam::DVec3::ZERO,0.0,Some(planes)).curved_earth(true);
+        assert!(!flat.visible(100000.0,0.0,8192.0));
+        assert!(curved.visible(100000.0,0.0,8192.0));
+        assert_eq!(flat.rel_box(100000.0,0.0,8192.0).0.y,MIN_Y);
+    }
+
+    #[test]
+    fn earth_ocean_crosses_the_resident_rectangle_with_existing_budget() {
+        let c = Cdlod::default();
+        let cam = glam::DVec3::new(8000.0,1000.0,4800.0);
+        let nodes = Selection::new(&c,cam,0.0,None).curved_earth(true).run();
+        assert!(!nodes.is_empty() && nodes.len() < MAX_INSTANCES);
+        // The old resident clip was [4800,11200] x [1600,8000]. The selected
+        // existing mesh must cross it in every direction without changing caps.
+        for (x,z) in [(8000.0,-100000.0),(8000.0,110000.0),(-100000.0,4800.0),(110000.0,4800.0)] {
+            assert!(nodes.iter().any(|n| x>=n[0] && x<=n[0]+n[2] && z>=n[1] && z<=n[1]+n[2]));
+        }
+        let forward = glam::Vec3::new(0.664463,-0.342020,-0.664463);
+        #[allow(deprecated)]
+        let view = glam::Mat4::look_at_lh(glam::Vec3::ZERO,forward,glam::Vec3::Y);
+        #[allow(deprecated)]
+        let projection = glam::Mat4::perspective_lh(60f32.to_radians(),16.0/9.0,0.1,500000.0);
+        let visible = Selection::new(&c,cam,0.0,Some(SidePlanes::from_clip(projection*view))).curved_earth(true).run();
+        assert!(!visible.is_empty() && visible.len()<MAX_INSTANCES);
+        for distance in [5000.0,30000.0,100000.0] {
+            let x=cam.x as f32+distance/std::f32::consts::SQRT_2;
+            let z=cam.z as f32-distance/std::f32::consts::SQRT_2;
+            assert!(visible.iter().any(|n| x>=n[0] && x<=n[0]+n[2] && z>=n[1] && z<=n[1]+n[2]));
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn earth_reverse_depth_retains_opaque_land_and_rejects_the_hidden_horizon() {
+        // The actual material and pipeline use reverse-Z GreaterEqual. Along
+        // one pixel ray, near opaque land must win and a deeper floor must not.
+        let p = glam::Mat4::perspective_lh(60f32.to_radians(),16.0/9.0,0.1,500000.0);
+        let depth = |distance| {let q=p*glam::Vec4::new(0.0,0.0,distance,1.0);1.0-q.z/q.w};
+        assert!(depth(1000.0)<depth(300.0));
+        assert!(depth(1000.0)>=depth(1500.0));
+        // Sphere normal dot camera vector changes sign at the geometric
+        // horizon (~113 km from 1000 m), independent of any rectangular map.
+        let facing = |r:f64| {
+            let drop=earth_drop(EARTH_ANCHOR+r,EARTH_ANCHOR);
+            -r*r+(EARTH_RADIUS-drop)*(1000.0+drop)
+        };
+        assert!(facing(10000.0)>0.0);
+        assert!(facing(200000.0)<0.0);
     }
 
     #[test]

@@ -25,10 +25,29 @@
 
 // (W9a) within this of the surface the medium is decided per pixel on the lens (was 0.35 m while
 // the camera's height came from the FFT alone; the probe's is the drawn surface's own)
-const UW_STRADDLE: f32 = 1.0;
+// (OP, 2026-10-12) 1.0 -> 0.05 m: within a metre the per-pixel test let a camera a few decimetres under
+// the water call every upward pixel "air" (its port point poked out of the surface), and with the
+// surface itself closer than the near plane and clipped, the owner saw plain undistorted clouds and
+// clear water until he dived deeper. Under the water the eye's own medium decides; only a lens really
+// touching the surface (a few centimetres) is split.
+const UW_STRADDLE: f32 = 0.05;
+// (OP) the split is decided on a virtual dome port this far along the view, not on the near plane:
+// the near plane is a few cm tall on screen terms, so the waterline crossed the whole frame within
+// +-5 cm of bob and the view flipped between air and water as each wave passed. At 0.6 m it sweeps
+// the frame over about +-0.35 m, the bob the waves actually give a swimmer's eye -- a half-submerged
+// camera's waterline, rising and falling across the lens.
+//
+// 0.6 -> 0.12 m (owner, 2026-10-12, "two underwater systems that fight each other" in high waves):
+// an eye up to ~0.3 m ABOVE the drawn surface looking down put the 0.6 m port under it, so the
+// lower frame became underwater fog laid over the very surface the water material was drawing
+// from above. At 0.12 m the split stays where the drawn surface really crosses the lens.
+const UW_PORT: f32 = 0.03;
+// (OP) the shortest water path a view ray from a submerged eye up to the surface is given (m)
+const UW_SURFACE_VEIL: f32 = 1.5;
 const UW_BAND: i32 = 16;
 const UW_IOR: f32 = 1.333;
 const UW_PI: f32 = 3.141592653589793;
+const UW_PROBE_FADE: f32 = 16.0; // probe cells (0.25 m): the outer 4 m of the 16 m grid
 
 struct UwParams {
     inv_view_proj: mat4x4<f32>, // inv(view) * inv(proj), camera-relative (Frame.inv_view_proj)
@@ -43,7 +62,7 @@ struct UwParams {
     torch_pos: vec4<f32>,       // (W5e) the torch: world position, w: on
     torch_dir: vec4<f32>,       // beam direction, w: cos^2 of the outer cone
     torch_col: vec4<f32>,       // irradiance in the core (Tidewater units), w: core radius (m)
-    torch_shape: vec4<f32>,     // x: cone shaping exponent, y: beam in-scatter strength
+    torch_shape: vec4<f32>,     // x: cone shaping exponent, y: beam in-scatter strength, z: the whole world's open sea (uwLightLeg, its curved datum)
     probe: vec4<f32>,           // (W9a) the probe grid: camera x, z, step (m), size (0 = none)
 };
 
@@ -56,6 +75,20 @@ struct UwParams {
 @group(0) @binding(6) var causticsFineTex: texture_2d<f32>;  // W5b (caustics.rs)
 @group(0) @binding(7) var causticsBroadTex: texture_2d<f32>;
 @group(0) @binding(8) var uwProbe: texture_2d<f32>;           // (W9a) r32float surface heights
+// (OP) the sky's SH-9 irradiance (sky_sh.wgsl), for the light the water column receives from the
+// sky: OFP's flat ambient (sky_e) is an artistic fill ~30x the sun's irradiance on stock worlds, and
+// lit with it the water seen from inside glowed neon turquoise (owner, 2026-10-12).
+struct UwSkySh { c: array<vec4<f32>, 9>, };
+@group(0) @binding(9) var<uniform> uwSkySh: UwSkySh;
+
+// downwelling sky irradiance / PI at the surface (sky_irradiance(+y) of frame.wgsl), x the frame's
+// ambient scale (uw.absorption.w); the flat ambient when no scale is given
+fn uwSkyE() -> vec3<f32> {
+    if (uw.absorption.w <= 0.0) { return uw.sky_e.rgb; }
+    let e = 0.886227 * uwSkySh.c[0].rgb - 0.247708 * uwSkySh.c[6].rgb + 2.0 * 0.511664 * uwSkySh.c[1].rgb
+        - 0.429043 * uwSkySh.c[8].rgb;
+    return max(e, vec3<f32>(0.0)) * (1.0 / 3.14159265359) * uw.absorption.w;
+}
 
 struct UwOut {
     @builtin(position) pos: vec4<f32>,
@@ -93,16 +126,20 @@ fn uwTri(xz: vec2<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec2<f32> {
 // vertices (tw_probe.wgsl). The triangles are CDLOD.js's grid (cdlod.rs grid_mesh): in a cell
 // (i, j) with i + j even, (a c b) (b c d), else (a c d) (a d b), a = (i, j), b = (i+1, j),
 // c = (i, j+1), d = (i+1, j+1); nodes start on even lattice indices, so the parity is the
-// world lattice's. The cell under xz is found from the lattice point displaced to it (two
-// fixed-point steps), then it and its 8 neighbours are tested. y = 0 outside the grid.
+// world lattice's. The cell under xz is found from the lattice point displaced to it (Newton
+// steps), then it and its 8 neighbours are tested. y = 0 outside the grid.
 fn uwProbeHeight(xz: vec2<f32>) -> vec2<f32> {
     let nf = uw.probe.w;
     if (nf < 2.0) { return vec2<f32>(0.0); }
     let n = i32(nf);
     let h = uw.probe.z;
     let base = uw.probe.xy;
+    // (OP, 2026-10-13) Newton on p + D(p) = xz with the cell's bilinear displacement, as probe.rs
+    // `surface_height` (tested there against a trochoid). The plain fixed-point step used before
+    // contracts by only 1 - kQ per step: on a choppy crest two steps left the point metres off,
+    // outside the 3 x 3 cells searched, and the camera's own depth came out wrong.
     var p = xz;
-    for (var k = 0; k < 2; k++) {
+    for (var k = 0; k < 6; k++) {
         let f = clamp((p - base) / h, vec2<f32>(0.0), vec2<f32>(nf - 1.001));
         let i = vec2<i32>(floor(f));
         let t = f - vec2<f32>(i);
@@ -110,10 +147,29 @@ fn uwProbeHeight(xz: vec2<f32>) -> vec2<f32> {
         let d10 = uwProbeV(i + vec2<i32>(1, 0)).xz - (base + vec2<f32>(i + vec2<i32>(1, 0)) * h);
         let d01 = uwProbeV(i + vec2<i32>(0, 1)).xz - (base + vec2<f32>(i + vec2<i32>(0, 1)) * h);
         let d11 = uwProbeV(i + vec2<i32>(1, 1)).xz - (base + vec2<f32>(i + vec2<i32>(1, 1)) * h);
-        p = xz - mix(mix(d00, d10, t.x), mix(d01, d11, t.x), t.y);
+        let a = mix(d00, d10, t.x);
+        let b = mix(d01, d11, t.x);
+        let m = mix(a, b, t.y);
+        // columns: d/dx and d/dz of p + D(p)
+        let jx = vec2<f32>(1.0, 0.0) + ((d10 - d00) * (1.0 - t.y) + (d11 - d01) * t.y) / h;
+        let jz = vec2<f32>(0.0, 1.0) + (b - a) / h;
+        let r = p + m - xz;
+        let det = jx.x * jz.y - jz.x * jx.y;
+        var step = r;
+        if (det > 0.05) {
+            step = vec2<f32>(jz.y * r.x - jz.x * r.y, jx.x * r.y - jx.y * r.x) / det;
+        }
+        let len = length(step);
+        if (len > 1.0) { step = step / len; }
+        p = p - step;
     }
     let f = (p - base) / h;
     if (any(f < vec2<f32>(1.0)) || any(f > vec2<f32>(nf - 2.0))) { return vec2<f32>(0.0); }
+    // (OP, 2026-10-13) weight of the probe surface: 1 inside, fading to 0 over the outer
+    // UW_PROBE_FADE cells. A hard switch to the fallback put a square on the seabed that followed
+    // the camera (owner): the column depth, its light and caustics all stepped at the grid edge.
+    let edge = min(min(f.x, f.y) - 1.0, (nf - 2.0) - max(f.x, f.y));
+    let wEdge = max(smoothstep(0.0, UW_PROBE_FADE, edge), 0.001);
     let c0 = vec2<i32>(floor(f));
     let g0 = vec2<i32>(round(base / h));
     for (var k = 0; k < 9; k++) {
@@ -133,18 +189,18 @@ fn uwProbeHeight(xz: vec2<f32>) -> vec2<f32> {
             r = uwTri(xz, a, cc, d);
             if (r.y < 0.5) { r = uwTri(xz, a, d, b); }
         }
-        if (r.y > 0.5) { return r; }
+        if (r.y > 0.5) { return vec2<f32>(r.x, wEdge); }
     }
     // (no triangle found: a folded patch) the four vertices around the lattice point, averaged
     let i = clamp(c0, vec2<i32>(0), vec2<i32>(n - 2));
-    return vec2<f32>((uwProbeV(i).y + uwProbeV(i + vec2<i32>(1, 0)).y + uwProbeV(i + vec2<i32>(0, 1)).y + uwProbeV(i + vec2<i32>(1, 1)).y) * 0.25, 1.0);
+    return vec2<f32>((uwProbeV(i).y + uwProbeV(i + vec2<i32>(1, 0)).y + uwProbeV(i + vec2<i32>(0, 1)).y + uwProbeV(i + vec2<i32>(1, 1)).y) * 0.25, wEdge);
 }
 
 // water surface height at xz: the drawn surface near the camera (W9a), else sea level + the FFT's
 // vertical displacement
 fn uwWaterHeight(xz: vec2<f32>) -> f32 {
     let near = uwProbeHeight(xz);
-    if (near.y > 0.5) { return near.x; }
+    if (near.y >= 1.0) { return near.x; }
     var y = 0.0;
     let n = i32(uw.ocean.y);
     for (var c = 0; c < 4; c++) {
@@ -152,7 +208,16 @@ fn uwWaterHeight(xz: vec2<f32>) -> f32 {
             y += textureSampleLevel(uwDisplacement, uwRepeat, xz / uw.sizes[c], c, 0.0).y;
         }
     }
-    return uw.scattering.w + y * uw.ocean.x;
+    // (OP) the whole world's sea falls away from the origin with the planet's curvature (tw_water.wgsl
+    // earthWaterDrop); on the flat level a camera 3 m over the sea 13 km out read as 11 m under it
+    var datum = uw.scattering.w;
+    if (uw.torch_shape.z > 0.5) {
+        let r2 = dot(xz - vec2<f32>(6400.0), xz - vec2<f32>(6400.0));
+        let radius = 6378137.0;
+        datum -= r2 / (radius + sqrt(max(radius * radius - r2, 0.0)));
+    }
+    let far = datum + y * uw.ocean.x;
+    return mix(far, near.x, near.y);
 }
 
 fn uwDepthAt(uv: vec2<f32>) -> f32 {
@@ -191,7 +256,7 @@ fn uwMedium(uv: vec2<f32>, camH: f32) -> f32 {
     if (abs(camH) < UW_STRADDLE) {
         let dir = uwDir(uv);
         let fwd = uwDir(vec2<f32>(0.5, 0.5));
-        let q = uw.cam.xyz + dir * (uw.cam.w / max(dot(dir, fwd), 0.1));
+        let q = uw.cam.xyz + dir * (max(uw.cam.w, UW_PORT) / max(dot(dir, fwd), 0.1));
         water = select(0.0, 1.0, q.y < uwWaterHeight(q.xz));
     }
     return water;
@@ -208,9 +273,19 @@ fn uwTorchCone(cosToAxis: f32) -> f32 {
     return pow(t * t * (3.0 - 2.0 * t), uw.torch_shape.x);
 }
 
-fn uwLit(m: f32, sigT: vec3<f32>, zc: f32, dirY: f32, dist: f32) -> vec3<f32> {
-    let a = sigT * zc / m;
-    let kk = sigT * (1.0 - dirY / m);
+// (OP) the coefficient daylight fades by on its way down. The beam extinction sigT counts every
+// scattered photon as lost, but nearly all of them scatter a few degrees forward and keep going down:
+// what daylight really loses per metre is absorption plus BACKscatter (the diffuse attenuation Kd of
+// ocean optics). On the whole world's open sea (torch_shape.z = 1) that is the leg used, and 80 m down
+// stays the dim blue of real clear ocean instead of black; elsewhere sigT, as tuned on the islands.
+fn uwLightLeg(sigA: vec3<f32>, sigS: vec3<f32>) -> vec3<f32> {
+    return sigA + sigS * mix(1.0, 0.035, clamp(uw.torch_shape.z, 0.0, 1.0));
+}
+
+// in-scatter integral along the view ray: light leg sigL down to each point, view leg sigT back
+fn uwLit(m: f32, sigT: vec3<f32>, sigL: vec3<f32>, zc: f32, dirY: f32, dist: f32) -> vec3<f32> {
+    let a = sigL * zc / m;
+    let kk = sigT - sigL * dirY / m;
     let e0 = exp(-a);
     let e1 = exp(-max(a + kk * dist, vec3<f32>(0.0)));
     return select((e0 - e1) / kk, e0 * dist, abs(kk) < vec3<f32>(1e-4));
@@ -220,6 +295,14 @@ fn uwLit(m: f32, sigT: vec3<f32>, zc: f32, dirY: f32, dist: f32) -> vec3<f32> {
 fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
     let uv = in.uv;
     let dims = vec2<f32>(textureDimensions(uwScene));
+    // (OP) the cutscene letterbox and widescreen pillarbox (CameraEffect::Draw) are drawn into the
+    // scene before this pass, exact black (the border model with depth, the bars without). Leave
+    // them black -- the water's colour used to fill the bars whenever the camera went under. Lit
+    // geometry in the HDR scene is never exactly zero.
+    let raw = textureSampleLevel(uwScene, uwClamp, uv, 0.0).rgb;
+    if (max(raw.r, max(raw.g, raw.b)) <= 0.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     let camWater = uwWaterHeight(uw.cam.xz);
     let camH = uw.cam.y - camWater;
     let here = uwMedium(uv, camH);
@@ -255,6 +338,7 @@ fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
     let sigA = uw.absorption.rgb;
     let sigS = uw.scattering.rgb;
     let sigT = sigA + sigS;
+    let sigL = uwLightLeg(sigA, sigS);
     let L = uw.sun_dir.xyz;
     let Ls = -refract(-L, vec3<f32>(0.0, 1.0, 0.0), 1.0 / UW_IOR); // toward the sun, underwater
     let mu = max(Ls.y, 0.15);
@@ -266,7 +350,11 @@ fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
         // (W5a.1, OP) OP's water writes no depth: a ray that meets the surface from below leaves
         // the water there (Tidewater: the surface's own depth ends it)
         if (dir.y > 0.01) {
-            dist = min(dist, max(camWater - uw.cam.y, 0.0) / dir.y);
+            // (OP, 2026-10-12) at least UW_SURFACE_VEIL: just under the surface the column to it is
+            // centimetres, and the view up read as clear air with the sky undimmed (owner: "water is
+            // totally transparent, no underwater effect" until he dived deeper). The bright, hazy,
+            // tinted ceiling a swimmer sees there is the water around him too, not only above him.
+            dist = max(min(dist, max(camWater - uw.cam.y, 0.0) / dir.y), UW_SURFACE_VEIL);
         }
 
         // (OP) UnderwaterLighting in post: OP lit the submerged scene as if it stood in air;
@@ -279,11 +367,11 @@ fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
                 // (W5b) Tidewater's caustic networks on the submerged scene, filtered over the pixel
                 let fp = length(uwRelAt(uv, d)) * 2.0 / dims.y;
                 let caus = twCausticsSample(causticsFineTex, causticsBroadTex, uwRepeat, uw.ocean.zw, q, zq, L, twCausticsLevel(fp, uw.ocean.z), false);
-                let attDirect = exp(-sigT * zq / mu) * caus;
-                let attAmbient = exp(-sigT * zq * 1.2) * 0.85 + vec3<f32>(0.0, 0.02, 0.04) * exp(zq * -0.1);
+                let attDirect = exp(-sigL * zq / mu) * caus;
+                let attAmbient = exp(-sigL * zq * 1.2) * 0.85 + vec3<f32>(0.0, 0.02, 0.04) * exp(zq * -0.1);
                 let lumW = vec3<f32>(0.2126, 0.7152, 0.0722);
                 let eSun = dot(uw.sun_e.rgb, lumW) * max(L.y, 0.0) / UW_PI;
-                let eSky = dot(uw.sky_e.rgb, lumW);
+                let eSky = dot(uwSkyE(), lumW);
                 let share = eSun / max(eSun + eSky, 1e-5);
                 base *= mix(vec3<f32>(1.0), attDirect * share + attAmbient * (1.0 - share), smoothstep(0.0, 0.08, zq));
             }
@@ -294,12 +382,12 @@ fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
         let g = 0.85;
         let phase = (1.0 - g * g) / (4.0 * UW_PI) / pow(max(1.0 + g * g - cosPh * 2.0 * g, 1e-4), 1.5) * 0.75 + 0.25 / (4.0 * UW_PI);
         let sunE = uw.sun_e.rgb * 0.96;
-        let ambE = uw.sky_e.rgb * UW_PI * 0.9;
+        let ambE = uwSkyE() * UW_PI * 0.9;
         let bb = sigS * 0.035;
         let msAlb = bb * 1.3 / (sigA + bb);
         let k = uw.sun_dir.w;
-        let inSun = sunE * (sigS * phase + msAlb * sigT * (1.0 / UW_PI)) * uwLit(mu, sigT, zc, dir.y, dist) * k;
-        let inAmb = ambE * (sigS * (1.0 / (4.0 * UW_PI)) + msAlb * sigT * (1.0 / UW_PI)) * uwLit(0.8, sigT, zc, dir.y, dist) * k;
+        let inSun = sunE * (sigS * phase + msAlb * sigT * (1.0 / UW_PI)) * uwLit(mu, sigT, sigL, zc, dir.y, dist) * k;
+        let inAmb = ambE * (sigS * (1.0 / (4.0 * UW_PI)) + msAlb * sigT * (1.0 / UW_PI)) * uwLit(0.8, sigT, sigL, zc, dir.y, dist) * k;
         // (W5b) caustic light shafts: the focused light scattered toward the eye along the view ray
         // (the excess over the mean: the mean is in inSun), 12 jittered steps over the first 22 m
         var shafts = vec3<f32>(0.0);
@@ -313,7 +401,7 @@ fn fs_uw(in: UwOut) -> @location(0) vec4<f32> {
                 let p = uw.cam.xyz + dir * s;
                 let z = max(camWater - p.y, 0.01);
                 let c = twCausticsSample(causticsFineTex, causticsBroadTex, uwRepeat, uw.ocean.zw, p, z, L, 1.5, true);
-                shafts += (c - 1.0) * exp(-sigT * (s + z / mu)) * ds;
+                shafts += (c - 1.0) * exp(-sigT * s - sigL * z / mu) * ds;
             }
             shafts = max(shafts * sunE * sigS * phase * 2.5 * k, vec3<f32>(0.0));
         }

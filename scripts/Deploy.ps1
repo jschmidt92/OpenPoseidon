@@ -53,7 +53,7 @@ $distDir  = Join-Path $repoRoot "dist\x64-win-$suffix"
 
 # A direct CMake engine build does not regenerate the managed visual PBO.
 # Reject stale staged content before any game-folder mutation or new source stamp.
-$visualStage = Join-Path $distDir 'Mods/@OP_VisualUpgrade'
+$visualStage = Join-Path $distDir 'assets/Mods/@OP_VisualUpgrade'
 if (Test-Path -LiteralPath $visualStage) {
     & "$PSScriptRoot/Assert-DefaultMaterialPackage.ps1" `
         -Archive (Join-Path $visualStage 'AddOns/op_ground_materials.pbo') `
@@ -117,10 +117,21 @@ $commit = (& git -C $repoRoot rev-parse --short HEAD 2>$null)
 # A warning, not a refusal: deploying a local build to test it is legitimate and common.
 # What is not legitimate is doing it WITHOUT KNOWING, which is the same principle as the
 # provenance line further down.
+# Windows PowerShell 5.1 turns ANY native stderr line into a terminating error under 'Stop', even
+# with 2>$null -- so a local branch with no upstream, or an upstream of another name, aborted the
+# whole deploy here instead of reaching the warning below. These probes are advisory: let git
+# complain and read its exit code.
+$savedPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $upstream = (& git -C $repoRoot rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null)
-if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($upstream))
+$upstreamFound = $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($upstream)
+if ($upstreamFound)
 {
-    & git -C $repoRoot fetch --quiet ($upstream -split '/')[0] $branch 2>$null
+    & git -C $repoRoot fetch --quiet ($upstream -split '/')[0] 2>$null
+}
+$ErrorActionPreference = $savedPreference
+if ($upstreamFound)
+{
     $behind = (& git -C $repoRoot rev-list --count "HEAD..$upstream" 2>$null)
     if ($LASTEXITCODE -eq 0 -and [int]$behind -gt 0)
     {
@@ -179,7 +190,10 @@ if (Test-Path -LiteralPath $stampPath)
     $prev = (Get-Content -LiteralPath $stampPath -TotalCount 1)
     Write-Host "Installed now: $prev"
     # If the previous stamp names a commit we can resolve, refuse to go backwards without -Force.
-    if ($commit -and $prev -match '\b([0-9a-f]{7,40})\b')
+    # The stamp is "<branch> <commit> <time> <tool>". Take the commit FIELD: a regex over the whole
+    # line matched the date inside branch names like codex/whole-world-horizon-20261008 (digits are hex).
+    $prevFields = @($prev -split '\s+')
+    if ($commit -and $prevFields.Count -ge 2 -and $prevFields[1] -match '^([0-9a-f]{7,40})(\+dirty)?$')
     {
         $prevCommit = $matches[1]
         & git -C $repoRoot merge-base --is-ancestor $commit $prevCommit 2>$null
@@ -220,10 +234,46 @@ foreach ($name in @('m16','rifle','ak_rifle','scoped_rifle','smg','machinegun','
     }
     $contentPayload += @{Source=$source; Relative=$relative}
 }
+# The near grass blade layers (CC0, docs/assets/source-registry.yaml) -- staged from the repo's
+# assets\grass by the build; the renderer falls back to procedural blades without them.
+foreach ($file in Get-ChildItem -LiteralPath (Join-Path $distDir 'assets/grass') -File -Filter 'meadow-grass-blade-*.png' -ErrorAction SilentlyContinue) {
+    $contentPayload += @{Source=$file.FullName; Relative=('assets/grass/' + $file.Name)}
+}
+# The Desert Island ICBM scripts (whole world; WholeWorldDisplay copies them into the Earth mission).
+foreach ($file in Get-ChildItem -LiteralPath (Join-Path $distDir 'assets/earth/icbm') -File -Filter '*.sqs' -ErrorAction SilentlyContinue) {
+    $contentPayload += @{Source=$file.FullName; Relative=('assets/earth/icbm/' + $file.Name)}
+}
+# The whole world's moon surface map (NASA LRO WAC mosaic, tools/sky/make_moon_albedo.py) and topography
+# (LRO LOLA, tools/sky/make_moon_relief.py); without them the renderer draws procedural maria on a sphere.
+foreach ($file in Get-ChildItem -LiteralPath (Join-Path $distDir 'assets/earth/moon') -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.pmoon', '.pmoh' }) {
+    $contentPayload += @{Source=$file.FullName; Relative=('assets/earth/moon/' + $file.Name)}
+}
+# Engine feature packs live in assets\Mods (owner 2026-10-20: the game is exe + dll + assets\);
+# maps stay in Mods. A pack still installed at its old Mods\ location is removed after the copy.
+$relocatedPacks = @()
 foreach ($pack in @(
-    @{Folder='Mods/@OP_VisualUpgrade'; Archive='op_ground_materials.pbo'},
-    @{Folder='Mods/@OP_VehicleActions'; Archive='op_jeep_actions.pbo'})) {
+    @{Folder='assets/Mods/@OP_VisualUpgrade'; Archive='op_ground_materials.pbo'; Source='visual'; Builder='Build-DefaultContent.ps1'},
+    @{Folder='assets/Mods/@OP_VehicleActions'; Archive='op_jeep_actions.pbo'; Source='vehicle-actions'; Builder='Build-VehicleActions.ps1'},
+    @{Folder='assets/Mods/@OP_Swim'; Archive='swim.pbo'; Source='swim'; Builder='Build-Swim.ps1'},
+    @{Folder='assets/Mods/@OP_TidewaterBoat'; Archive='op_tidewater_boat.pbo'; Source='tidewater-boat'; Builder='Build-TidewaterBoat.ps1'},
+    @{Folder='assets/Mods/@OP_TidewaterWildlife'; Archive='op_tidewater_wildlife.pbo'; Source='tidewater-wildlife'; Builder='Build-TidewaterWildlife.ps1'})) {
+    $relocatedPacks += ($pack.Folder -replace '^assets/', '')
     $sourcePack = Join-Path $distDir $pack.Folder
+    # A pack staged before its source last changed is rebuilt, not shipped. A cmake build does not restage the packs
+    # (Build.ps1 does), so dist\ can hold an archive older than the code it ships with: on 2026-10-22 a deploy put
+    # a swim.pbo from before the jump moves next to an exe that plays them, and the owner jumped with no animation.
+    $packSource = Join-Path $repoRoot ('content/default-packs/' + $pack.Source)
+    $staged = Join-Path $sourcePack ('AddOns/' + $pack.Archive)
+    if (Test-Path -LiteralPath $packSource) {
+        $newest = Get-ChildItem -LiteralPath $packSource -Recurse -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        if (!(Test-Path -LiteralPath $staged) -or ($newest -and $newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $staged).LastWriteTimeUtc)) {
+            Write-Host ("Restaging {0}: {1} is newer than the staged {2}" -f $pack.Folder, $newest.Name, $pack.Archive)
+            & (Join-Path $PSScriptRoot $pack.Builder) -Preset $Preset
+            if (!(Test-Path -LiteralPath $staged) -or (Get-Item -LiteralPath $staged).LastWriteTimeUtc -lt $newest.LastWriteTimeUtc) {
+                throw "Could not restage $($pack.Folder) from $packSource ($($pack.Builder))"
+            }
+        }
+    }
     if (!(Test-Path -LiteralPath $sourcePack)) { continue }
     $metadata = Join-Path $sourcePack 'mod.json'
     $archive = Join-Path $sourcePack ('AddOns/' + $pack.Archive)
@@ -267,6 +317,14 @@ foreach ($name in $payload)
     Write-Host ("  + {0,-22} {1,10:N0} bytes  built {2}" -f $name, (Get-Item -LiteralPath $dst).Length, $stamp)
 }
 
+# The Island Editor (main menu "ISLAND EDITOR") is a standalone exe with no renderer DLL of its own,
+# so it is not part of the matched pair above; it is installed beside the game when it was built.
+$islandEditor = Join-Path $distDir 'PoseidonIslandEditor.exe'
+if (Test-Path -LiteralPath $islandEditor) {
+    Copy-Item -LiteralPath $islandEditor -Destination (Join-Path $GameDir 'PoseidonIslandEditor.exe') -Force
+    Write-Host "  + PoseidonIslandEditor.exe"
+}
+
 function Get-ContentPayloadHash([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -276,11 +334,46 @@ function Get-ContentPayloadHash([string]$Path) {
 foreach ($item in $contentPayload) {
     $destination = Join-Path $GameDir $item.Relative
     New-Item -ItemType Directory -Force (Split-Path $destination -Parent) | Out-Null
+    # An identical installed file is left alone: re-copying it fails while another program
+    # holds it open (Blender's PBO add-on had op_ground_materials.pbo open on 2026-10-17 and
+    # stopped the deploy after the binaries were already copied, so the stamp below was never
+    # written and named an older commit than the one installed).
+    if ((Test-Path -LiteralPath $destination) -and
+        (Get-ContentPayloadHash $item.Source) -eq (Get-ContentPayloadHash $destination)) {
+        Write-Host "  = $($item.Relative)"
+        continue
+    }
     Copy-Item -LiteralPath $item.Source -Destination $destination -Force
     if ((Get-ContentPayloadHash $item.Source) -ne (Get-ContentPayloadHash $destination)) {
         throw "Default content verification failed: $destination"
     }
     Write-Host "  + $($item.Relative)"
+}
+
+# Feature packs moved to assets\Mods: retire their old Mods\ copies, but only the files a deploy
+# put there (mod.json, the pack archive, and missions the new pack ships too). Anything else -- a
+# mission someone added -- is kept and reported, never deleted.
+foreach ($old in $relocatedPacks) {
+    $oldDir = Join-Path $GameDir $old
+    $newDir = Join-Path $GameDir ('assets/' + $old)
+    if (!(Test-Path -LiteralPath $oldDir) -or !(Test-Path -LiteralPath (Join-Path $newDir 'mod.json'))) { continue }
+    $oldManifest = Join-Path $oldDir 'mod.json'
+    if (!(Test-Path -LiteralPath $oldManifest)) { Write-Warning "Not removing unmanaged $oldDir"; continue }
+    if ((Get-Content -LiteralPath $oldManifest -Raw | ConvertFrom-Json).defaultContentApi -cne '1') { Write-Warning "Not removing unmanaged $oldDir"; continue }
+    foreach ($file in Get-ChildItem -LiteralPath $oldDir -Recurse -File) {
+        $rel = $file.FullName.Substring($oldDir.Length + 1)
+        $managed = ($rel -eq 'mod.json') -or ($rel -like 'AddOns\*.pbo') -or
+                   (($rel -like 'Missions\*') -and (Test-Path -LiteralPath (Join-Path $newDir $rel)))
+        if ($managed) { Remove-Item -LiteralPath $file.FullName -Force }
+    }
+    Get-ChildItem -LiteralPath $oldDir -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending |
+        Where-Object { @(Get-ChildItem -LiteralPath $_.FullName -Force).Count -eq 0 } | Remove-Item -Force
+    if (@(Get-ChildItem -LiteralPath $oldDir -Recurse -File).Count -eq 0) {
+        Remove-Item -LiteralPath $oldDir -Recurse -Force
+        Write-Host "  - $old (moved to assets\$old)"
+    } else {
+        Write-Warning "$old kept files a deploy did not put there; the engine now loads assets\$old instead."
+    }
 }
 
 if ($PruneStale)

@@ -228,7 +228,7 @@ impl Gpu {
                 },
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         Self { pipeline, layout }
     }
@@ -388,7 +388,7 @@ impl Pending {
         {
             return Err("map failed");
         }
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
         let values = decode(&mapped, &self.input);
         drop(mapped);
         self.buffer.unmap();
@@ -627,7 +627,7 @@ mod tests {
         ep.max_scale = 2.;
         exposure.upload_params(&queue, &ep);
         let mut tone = crate::tonemap::Tonemap::new(&device, wgpu::TextureFormat::Rgba8Unorm);
-        tone.set_source(&device, &hdr, &bloom, exposure.scale_view());
+        tone.set_source(&device, &hdr, &bloom, exposure.scale_view(), Some(exposure.clip_buffer()));
         let mut tp = crate::ffi::WgrTonemap::default();
         tp.exposure = 2.;
         tp.bloom_intensity = 0.4;
@@ -651,7 +651,7 @@ mod tests {
         );
         assert_eq!(
             values[26 * 25],
-            [ep.rate, ep.sky_weight, ep._pad1, ep._pad2]
+            [ep.rate, ep.sky_weight, ep.compensation, ep.meter_mode]
         );
         assert_eq!(values[27 * 25], [16., 16., 16., 16.]);
         let compiled_white = std::env::var("WGR_TONEMAP_WHITE")

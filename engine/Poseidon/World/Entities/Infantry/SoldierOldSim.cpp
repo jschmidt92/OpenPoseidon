@@ -1,4 +1,6 @@
 #include <Poseidon/World/Entities/Infantry/SoldierOldCommon.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <Poseidon/AI/AICombatPace.hpp> // AI-AIM-001
 #include <Poseidon/World/Entities/Infantry/BodyWaterResponse.hpp>
 #include <Poseidon/World/Weather/SnowField.hpp>
 #include <Poseidon/World/Weather/RainWaterField.hpp>
@@ -8,7 +10,9 @@
 #include <Poseidon/Input/InputSubsystem.hpp>
 #include <Poseidon/Graphics/Rendering/WaterInteractionBridge.hpp>
 #include <Poseidon/World/Terrain/WaterSurfaceQuery.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 #include <Poseidon/Network/NetworkCustomAssets.hpp>
+#include <Poseidon/World/Entities/Vehicles/Misc/Ship.hpp>
 #include <limits.h>
 #include <stdio.h>
 #include <cmath>
@@ -28,6 +32,9 @@
 #include <Poseidon/Foundation/Types/Pointers.hpp>
 #include <Poseidon/Foundation/platform.hpp>
 #include <Random/randomGen.hpp>
+#include <Poseidon/World/SimVehicleCost.hpp>
+#include <cstdint>
+#include <string>
 
 namespace Poseidon
 {
@@ -99,6 +106,12 @@ bool Man::SimulateAnimations(float& turn, float& moveX, float& moveZ, float delt
 
     ActionMap* map = Type()->GetActionMap(_primaryMove.id);
     float turnSpeed = map ? map->GetTurnSpeed() : 0;
+    // AI-AIM-001 (CfgAIFork proneSpeed): an AI soldier turns faster lying down (the player never)
+    if (map && map->GetUpDegree() == ManPosLying && CombatPace::ProneSpeed() != 1.0f && Brain() &&
+        !Brain()->IsPlayer() && !QIsManual())
+    {
+        turnSpeed *= CombatPace::ProneSpeed();
+    }
     saturate(turn, -turnSpeed * deltaT, +turnSpeed * deltaT);
 
     if (fabs(turn) > 1e-3)
@@ -281,7 +294,8 @@ void Man::PlaceOnSurface(Matrix4& trans)
     Vector3 pos = trans.Position();
     Matrix3 orient = trans.Orientation();
 
-    pos[1] = GLOB_LAND->RoadSurfaceYAboveWater(pos + VUp * 0.5f);
+    // Sinkhole W5: searched from no lower than the drawn terrain (Landscape::SurfacePlacementProbe)
+    pos[1] = GLOB_LAND->RoadSurfaceYAboveWater(GLOB_LAND->SurfacePlacementProbe(pos) + VUp * 0.5f);
 
     trans.SetPosition(pos);
 }
@@ -346,8 +360,165 @@ void Man::OnAddImpulse(Vector3Par force, Vector3Par torque)
     }
 }
 
+namespace
+{
+// POSEIDON_SIM_VEHICLE_COST=1: where Man::Simulate spends its time, by section, logged every
+// 3000 calls (ms per call, average and slowest). Off: one bool test per mark.
+struct ManSimProbe
+{
+    static constexpr int N = 9;
+    struct Accum
+    {
+        double ms[N] = {};
+        double maxMs[N] = {};
+        long long calls = 0;
+    };
+    static Accum& Totals()
+    {
+        static Accum a;
+        return a;
+    }
+    bool on;
+    std::uint64_t last = 0;
+    ManSimProbe() : on(SimVehCost::Enabled())
+    {
+        if (on)
+            last = SimVehCost::NowNs();
+    }
+    void Mark(int i)
+    {
+        if (!on)
+            return;
+        const std::uint64_t now = SimVehCost::NowNs();
+        const double ms = static_cast<double>(now - last) * 1.0e-6;
+        last = now;
+        Accum& a = Totals();
+        a.ms[i] += ms;
+        if (ms > a.maxMs[i])
+            a.maxMs[i] = ms;
+    }
+    ~ManSimProbe()
+    {
+        if (!on)
+            return;
+        Accum& a = Totals();
+        if (++a.calls < 3000)
+            return;
+        static const char* const names[N] = {"pre", "anim", "core", "land", "collide", "settle", "move", "after", "base"};
+        const double inv = 1.0 / static_cast<double>(a.calls);
+        std::string line;
+        char part[64];
+        for (int i = 0; i < N; i++)
+        {
+            std::snprintf(part, sizeof(part), " %s=%.3f/%.1f", names[i], a.ms[i] * inv, a.maxMs[i]);
+            line += part;
+        }
+        LOG_INFO(World, "Man::Simulate ms/call (avg/max) over {} calls:{}", a.calls, line);
+        a = Accum();
+    }
+};
+} // namespace
+
+// A man on a boat's deck (its roadway LOD) is that boat's rider: the boat carries him through each move it makes
+// (Ship::CarryRiders), so walking, standing and lying on a deck under way stay where they are on it. The 2001
+// engine stood men on roadways of moving vehicles too (the roadway is read at the vehicle's current transform),
+// but nothing moved them with it: the boat slid out from under them. Registered here, every frame he simulates.
+void Man::UpdatePlatform()
+{
+    Ship* ship = nullptr;
+    const AIUnit* unit = Brain();
+    if (Ship::DeckShips() > 0 && GLandscape && IsInLandscape() && !_swimming && !_ladderBuilding &&
+        !(unit && unit->GetVehicleIn()))
+    {
+        Object* support = nullptr;
+        const float y = GLandscape->RoadSurfaceY(Position() + VUp * 0.5f, nullptr, nullptr, nullptr, &support);
+        ship = support ? dyn_cast<Ship>(support) : nullptr;
+        // on the deck or close above it (a step, a jump); well above it he is no longer standing there
+        if (ship && Position().Y() - y > 1.5f)
+            ship = nullptr;
+        static const bool diag = std::getenv("POSEIDON_BOAT_DIAG") != nullptr;
+        if (diag && (ship || _platform) && Brain() && Brain()->IsPlayer())
+        {
+            static float next = 0;
+            if (Glob.time.toFloat() >= next || !ship)
+            {
+                next = Glob.time.toFloat() + 0.1f;
+                const Object* ref = ship ? static_cast<const Object*>(ship) : _platform.GetLink();
+                const Vector3 local = ref ? ref->GetInvTransform().FastTransform(Position()) : Vector3(VZero);
+                LOG_INFO(World, "Deck rider: t={:.2f} y={:.2f} support y={:.2f} on={} model={:.2f},{:.2f},{:.2f} land={} object={} "
+                                "swim={} fall={} speed={:.2f},{:.2f},{:.2f}",
+                         Glob.time.toFloat(), Position().Y(), y, ship != nullptr, local.X(), local.Y(), local.Z(),
+                         (bool)_landContact, (bool)_objectContact, _swimming, (bool)_falling, Speed().X(), Speed().Y(),
+                         Speed().Z());
+            }
+        }
+    }
+    Ship* old = _platform ? dyn_cast<Ship>(_platform.GetLink()) : nullptr;
+    if (old == ship)
+        return;
+    if (old)
+        old->RemoveRider(this);
+    if (ship)
+        ship->AddRider(this);
+    _platform = ship;
+    LOG_INFO(World, "{} {} a boat deck ({})", (const char*)GetDebugName(), ship ? "stands on" : "left",
+             (const char*)(ship ? ship : old)->GetDebugName());
+}
+
+bool Man::CarryOnPlatform(Ship* ship, const Matrix4& delta)
+{
+    const AIUnit* unit = Brain();
+    if (_platform.GetLink() != ship || _swimming || _ladderBuilding || (unit && unit->GetVehicleIn()) || !IsInLandscape())
+    {
+        if (_platform.GetLink() == ship)
+            _platform = nullptr;
+        return false;
+    }
+    // his position with the deck's whole move, his heading with its turn; he stays upright
+    Vector3 dir = delta.Rotate(Direction());
+    Matrix3 orient;
+    orient.SetUpAndDirection(DirectionUp(), dir);
+    Matrix4 moved;
+    moved.SetOrientation(orient);
+    moved.SetPosition(delta.FastTransform(Position()));
+    Move(moved);
+    return true;
+}
+
 void Man::Simulate(float deltaT, SimulationImportance prec)
 {
+    ManSimProbe probe;
+    // Every man, not only the player: a planned Whole World mission places AI too, all spawned at the fixture's
+    // height and only later given streamed ground.
+    if (EarthStreaming::Enabled() && !_isDead && IsInLandscape() && GWorld &&
+        !_ladderBuilding && (!Brain() || !Brain()->GetVehicleIn()) && !_falling &&
+        _freeFallUntil <= Glob.time && std::abs(Speed().Y()) < 0.1f)
+    {
+        const auto ground = EarthStreaming::QueryGround(Position().X(), Position().Z());
+        if (!ground)
+        {
+            // Streaming/relocation has no support yet. Preserve the player's
+            // root instead of falling through an unqueried overview mesh.
+            _speed = VZero;
+            base::Simulate(deltaT, prec);
+            return;
+        }
+        if (Position().Y() < ground->height)
+        {
+            // Resident elevation can first arrive above the fixture's initial
+            // spawn, or replace an older/coarser patch. Recover once, then use
+            // ordinary animated-foot contacts for standing/walking/crawling.
+            Matrix4 transform = Transform();
+            Vector3 position = Position();
+            position[1] = ground->height;
+            transform.SetPosition(position);
+            Move(transform);
+            _speed = VZero;
+            _landContact = true;
+            _freeFallUntil = Glob.time;
+        }
+    }
+    UpdatePlatform();
     if (!_isDead && !IsDammageDestroyed() && IsInLandscape()) PrepareAutomaticInfantryTerrain();
     if (!_isDead && !IsDammageDestroyed() && IsInLandscape()) _automaticDeathEligible = true;
     if (_automaticCorpsePose && _automaticCorpsePose->pending)
@@ -392,7 +563,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
         return;
     }
     // Sinkhole W3: in water too deep to stand the man swims (SoldierOldSwim.cpp)
-    if (UpdateSwimming())
+    if (!EarthStreaming::Enabled() && UpdateSwimming())
     {
         SimSwimMovement(deltaT, prec);
         base::Simulate(deltaT, prec);
@@ -403,7 +574,9 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
 
     float turn, moveX, moveZ;
 
+    probe.Mark(0);
     bool change = SimulateAnimations(turn, moveX, moveZ, deltaT, prec);
+    probe.Mark(1);
 
     if (_objectContact)
     {
@@ -411,6 +584,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
     }
 
     BasicSimulationCore(deltaT, prec);
+    probe.Mark(2);
 
     // if object is frozen, do not simulate it
     if (!CheckPredictionFrozen())
@@ -449,7 +623,11 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             pForce[0] = 0;
             pForce[1] = -G_CONST * GetMass();
             pForce[2] = 0;
-            if (playerControlled && !IsDead() && _waterBuoyancyContact)
+            // The player's float spring from before swimming existed. With the swim system on, deep water is
+            // the swim simulation's and shallow water is for standing in: this spring held a man in 0.8 m of
+            // surf ~0.4 m over the water and bounced him in a fall for as long as he stood there.
+            if (!EarthStreaming::Enabled() && playerControlled && !IsDead() && _waterBuoyancyContact &&
+                !SwimSystemActive())
             {
                 const float waveTime = Glob.time.toFloat();
                 const float seaLevel = GLOB_LAND->GetSeaLevel();
@@ -590,10 +768,26 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             moveTrans.SetPosition(position);
         }
 
+        if (EarthStreaming::Enabled() && !EarthStreaming::OnMoon)
+        {
+            // Do not walk off the resident near mesh into unqueried horizon
+            // terrain. Keep a small margin for the animated land-contact feet.
+            const auto ground = EarthStreaming::Locations().Ground();
+            const auto desired = moveTrans.Position();
+            if (!ground || !ground->Contains(desired.X(), desired.Z(), 2.0f))
+            {
+                Vector3 held = desired;
+                held[0] = Position().X();
+                held[2] = Position().Z();
+                moveTrans.SetPosition(held);
+                _speed[0] = _speed[2] = 0;
+            }
+        }
+
         // Malprave terrainHole5: a man down in a terrain hole (a cellar) cannot leave it sideways under the ground. AI men
         // and bodies do not collide with walls, so a dying slide or an explosion's push carried them out into the earth,
         // where the terrain then lifted them to the surface. Keep the old X/Z (the vertical move still applies).
-        if (GLOB_LAND->LeavesTerrainHoleUnderground(Position(), moveTrans.Position()))
+        if (!EarthStreaming::Enabled() && GLOB_LAND->LeavesTerrainHoleUnderground(Position(), moveTrans.Position()))
         {
             Vector3 held = moveTrans.Position();
             held[0] = Position().X();
@@ -601,6 +795,19 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             moveTrans.SetPosition(held);
             _speed[0] = 0;
             _speed[2] = 0;
+        }
+        // Sinkhole W5: the mirror case -- a man (or body) on the drawn hillside over a hidden cave footprint sinks no
+        // deeper than the hillside: a landing or a step that ends past the ceiling gap had tunnelled into the cave
+        // (The Forest's beach: a fall of 6 m went straight through to the cave 250 m below). He stays on the ground.
+        else if (GLOB_LAND->SinksIntoHiddenTerrainHole(Position(), moveTrans.Position()))
+        {
+            Vector3 held = moveTrans.Position();
+            held[1] = GLOB_LAND->SurfaceY(held.X(), held.Z());
+            moveTrans.SetPosition(held);
+            if (_speed[1] < 0)
+            {
+                _speed[1] = 0;
+            }
         }
 
         const MoveInfo* priInfo = Type()->GetMoveInfo(_primaryMove.id);
@@ -654,6 +861,27 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
                     _waterDepth = 0;
                     GroundCollisionBuffer retVal;
                     GLOB_LAND->GroundCollision(retVal, this, moveTrans, underBias, 0, true, true);
+                    static const bool deckDiag = std::getenv("POSEIDON_BOAT_DIAG") != nullptr;
+                    if (deckDiag && _platform && Brain() && Brain()->IsPlayer())
+                    {
+                        int onDeck = 0, water = 0, solid = 0;
+                        float deckUnder = -9;
+                        for (int i = 0; i < retVal.Size(); i++)
+                        {
+                            const UndergroundInfo& info = retVal[i];
+                            if (info.obj == _platform.GetLink())
+                            {
+                                ++onDeck;
+                                saturateMax(deckUnder, info.under);
+                            }
+                            else if (info.type == GroundWater)
+                                ++water;
+                            else
+                                ++solid;
+                        }
+                        LOG_INFO(World, "Deck ground: t={:.2f} entries={} deck={} (max under {:.2f}) water={} solid={} bias={:.2f}",
+                                 Glob.time.toFloat(), retVal.Size(), onDeck, deckUnder, water, solid, underBias);
+                    }
                     bool waterContact = false;
                     if (retVal.Size() > 0)
                     {
@@ -773,6 +1001,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             moveTrans.SetPosition(position);
         }
 
+        probe.Mark(3);
         // collision testing
         if (deltaT > 0 && (change || prec <= SimulateVisibleNear))
         {
@@ -859,7 +1088,36 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
 #define MAX_IN 0.05f
                 CollisionBuffer collision;
                 bool onlyVehicles = !QIsManual() && !freeFall;
+                const std::uint64_t collideT0 = probe.on ? SimVehCost::NowNs() : 0;
                 GLandscape->ObjectCollision(collision, this, moveTrans, onlyVehicles);
+                if (probe.on)
+                {
+                    // POSEIDON_SIM_VEHICLE_COST: name the slow ones (C0: up to 344 ms per man)
+                    const double ms = static_cast<double>(SimVehCost::NowNs() - collideT0) * 1.0e-6;
+                    static int slowReported = 0;
+                    if (ms > 20.0 && slowReported < 40)
+                    {
+                        ++slowReported;
+                        std::string hits;
+                        for (int i = 0; i < collision.Size() && i < 4; i++)
+                        {
+                            const Object* o = collision[i].object;
+                            const Shape* og = o && o->GetShape() ? o->GetShape()->GeometryLevel() : nullptr;
+                            hits += fmt::format(" [{} comp {} hier {} geom {} faces r {:.1f}]",
+                                                o && o->GetShape() ? (const char*)o->GetShape()->GetName() : "-",
+                                                collision[i].component, collision[i].hierLevel,
+                                                og ? og->NFaces() : -1, o ? o->GetRadius() : -1.0f);
+                        }
+                        const Shape* geom = _shape ? _shape->GeometryLevel() : nullptr;
+                        const int comps = geom ? _shape->GetGeomComponents().Size() : -1;
+                        LOG_INFO(World,
+                                 "Man::Simulate slow ObjectCollision {:.1f} ms: {} ({}), radius {:.1f}, geometry {} faces / {} "
+                                 "components, onlyVehicles={}, {} hits:{}",
+                                 ms, (const char*)GetDebugName(), _shape ? (const char*)_shape->GetName() : "-",
+                                 GetRadius(), geom ? geom->NFaces() : -1, comps, onlyVehicles,
+                                 collision.Size(), hits);
+                    }
+                }
 
                 Vector3 offset = VZero;
 
@@ -907,6 +1165,11 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
 
                     Point3 pos = info.object->PositionModelToWorld(info.pos);
                     Vector3 dirOut = info.object->DirectionModelToWorld(info.dirOut);
+                    static const bool deckDiag = std::getenv("POSEIDON_BOAT_DIAG") != nullptr;
+                    if (deckDiag && _platform && info.object == _platform.GetLink() && Brain() && Brain()->IsPlayer())
+                        LOG_INFO(World, "Deck collision: t={:.2f} component={} under={:.2f} out={:.2f},{:.2f},{:.2f} at model {:.2f},{:.2f},{:.2f}",
+                                 Glob.time.toFloat(), info.component, info.under, info.dirOut.X(), info.dirOut.Y(), info.dirOut.Z(),
+                                 info.pos.X(), info.pos.Y(), info.pos.Z());
 
                     float offsetInOutDir = dirOut * offset;
                     saturateMax(offsetInOutDir, 0);
@@ -963,6 +1226,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             }
         }
 
+        probe.Mark(4);
         if (change && !GetHierachyParent())
         {
             float legDX = landDX;
@@ -1087,6 +1351,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             _snowBodyStampTime = 0;
             _snowWalkingValid = false;
         }
+        probe.Mark(5);
         Move(moveTrans);
         DirectionWorldToModel(_modelSpeed, _speed);
 
@@ -1192,13 +1457,16 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             _hydroWaterDepth = 0.0f;
         }
     } // if (!CheckPredictionFrozen())
+    probe.Mark(6);
 
     if (_mGunClouds.Active() || _mGunFire.Active() || _gunClouds.Active())
     {
         Vector3 gunPos = PositionModelToWorld(GetWeaponPoint(_currentWeapon));
         Vector3 dir = GetWeaponDirection(_currentWeapon);
         _mGunFire.Simulate(gunPos, deltaT);
-        _mGunClouds.Simulate(gunPos, Speed() * 0.7f + dir * 5.0f, 0.35f, deltaT);
+        // Rifle smoke (WeaponCloudsSource::SetRifleSmoke) leaves at half the legacy blast speed.
+        const float blast = WeaponCloudsSource::RifleSmokeEnabled() ? 2.5f : 5.0f;
+        _mGunClouds.Simulate(gunPos, Speed() * 0.7f + dir * blast, 0.35f, deltaT);
         _gunClouds.Simulate(gunPos, Speed() * 0.7f + dir * 2.0f, 0.35f, deltaT);
     }
 
@@ -1223,9 +1491,12 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
         }
     }
 
+    SimulateUpperBodyAction(deltaT);
     MoveWeapons(deltaT, change);
+    probe.Mark(7);
 
     base::Simulate(deltaT, prec);
+    probe.Mark(8);
 }
 
 void Man::SetFace(RString name, RString player)
@@ -1245,6 +1516,42 @@ void Man::SetFace(RString name, const PlayerIdentityKey& player)
     if (stricmp(name, "custom") == 0 && player.playerId > 1)
     {
         playerKey = Poseidon::BuildNetworkPlayerStorageKey(player.playerId);
+    }
+    // --arma2: a man drawn with his Arma 2 model wears Arma 2's face of that name (CfgFaces
+    // >> his faceType), not a CWA face texture laid on a head it was not painted for.
+    if (const RString a2Face = Poseidon::Arma1Compat::Arma2FaceTexture(Type()->GetName(), _shape->GetName(), name);
+        a2Face.GetLength() > 0)
+    {
+        _head.SetFaceTexture(Type()->_head, _shape, a2Face);
+        // ... on the head model that face comes with (the body has none)
+        const std::string head = Poseidon::Arma1Compat::Arma2HeadModel(Type()->GetName(), _shape->GetName(), name);
+        const RString headShape = head.empty() ? RString() : ::GetShapeName(RString(head.c_str()));
+        if (headShape.GetLength() > 0 && (!_a2Head || stricmp(_a2Head->GetName(), headShape) != 0))
+        {
+            // turned at load like the body (an Arma 2 man is a reversed model), or the face
+            // looks out of the back of the head
+            _a2Head = QIFStreamB::FileExist(headShape) ? Shapes.New(headShape, Type()->_shapeReversed, true) : nullptr;
+            _a2HeadWeights = nullptr;
+            if (_a2Head)
+            {
+                // Arma 2's face selection is "osobnost", Arma 3's "personality"
+                _a2HeadFace.Init(_a2Head, Poseidon::Arma1Compat::Generation() >= 3 ? "personality" : "osobnost",
+                                 nullptr);
+                if (Type()->_moveType && Type()->_moveType->GetSkeleton())
+                {
+                    WeightInfoName wname;
+                    wname.shape = _a2Head.GetRef();
+                    wname.skeleton = Type()->_moveType->GetSkeleton();
+                    _a2HeadWeights = WeigthBank.New(wname);
+                    Type()->_moveType->GetSkeleton()->Prepare(_a2Head, *_a2HeadWeights);
+                }
+            }
+            else
+                LOG_WARN(Physics, "Arma 2 head model {} not found", (const char*)headShape);
+        }
+        if (_a2Head && _head._texture)
+            _a2Head->RegisterTexture(_head._texture, _a2HeadFace);
+        return;
     }
     _head.SetFace(Type()->_head, IsWoman(), _shape, name, playerKey);
 }

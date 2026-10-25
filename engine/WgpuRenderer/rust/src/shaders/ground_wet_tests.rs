@@ -79,7 +79,8 @@ fn wet_soil_sun_coat_composes_and_actual_terrain_uses_one_fresnel_and_filtered_n
     let derivative = source.find("let moist_normal_variation = length(fwidth(geometric_n));").unwrap();
     let coat = source.find("if (soil_wet > 0.0) {").unwrap();
     assert!(derivative < coat, "derivatives must be in uniform control flow");
-    assert!(source.contains("let moist_n = geometric_n"));
+    // (2026-10-14) patchy, bumpy wet film (owner: an even coat read as milky)
+    assert!(source.contains("let moist_n = normalize(geometric_n + vec3<f32>(-bump.x, 0.0, -bump.y))"));
     assert!(source.contains("soil_wet *= rain_proof"));
     assert!(source.contains("soil_wet_amount(mud, tp.rain_wetness, snow_cover("));
     assert!(source.contains("sun_diffuse * 3.14159265359 * solar_coat"));
@@ -134,7 +135,7 @@ fn actual_wet_soil_sun_gpu_is_energy_bounded_broad_filtered_and_physically_gated
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap(); rx.recv().unwrap().unwrap();
-    let bytes = slice.get_mapped_range();
+    let bytes = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
     let samples = bytemuck::cast_slice::<u8, f32>(&bytes);
     let eta = 1.333f32;
     let f0 = ((eta-1.0)/(eta+1.0)).powi(2);
@@ -299,7 +300,7 @@ fn actual_wet_soil_surface_gpu_preserves_hard_film_and_hands_soft_film_to_rough_
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
-    let bytes = slice.get_mapped_range();
+    let bytes = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
     let samples = bytemuck::cast_slice::<u8, f32>(&bytes);
     let mut previous = 1.0;
     let mut positive = false;
@@ -370,7 +371,8 @@ fn soil_wetting_composes_with_actual_terrain_and_uses_physical_rain_proof() {
     assert!(source.contains("soil_wet *= rain_proof"));
     assert!(source.contains("soil_wet_amount(mud, tp.rain_wetness, snow_cover("));
     assert!(source.contains("soil_wet * (1.0 - rain_puddle)"));
-    assert!(source.contains("let moist_n = geometric_n"));
+    // (2026-10-14) patchy, bumpy wet film (owner: an even coat read as milky)
+    assert!(source.contains("let moist_n = normalize(geometric_n + vec3<f32>(-bump.x, 0.0, -bump.y))"));
 }
 
 #[test]
@@ -452,7 +454,7 @@ fn cs_probe(@builtin(global_invocation_id) id: vec3<u32>) {
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
-    let bytes = slice.get_mapped_range();
+    let bytes = slice.get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
     let samples = bytemuck::cast_slice::<u8, f32>(&bytes);
     let mut previous = 0.0;
     for s in samples.chunks_exact(12) {

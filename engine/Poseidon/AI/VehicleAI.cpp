@@ -181,6 +181,23 @@ void ReflectorInfo::Load(EntityAIType& type, const ParamEntry& cls, float armor)
     }
     size = cls >> "size";
     brightness = cls >> "brightness";
+    // LGT-REFL-001: an addon may give its reflector a beam width. Nothing in OFP, CWA or the
+    // Arma configs carries this key, so every existing reflector keeps its old beam.
+    coneHalfAngle = 0;
+    if (cls.FindEntry("opConeAngle"))
+    {
+        const float degrees = cls >> "opConeAngle";
+        if (degrees > 1.0f && degrees < 176.0f)
+        {
+            coneHalfAngle = degrees * (H_PI / 360.0f);
+        }
+    }
+    flareRange = 0;
+    if (cls.FindEntry("opFlareRange"))
+    {
+        const float metres = cls >> "opFlareRange";
+        flareRange = metres > 0 ? metres : 0;
+    }
     RString selName = cls >> "selection";
     selection.Init(shape, selName, nullptr);
     RString hitName = cls >> "hitpoint";
@@ -811,6 +828,23 @@ void EntityAIType::InitShape()
             }
         }
 
+        // (OP) a steady white light (a boat's masthead and stern lights; OFP had white only blinking)
+        index = memory->FindNamedSel("bily pozicni");
+        if (index >= 0)
+        {
+            const NamedSelection& sel = memory->NamedSel(index);
+            for (int i = 0; i < sel.Size(); i++)
+            {
+                LightInfo& light = _lights.Set(_lights.Add());
+                light.type = LightTypeMarker;
+                light.position = memory->Pos(sel[i]);
+                light.direction = VUp;
+                light.color = MarkerWhiteColor;
+                light.ambient = MarkerWhiteAmbient;
+                light.brightness = MarkerWhiteBrightness;
+            }
+        }
+
         index = memory->FindNamedSel("bily pozicni blik");
         if (index >= 0)
         {
@@ -883,6 +917,15 @@ void EntityAIType::InitShape()
             }
         }
     }
+    // (OP) markerLightScale: a vehicle whose marker lights are real lamps rather than tell-tales scales their
+    // brightness (the stock 0.002 lights a tenth of a metre; Tidewater's boat's nav lights light its deck and the
+    // water round it). Default 1, the stock look.
+    if (const ParamEntry* scale = _par ? _par->FindEntry("markerLightScale") : nullptr)
+    {
+        const float k = *scale;
+        for (int i = 0; i < _lights.Size(); i++)
+            _lights[i].brightness *= k;
+    }
     _hitPoints.Clear();
     // must be first of InitShape chain
 
@@ -907,6 +950,16 @@ void EntityAIType::InitShape()
         int index = _hiddenSelections.Add();
         _hiddenSelections[index].Init(_shape, name, nullptr);
     }
+    // Arma's default texture per hidden selection (absent from every CWA class): what the
+    // selection shows until a script sets another with setObjectTexture.
+    _hiddenSelectionsTextureNames.Clear();
+    if (const ParamEntry* textures = par.FindEntry("hiddenSelectionsTextures"); textures && textures->IsArray())
+        for (int i = 0; i < textures->GetSize() && i < _hiddenSelections.Size(); i++)
+            _hiddenSelectionsTextureNames.Add((RString)(RStringB)(*textures)[i]);
+    _hiddenSelectionsMaterialNames.Clear();
+    if (const ParamEntry* materials = par.FindEntry("hiddenSelectionsMaterials"); materials && materials->IsArray())
+        for (int i = 0; i < materials->GetSize() && i < _hiddenSelections.Size(); i++)
+            _hiddenSelectionsMaterialNames.Add((RString)(RStringB)(*materials)[i]);
 
     // reload animations
     const ParamEntry* array = par.FindEntry("ReloadAnimations");
@@ -1173,12 +1226,46 @@ EntityAI::EntityAI(EntityAIType* type, bool fullCreate)
         LightReflectorOnVehicle* light = new LightReflectorOnVehicle(shape, info.color, info.colorAmbient, this,
                                                                      info.position, info.direction, info.size);
         light->SetBrightness(info.brightness);
+        if (info.coneHalfAngle > 0)
+        {
+            light->SetAngle(info.coneHalfAngle); // LGT-REFL-001
+        }
+        if (info.flareRange > 0)
+        {
+            light->SetFlareRange(info.flareRange); // LGT-REFL-001
+        }
         GScene->AddLight(light);
         _reflectors[i] = light;
     }
 
     _hiddenSelectionsTextures.Realloc(type->_hiddenSelections.Size());
     _hiddenSelectionsTextures.Resize(type->_hiddenSelections.Size());
+    for (int i = 0; i < type->_hiddenSelectionsTextureNames.Size() && i < _hiddenSelectionsTextures.Size(); i++)
+    {
+        RString name = type->_hiddenSelectionsTextureNames[i];
+        if (name.GetLength() == 0)
+            continue;
+        const char* path = name.Data();
+        if (*path == '\\')
+            path++;
+        RString lower = path;
+        lower.Lower();
+        _hiddenSelectionsTextures[i] = GlobLoadTexture(lower);
+    }
+    _hiddenSelectionsMaterials.Realloc(type->_hiddenSelections.Size());
+    _hiddenSelectionsMaterials.Resize(type->_hiddenSelections.Size());
+    for (int i = 0; i < type->_hiddenSelectionsMaterialNames.Size() && i < _hiddenSelectionsMaterials.Size(); i++)
+    {
+        RString name = type->_hiddenSelectionsMaterialNames[i];
+        if (name.GetLength() == 0)
+            continue;
+        const char* path = name.Data();
+        if (*path == '\\')
+            path++;
+        RString lower = path;
+        lower.Lower();
+        _hiddenSelectionsMaterials[i] = GTexMaterialBank.New(lower.Data());
+    }
 }
 
 EntityAI::~EntityAI()
@@ -1199,6 +1286,14 @@ void EntityAI::SetObjectTexture(int index, Texture* texture)
     if (index >= 0 && index < _hiddenSelectionsTextures.Size())
     {
         _hiddenSelectionsTextures[index] = texture;
+    }
+}
+
+void EntityAI::SetObjectMaterial(int index, TexMaterial* material)
+{
+    if (index >= 0 && index < _hiddenSelectionsMaterials.Size())
+    {
+        _hiddenSelectionsMaterials[index] = material;
     }
 }
 
@@ -1651,7 +1746,8 @@ bool EntityAI::CheckMagazine(const Magazine* magazine, AutoArray<Ref<const Magaz
 
     AI_ERROR((slots & (MaskSlotItem | MaskSlotHandGunItem)) == slots);
     const int itemMax = maxSlots & MaskSlotItem;
-    const int itemMaxHandGun = maxSlots & MaskSlotHandGunItem;
+    // in the mask's units (one magazine = 0x20), with the Arma 1 high bit's eight more
+    const int itemMaxHandGun = GetHandGunItemSlotsCount(maxSlots) << 5;
     int item = slots & MaskSlotItem;
     int itemHandGun = slots & MaskSlotHandGunItem;
     int reserve = itemMax - item;

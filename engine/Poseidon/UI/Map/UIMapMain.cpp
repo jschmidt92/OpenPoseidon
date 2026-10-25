@@ -1,3 +1,4 @@
+#include <Poseidon/Game/Compat/ArmaOriginalUi.hpp>
 #include <Poseidon/UI/Map/UIMap.hpp>
 #include <Poseidon/UI/Map/UIMapCommon.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
@@ -8,6 +9,7 @@
 #include <Poseidon/Input/InputSubsystem.hpp>
 #include <SDL3/SDL_keycode.h>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
 #include <Poseidon/World/Terrain/Roads.hpp>
 #include <Poseidon/World/Detection/Detector.hpp>
 #include <Poseidon/Game/Commands/GameStateExt.hpp>
@@ -65,7 +67,7 @@ CStaticMapMain::CStaticMapMain(ControlsContainer* parent, int idc, const ParamEn
     _colorActiveMarker = GetPackedColor(cls >> "ActiveMarker" >> "color");
     _sizeActiveMarker = cls >> "ActiveMarker" >> "size";
 
-    _iconPosition = GEngine->TextBank()->Load(GetPictureName(Pars >> "CfgInGameUI" >> "Cursor" >> "mission"));
+    _iconPosition = GEngine->TextBank()->Load(GetPictureName(ArmaOriginalUi::Config("CfgInGameUI") >> "Cursor" >> "mission"));
 
     GMainMapInfo.Clear();
 }
@@ -2123,6 +2125,12 @@ void CStaticMapMain::OnLButtonClick(float x, float y)
                 if (veh)
                 {
                     Vector3 pos = ScreenToWorld(DrawCoord(x, y));
+                    if (EarthStreaming::Enabled())
+                    {
+                        const auto ground = EarthStreaming::Locations().Ground();
+                        if (!ground || !ground->Contains(pos.X(), pos.Z(), std::max(2.0f, veh->GetRadius())))
+                            return;
+                    }
                     if (GLandscape)
                         pos[1] = GLandscape->SurfaceYAboveWater(pos[0], pos[2]) + 0.5f;
                     Matrix4 trans = veh->Transform();

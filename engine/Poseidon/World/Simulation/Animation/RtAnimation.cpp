@@ -4,8 +4,10 @@
 #include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/World/Entities/Infantry/Head.hpp>
 #include <Poseidon/Asset/Formats/RTM/RTMReader.hpp>
+#include <Poseidon/IO/ParamFileExt.hpp>
 #include <Poseidon/IO/Streams/QBStream.hpp>
 #include <Poseidon/Foundation/Types/ScopeLock.hpp>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -238,8 +240,25 @@ int AnimationRTWeights::ReplaceSelection(Shape* shape, int selIndex, int matrixI
                 continue;
             }
         }
-        entry.Clear();
-        entry.Add(AnimationRTPair(matrixIndex, 1.0f));
+        if (entry.Size() <= 1)
+        {
+            entry.Clear();
+            entry.Add(AnimationRTPair(matrixIndex, 1.0f));
+        }
+        else
+        {
+            // A blended vertex (an add-on creature's lip bound to both the torso and the neck,
+            // L.O.M.D.E's Annihilator) keeps its other bones: only the parent's share moves
+            // onto the face bone. Collapsing it onto the parent alone tore the jaw off the
+            // neck as soon as the creature's own animation turned the neck.
+            AnimationRTWeight kept = entry;
+            entry.Clear();
+            for (int i = 0; i < kept.Size(); i++)
+            {
+                const int b = kept[i].GetSel();
+                entry.Add(AnimationRTPair(b == bestSel ? matrixIndex : b, kept[i].GetWeight()));
+            }
+        }
         moved++;
     }
     if (moved <= 0)
@@ -474,11 +493,26 @@ float AnimationRTCache::Priority()
 }
 
 const int MaxAnimationRTItemCount = 4 * 1024;
-const int MaxAnimationRTMatrixCount = 32000;
+// Bone matrices kept decoded (64 bytes each). OFP's 32000 (2 MB) held its 20-bone moves
+// many times over, but an Arma 2 move is keyframes x 132 bones (~4000 matrices for 30
+// keys): about eight of them fit. With more moves in use than that (C0's 59 soldiers on
+// the LHD after ~10 s), every pose -- each collision test poses both men -- evicted one
+// move and decoded another from its archive again: ~13 ms per man per tick. 1M matrices
+// (64 MB) holds a mission's working set; FreeOnDemand still reclaims it under pressure.
+// POSEIDON_ANIM_CACHE_MATRICES=<n> sets another limit (32000 = the old one, for comparison).
+static int AnimationRTMatrixLimit()
+{
+    static const int limit = [] {
+        const char* e = std::getenv("POSEIDON_ANIM_CACHE_MATRICES");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0;
+        return v > 0 ? static_cast<int>(v) : 1000000;
+    }();
+    return limit;
+}
 
 size_t AnimationRTCache::BudgetBytes() const
 {
-    return (size_t)MaxAnimationRTMatrixCount * sizeof(Matrix4);
+    return (size_t)AnimationRTMatrixLimit() * sizeof(Matrix4);
 }
 
 AnimationRTCache::AnimationRTCache()
@@ -520,7 +554,7 @@ void AnimationRTCache::Load(AnimationRT* anim)
     }
     else
     {
-        if (_count > MaxAnimationRTItemCount || _countMatrices > MaxAnimationRTMatrixCount)
+        if (_count > MaxAnimationRTItemCount || _countMatrices > AnimationRTMatrixLimit())
         {
             if (_loaded.Last())
             {
@@ -529,6 +563,12 @@ void AnimationRTCache::Load(AnimationRT* anim)
         }
 
         anim->AddLoadCount();
+
+        // a cache too small for the moves in use reloads them over and over: say so
+        static long long loads = 0;
+        if (++loads % 2000 == 0)
+            LOG_INFO(Core, "Animation cache: {} loads so far ({} held, {} matrices of {})", loads, _count,
+                     _countMatrices, AnimationRTMatrixLimit());
 
         _loaded.Insert(anim);
 
@@ -539,6 +579,93 @@ void AnimationRTCache::Load(AnimationRT* anim)
 }
 
 static AnimationRTCache GAnimationRTCache;
+
+// The skinned rig a move set's binarised moves pose (its skeletonName: the man's
+// OFP2_ManSkeleton, an animal's CowSkeleton, ...), when the model's loader registered it;
+// its rest height read once from the set's standing move (its first action map's Stop).
+static const Poseidon::Asset::Formats::BmtrRig* BinarisedRig(const Skeleton* skelet)
+{
+    using namespace Poseidon::Asset::Formats;
+    if (!skelet)
+        return nullptr;
+    const ParamEntry* moves = Pars.FindEntry(skelet->GetName());
+    const ParamEntry* sn = moves && moves->IsClass() ? moves->FindEntry("skeletonName") : nullptr;
+    if (!sn || sn->IsClass() || sn->IsArray())
+        return nullptr;
+    std::string key = (const char*)(RStringB)*sn;
+    for (char& ch : key)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    auto it = BmtrRigs().find(key);
+    if (it == BmtrRigs().end() || it->second.parents.empty())
+        return nullptr;
+    BmtrRig& rig = it->second;
+    if (rig.rootRestHeight < 0)
+    {
+        rig.rootRestHeight = 0.0f;
+        std::string file;
+        const ParamEntry* maps = moves->FindEntry("primaryActionMaps");
+        const ParamEntry* actions = moves->FindEntry("Actions");
+        const ParamEntry* states = moves->FindEntry("States");
+        if (maps && maps->IsArray() && maps->GetSize() > 0 && actions && states)
+        {
+            const ParamEntry* map = actions->FindEntry(RStringB((*maps)[0].GetValue()));
+            const ParamEntry* stop = map ? map->FindEntry("Stop") : nullptr;
+            const ParamEntry* state =
+                stop && !stop->IsClass() && !stop->IsArray() ? states->FindEntry((RStringB)*stop) : nullptr;
+            const ParamEntry* f = state && state->IsClass() ? state->FindEntry("file") : nullptr;
+            if (f && !f->IsClass() && !f->IsArray())
+                file = (const char*)(RStringB)*f;
+        }
+        if (!file.empty())
+        {
+            QIFStreamB in;
+            in.AutoOpen(GetAnimationName(RString(file.c_str())));
+            std::vector<uint8_t> bytes;
+            while (!in.fail() && in.rest() > 0)
+            {
+                const int c = in.get();
+                if (in.eof() || in.fail() || c < 0)
+                    break;
+                bytes.push_back(static_cast<uint8_t>(c));
+            }
+            float h = 0.0f;
+            if (BmtrRootHeightAtStart(bytes.data(), bytes.size(), rig, h) && h > 0.0f && h < 5.0f)
+                rig.rootRestHeight = h;
+        }
+        LOG_INFO(Physics, "Binarised rig {}: root rest height {:.3f} m (from {})", key, rig.rootRestHeight,
+                 file.empty() ? std::string("nothing") : file);
+    }
+    return &rig;
+}
+
+// An Arma 2 binarised animation (BMTR) in `in`, converted to plain RTM bytes in `out`.
+// False (stream rewound) for anything else.
+static bool BinarisedToRtm(QIStream& in, std::string& out, const Skeleton* skelet = nullptr)
+{
+    const int start = in.tellg();
+    char magic[4] = {};
+    in.read(magic, 4);
+    const bool binarised = !in.fail() && std::memcmp(magic, "BMTR", 4) == 0;
+    in.seekg(start, QIOS::beg);
+    if (!binarised)
+        return false;
+    std::vector<uint8_t> bytes;
+    bytes.reserve(static_cast<size_t>(std::max(0, in.rest())));
+    while (true)
+    {
+        const int c = in.get();
+        if (in.eof() || in.fail() || c < 0)
+            break;
+        bytes.push_back(static_cast<uint8_t>(c));
+    }
+    if (!Poseidon::Asset::Formats::ConvertBMTRToRTM(bytes.data(), bytes.size(), out, BinarisedRig(skelet)))
+    {
+        LOG_ERROR(Physics, "Binarised animation could not be read ({} bytes)", bytes.size());
+        out.clear();
+        return false;
+    }
+    return true;
+}
 
 void AnimationRT::FullLoad(Skeleton* skelet, const char* file)
 {
@@ -551,7 +678,15 @@ void AnimationRT::FullLoad(Skeleton* skelet, const char* file)
     }
 
     Poseidon::Asset::Formats::RTMAnimation rtm;
-    if (!Poseidon::Asset::Formats::readRTM(in, rtm))
+    std::string bmtr; // Arma 2 binarised animation, converted (RTMReader.hpp)
+    QIStream converted;
+    QIStream* source = &in;
+    if (BinarisedToRtm(in, bmtr, skelet))
+    {
+        converted.init(bmtr.data(), static_cast<int>(bmtr.size()));
+        source = &converted;
+    }
+    if (!Poseidon::Asset::Formats::readRTM(*source, rtm))
     {
         ErrorMessage("Bad animation file format in file '%s'.", file);
         return;
@@ -731,6 +866,14 @@ void AnimationRT::Load(Skeleton* skelet, const char* file, bool reversed)
 
         return;
     }
+    std::string bmtr; // Arma 2 binarised animation, converted (RTMReader.hpp)
+    if (BinarisedToRtm(in, bmtr, skelet))
+    {
+        QIStream converted;
+        converted.init(bmtr.data(), static_cast<int>(bmtr.size()));
+        Load(converted, skelet, file, reversed);
+        return;
+    }
     Load(in, skelet, file, reversed);
 }
 
@@ -764,7 +907,11 @@ void AnimationRT::CombineTransform(const WeightInfo& weights, LODShape* lShape, 
 void AnimationRT::TransformPoint(Vector3& pos, const AnimationRTWeights& lWeights, Shape* shape, Matrix4Par trans,
                                  const BlendAnimInfo* blend, int nBlend, int index)
 {
-    if (index < 0)
+    // CRASH-20261022: a level whose weights were never built has an EMPTY table, and indexing it
+    // read through a null array (owner crash in a mission intro: Soldier::Soldier ->
+    // RecalcGunTransform -> GetWeaponCenter -> AnimatePoint -> TransformPoint). No weights =
+    // nothing to move.
+    if (index < 0 || index >= lWeights.Size())
     {
         return;
     }
@@ -807,7 +954,11 @@ void AnimationRT::TransformPoint(Vector3& pos, const AnimationRTWeights& lWeight
 void AnimationRT::TransformMatrix(Matrix4& mat, const AnimationRTWeights& lWeights, Shape* shape, Matrix4Par trans,
                                   const BlendAnimInfo* blend, int nBlend, int index)
 {
-    if (index < 0)
+    // CRASH-20261022: a level whose weights were never built has an EMPTY table, and indexing it
+    // read through a null array (owner crash in a mission intro: Soldier::Soldier ->
+    // RecalcGunTransform -> GetWeaponCenter -> AnimatePoint -> TransformPoint). No weights =
+    // nothing to move.
+    if (index < 0 || index >= lWeights.Size())
     {
         return;
     }
@@ -937,6 +1088,10 @@ Vector3 AnimationRT::ApplyMatricesPoint(const AnimationRTWeights& lWeights, LODS
     // int npos=shape->NPos();
     PoseidonAssert(lShape->BoundingCenter().SquareSize() < 1e-10);
     // Vector3Val bc=lShape->BoundingCenter();
+    if (pointIndex < 0 || pointIndex >= lWeights.Size()) // CRASH-20261022: weights never built
+    {
+        return shape->Pos(pointIndex < 0 ? 0 : pointIndex);
+    }
     const AnimationRTWeight& wg = lWeights[pointIndex];
     int wsize = wg.Size();
     // note: animation is calculated before BC centering
@@ -1276,7 +1431,8 @@ void AnimationRT::PrepareMatrices(Matrix4Array& matrix, float time, float factor
     }
 }
 
-Vector3 AnimationRT::Point(const WeightInfo& lWeights, LODShape* lShape, int level, float time, int index) const
+Vector3 AnimationRT::Point(const WeightInfo& lWeights, LODShape* lShape, int level, float time, int index,
+                           Vector3Par origin) const
 {
     if (index < 0)
     {
@@ -1289,6 +1445,10 @@ Vector3 AnimationRT::Point(const WeightInfo& lWeights, LODShape* lShape, int lev
     }
 
     const AnimationRTWeights& weights = lWeights[level];
+    if (index >= weights.Size()) // CRASH-20261022: the level's weights were never built
+    {
+        return shape->Pos(index);
+    }
     const AnimationRTWeight& wg = weights[index];
     if (wg.Size() <= 0)
     {
@@ -1318,7 +1478,7 @@ Vector3 AnimationRT::Point(const WeightInfo& lWeights, LODShape* lShape, int lev
     shape->SaveOriginalPos();
 
     PoseidonAssert(lShape->BoundingCenter().SquareSize() < 1e-10);
-    Vector3 pos = shape->OrigPos(index);
+    Vector3 pos = shape->OrigPos(index) - origin;
 
     Vector3 res = VZero;
     float f1 = 1 - interpol;
@@ -1336,7 +1496,7 @@ Vector3 AnimationRT::Point(const WeightInfo& lWeights, LODShape* lShape, int lev
     }
 
     PoseidonAssert(lShape->BoundingCenter().SquareSize() < 1e-10);
-    return res;
+    return res + origin; // the weights sum to one
 }
 
 void AnimationRT::Matrix(Matrix4& mat, float time, const AnimationRTWeight& wgt) const

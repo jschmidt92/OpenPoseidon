@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <cmath>
+#include <vector>
 #include <Poseidon/Foundation/Common/FltOpts.hpp>
 #include <Poseidon/Foundation/Containers/Array.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
@@ -209,6 +210,39 @@ static ParamEntryError& GetParamEntryError()
     return instance;
 }
 #pragma clang diagnostic pop
+
+// The last `class >> name` lookup that missed, so a later use of the error entry (the
+// classic "Size: '/' not an array") can say which entry was actually missing.
+namespace
+{
+thread_local const ParamClass* gLastMissClass = nullptr;
+thread_local char gLastMissName[64] = {};
+thread_local char gLastMissTail[256] = {};
+
+void NoteMiss(const ParamClass* cls, const char* name)
+{
+    // A lookup on the error entry continues the previous miss ("CfgWeapons/X" then
+    // "muzzles" reads "CfgWeapons.X/muzzles"). Kept cheap: the context is built only
+    // when an error is reported.
+    if (cls == &GetParamEntryError())
+    {
+        const size_t used = ::strlen(gLastMissTail);
+        snprintf(gLastMissTail + used, sizeof(gLastMissTail) - used, "/%s", name ? name : "");
+        return;
+    }
+    gLastMissClass = cls;
+    ::strncpy(gLastMissName, name ? name : "", sizeof(gLastMissName) - 1);
+    gLastMissName[sizeof(gLastMissName) - 1] = 0;
+    gLastMissTail[0] = 0;
+}
+
+RString LastMissContext()
+{
+    if (!gLastMissClass)
+        return RString("?");
+    return gLastMissClass->GetContext(gLastMissName) + RString(gLastMissTail);
+}
+} // namespace
 
 ParamEntry* ParamEntry::FindEntry(const RStringB& name, IParamVisibleTest& visible) const
 {
@@ -457,7 +491,10 @@ void ParamEntry::SetValue(int index, int val)
 
 int ParamEntry::GetSize() const
 {
-    ErrorMessage(EMError, "Size: '%s' not an array", (const char*)GetContext());
+    if (this == &GetParamEntryError())
+        ErrorMessage(EMError, "Size: missing entry '%s' (not an array)", (const char*)LastMissContext());
+    else
+        ErrorMessage(EMError, "Size: '%s' not an array", (const char*)GetContext());
     return 0;
 }
 
@@ -786,6 +823,119 @@ static float ScanFloat(const char* ptr, bool& ok)
         return val;
     }
     return 0;
+}
+
+// Constant arithmetic in an unquoted value: Arma 1 resources write
+// `style = ST_LEFT + ST_MULTI + ST_NO_RECT;`, which after macro expansion is
+// `0x00 + 16 + 512`. Numbers (decimal, hex, float), + - * / and parentheses only;
+// anything else is not arithmetic and stays a string. Result in `out` as text.
+namespace
+{
+struct ConstExprParser
+{
+    const char* p;
+    bool ok = true;
+    bool isFloat = false;
+
+    void Skip()
+    {
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+    double Number()
+    {
+        Skip();
+        if (*p == '(')
+        {
+            p++;
+            const double v = Sum();
+            Skip();
+            if (*p != ')')
+                ok = false;
+            else
+                p++;
+            return v;
+        }
+        if (*p == '-' || *p == '+')
+        {
+            const bool neg = *p++ == '-';
+            const double v = Number();
+            return neg ? -v : v;
+        }
+        char* end = nullptr;
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        {
+            const long v = strtol(p + 2, &end, 16);
+            if (end == p + 2)
+                ok = false;
+            p = end;
+            return (double)v;
+        }
+        const double v = strtod(p, &end);
+        if (end == p)
+        {
+            ok = false;
+            return 0;
+        }
+        for (const char* q = p; q < end; q++)
+            if (*q == '.' || *q == 'e' || *q == 'E')
+                isFloat = true;
+        p = end;
+        return v;
+    }
+    double Product()
+    {
+        double v = Number();
+        for (Skip(); ok && (*p == '*' || *p == '/'); Skip())
+        {
+            const char op = *p++;
+            const double r = Number();
+            if (op == '*')
+                v *= r;
+            else
+            {
+                isFloat = isFloat || (r != 0 && std::fmod(v, r) != 0);
+                v = r != 0 ? v / r : 0;
+            }
+        }
+        return v;
+    }
+    double Sum()
+    {
+        double v = Product();
+        for (Skip(); ok && (*p == '+' || *p == '-'); Skip())
+        {
+            const char op = *p++;
+            const double r = Product();
+            v = op == '+' ? v + r : v - r;
+        }
+        return v;
+    }
+};
+} // namespace
+
+bool ParamConstArithmetic(const char* text, char* out, size_t outSize)
+{
+    bool hasOperator = false;
+    for (const char* q = text; *q; q++)
+    {
+        if (strchr("+-*/", *q) && q != text)
+            hasOperator = true;
+        else if (!strchr("0123456789abcdefABCDEFxX.() \t+-*/", *q))
+            return false;
+    }
+    if (!hasOperator)
+        return false;
+    ConstExprParser parser{text};
+    const double v = parser.Sum();
+    parser.Skip();
+    if (!parser.ok || *parser.p != 0)
+        return false;
+    if (parser.isFloat)
+        snprintf(out, outSize, "%g", v);
+    else
+        snprintf(out, outSize, "%d", (int)std::lround(v));
+    return true;
 }
 
 const RStringB ParamRawValue::GetValue() const
@@ -1241,7 +1391,14 @@ ParamEntry* ParamClass::Find(const RStringB& name, bool parent, bool base, IPara
     }
     if (base && _base != nullptr)
     {
-        return _base->Find(name, parent, base, visible);
+        ParamEntry* found = _base->Find(name, parent, base, visible);
+        // Not in the base chain: a base-class name is also looked up in the enclosing
+        // scopes (Arma 2 configs rely on it: a control group's class deriving from a
+        // sibling of the group). Lookups that succeeded before are unchanged.
+        if (found || !parent)
+        {
+            return found;
+        }
     }
     if (parent && _parent != nullptr)
     {
@@ -1313,6 +1470,7 @@ const ParamEntry& ParamClass::operator>>(const char* name) const
     {
         return *entry;
     }
+    NoteMiss(this, name);
     LOG_DEBUG(Core, "ParamFile error: No entry '{}'", (const char*)GetContext(name));
     return GetParamEntryError();
 }
@@ -1618,14 +1776,23 @@ void ParamClass::Parse(QIStream& in, ParamFile* file)
                 ParamEntry* entry = Find(base, true, true, DefaultAccess); // search parents and bases of my parent
                 if (!entry)
                 {
+                    // Reported, and the class is read without a base rather than abandoning
+                    // the rest of the section (which cascaded into "input after EndOfFile"
+                    // and dropped every class after it).
                     ErrorMessage("%s: Undefined base class '%s'", (const char*)GetContext(word), (const char*)base);
-                    return;
                 }
-                section->_base = dynamic_cast<ParamClass*>(entry);
-                if (!section->_base)
+                else
                 {
-                    ErrorMessage("%s: '%s' is not class", (const char*)GetContext(word), (const char*)base);
-                    return;
+                    section->_base = dynamic_cast<ParamClass*>(entry);
+                    if (!section->_base)
+                    {
+                        // Read without a base, like an undefined one: returning here dropped
+                        // the rest of the file. Arma 3 module arguments name their classes
+                        // after values of the module (Site_BLUFOR: `faction = ...;` and
+                        // `class Arguments: Arguments { class faction: faction {...} }`),
+                        // which ended the merged Arma 3 config in the middle of CfgVehicles.
+                        ErrorMessage("%s: '%s' is not class", (const char*)GetContext(word), (const char*)base);
+                    }
                 }
                 c = in.get();
             }
@@ -1818,25 +1985,43 @@ void ParamClass::Parse(QIStream& in, ParamFile* file)
                 }
                 in.unget();
                 bool quot;
-                GetWord(word, sizeof(word), in, ";\n\r", &quot);
+                // A value string can be far longer than an entry name: Arma 2 FSM states keep
+                // whole scripts (6000+ characters) in one string, which a 2 KB word buffer cut
+                // off mid-block. Read values into a large per-thread buffer instead.
+                static thread_local std::vector<char> valueBuf;
+                if (valueBuf.empty())
+                    valueBuf.resize(256 * 1024);
+                char* const vword = valueBuf.data();
+                GetWord(vword, static_cast<int>(valueBuf.size()), in, ";\n\r", &quot);
                 c = in.get();
+                // a macro value with trailing blanks: `text = "x" ;`
+                while (c == ' ' || c == '\t')
+                {
+                    c = in.get();
+                }
                 if (c != ';' && c != '\n' && c != '\r')
                 {
                     ErrorMessage("'%s': '%c' encountered instead of ';'", (const char*)GetContext(valueName), c);
                     return;
                 }
 
-                if (strncmp(word, "__EVAL", 6) == 0)
+                if (strncmp(vword, "__EVAL", 6) == 0)
                 {
-                    ::strcpy(word, file->EvaluateStringInternal(word + 6));
+                    ::strcpy(vword, file->EvaluateStringInternal(vword + 6));
                 }
-                else if (!quot && word[0] == '(')
+                else if (!quot && vword[0] == '(')
                 {
                     // Implicit arithmetic — `w = (1.0 - 2 * 0.02);` evaluates
                     // to 0.96.  Lets resource headers compose numeric layout
                     // constants from named macros without requiring the
                     // BIS-style __EVAL prefix on every site.
-                    ::strcpy(word, file->EvaluateStringInternal(word));
+                    ::strcpy(vword, file->EvaluateStringInternal(vword));
+                }
+                else if (!quot)
+                {
+                    char folded[64];
+                    if (ParamConstArithmetic(vword, folded, sizeof(folded)))
+                        ::strcpy(vword, folded);
                 }
 
                 // check if value is integer or float
@@ -1844,7 +2029,7 @@ void ParamClass::Parse(QIStream& in, ParamFile* file)
                 if (!quot)
                 {
                     bool ok = false;
-                    int val = ScanInt(word, ok);
+                    int val = ScanInt(vword, ok);
                     if (ok)
                     {
                         value = new ParamValueInt(valueName);
@@ -1852,7 +2037,7 @@ void ParamClass::Parse(QIStream& in, ParamFile* file)
                     }
                     else
                     {
-                        float val = ScanFloat(word, ok);
+                        float val = ScanFloat(vword, ok);
                         if (ok)
                         {
                             value = new ParamValueFloat(valueName);
@@ -1863,7 +2048,7 @@ void ParamClass::Parse(QIStream& in, ParamFile* file)
                 if (!value)
                 {
                     value = new ParamValue(valueName);
-                    value->SetValue(word);
+                    value->SetValue(vword);
                 }
 
                 // SetFile is done recursively at the end of parsing
@@ -1932,14 +2117,29 @@ void ParamClass::Update(const ParamClass& source)
             if (srcCls->_base)
             {
                 ParamEntry* baseEntry = Find(srcCls->_base->GetName(), true, true, DefaultAccess);
+                // `class Turrets: Turrets` (Arma-era configs) names the INHERITED class of the
+                // same name. The parser resolves it before the new class exists; here the
+                // destination class is already a member, so the lookup finds the class itself
+                // and would make it its own base -- endless recursion on the next lookup.
+                // Resolve it the way the parser does: past this class's own members.
+                if (baseEntry == dstCls)
+                {
+                    baseEntry = nullptr;
+                    if (_base)
+                        baseEntry = _base->Find(srcCls->_base->GetName(), true, true, DefaultAccess);
+                    if (!baseEntry && _parent)
+                        baseEntry = _parent->Find(srcCls->_base->GetName(), true, true, DefaultAccess);
+                    if (baseEntry == dstCls)
+                        baseEntry = nullptr;
+                }
                 if (!baseEntry || !baseEntry->IsClass())
                 {
+                    // Keep merging the members; only the base change is impossible.
                     ErrorMessage("%s: Cannot find base class '%s'", (const char*)GetContext(),
                                  (const char*)srcCls->_base->GetName());
-                    return;
                 }
                 // check if changing base is enabled
-                if (baseEntry != dstCls->_base)
+                else if (baseEntry != dstCls->_base)
                 {
                     if (dstCls->GetAccessMode() < PAReadOnly)
                     {
@@ -2038,6 +2238,13 @@ void ParamClass::Update(const ParamClass& source)
             }
             else if (dynamic_cast<const ParamValue*>(&srcEntry))
             {
+                // A text value replacing a numeric one (an addon redefining `x=0.5` as
+                // `x="0.5*y"`): the numeric entry cannot hold text, so it is replaced.
+                if (dstEntry && _access < PAReadAndCreate && (dstEntry->IsFloatValue() || dstEntry->IsIntValue()))
+                {
+                    Delete(srcEntry.GetName());
+                    dstEntry = nullptr;
+                }
                 if (!dstEntry)
                 {
                     dstEntry = new ParamValue(srcEntry.GetName());

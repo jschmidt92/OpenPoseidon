@@ -25,7 +25,11 @@
 #include <Poseidon/World/Entities/Weapons/GrenadeFuse.hpp>
 #include <Poseidon/AI/InfantryCombat.hpp>
 #include <Poseidon/AI/FriendlyFire.hpp>
+#include <Poseidon/AI/AIHunt.hpp>
+#include <Poseidon/AI/AICombatPace.hpp> // AI-AIM-001
 #include <Poseidon/World/Weather/WindModel.hpp>
+#include <Poseidon/Graphics/Rendering/Effects/MuzzleBurst.hpp>
+#include <Poseidon/World/Entities/Weapons/RecoilTuning.hpp>
 
 namespace Poseidon
 {
@@ -810,6 +814,48 @@ Vector3 Man::GetWeaponRelDirection(int weapon) const
 
 Matrix4 Man::GetWeaponRelTransform(int weapon) const
 {
+    // Arma 2 3D sights: from the weapon model's "eye" memory point along the barrel, with
+    // the weapon placed exactly as the first-person LOD draws it, so the camera lines up
+    // with the sights on screen. The proxy below is the memory LOD's placeholder, whose
+    // "pilot" point no Arma weapon defines.
+    if (weapon == _currentWeapon && Optics3DSelected())
+    {
+        const MagazineSlot& slot = GetMagazineSlot(weapon);
+        Matrix4 held;
+        const bool found = HeldWeaponTransform(Type()->_insideView, slot._weapon, held);
+        // the muzzle's own camera point (an Arma 1 M203's "GL eye"), else the weapon's "eye"
+        const Vector3 eyePos = slot._muzzle->_hasArmaEye ? slot._muzzle->_armaEyePos : slot._weapon->_eyePos;
+        Vector3 dir = found ? held.Rotate(slot._muzzle->_muzzleDir) : VZero;
+        const float len = dir.Size();
+        // The first few per process: where the sights put the camera (T06's view through
+        // the M4's EOTech came out black where C2B's, the same weapon, did not).
+        static int logged = 0;
+        if (logged < 3)
+        {
+            logged++;
+            const Vector3 eye = found ? held.FastTransform(eyePos) : VZero;
+            LOG_INFO(Graphics,
+                     "A2 3D sights: proxy {} eye {:.3f},{:.3f},{:.3f} dir {:.3f},{:.3f},{:.3f} (|muzzle dir| {:.3f}) up "
+                     "{:.3f},{:.3f},{:.3f} model eye {:.3f},{:.3f},{:.3f} move {}",
+                     found ? "found" : "MISSING", eye.X(), eye.Y(), eye.Z(), dir.X(), dir.Y(), dir.Z(),
+                     slot._muzzle->_muzzleDir.Size(), held.DirectionUp().X(), held.DirectionUp().Y(),
+                     held.DirectionUp().Z(), slot._weapon->_eyePos.X(), slot._weapon->_eyePos.Y(),
+                     slot._weapon->_eyePos.Z(), (const char*)Type()->GetMoveName(_primaryMove.id));
+        }
+        // A muzzle without its two memory points has no direction: aim along the weapon
+        // proxy instead of building a camera from a zero vector.
+        if (found && !(len > 1e-3f))
+            dir = held.Direction(), dir.Normalize();
+        else if (found)
+            dir = dir * (1.0f / len);
+        if (found && dir.SquareSize() > 0.5f)
+        {
+            Matrix4 trans;
+            trans.SetDirectionAndUp(dir, held.DirectionUp());
+            trans.SetPosition(held.FastTransform(eyePos));
+            return trans;
+        }
+    }
     if (weapon >= 0 && weapon < NMagazineSlots())
     {
         int weaponIndex = -1;
@@ -962,7 +1008,8 @@ Vector3 Man::GetWeaponPoint(int weapon) const
         {
             Shape* proxyContainer = _shape->MemoryLevel();
             const ProxyObject& proxy = proxyContainer->Proxy(weaponIndex);
-            Matrix4 animTrans = AnimateProxyMatrix(_shape->FindMemoryLevel(), proxy);
+            Matrix4 animTrans = AnimateProxyMatrix(_shape->FindMemoryLevel(), proxy) *
+                                HeldModelPointCorrection(proxy, info);
 
             const MuzzleType* muzzle = GetMagazineSlot(weapon)._muzzle;
             Vector3Val pos = muzzle->_muzzlePos;
@@ -971,6 +1018,27 @@ Vector3 Man::GetWeaponPoint(int weapon) const
         }
     }
     return PositionWorldToModel(AimingPosition());
+}
+
+Vector3 Man::GetWeaponBarrelDirection(int weapon) const
+{
+    if (weapon < 0 || weapon >= NMagazineSlots()) return VZero;
+    const WeaponType* info = GetMagazineSlot(weapon)._weapon;
+    const MuzzleType* muzzle = GetMagazineSlot(weapon)._muzzle;
+    if (!info || !muzzle) return VZero;
+    int weaponIndex = -1;
+    if (info->_weaponType & MaskSlotPrimary) weaponIndex = Type()->_priWeaponIndex;
+    else if (info->_weaponType & MaskSlotSecondary) weaponIndex = Type()->_secWeaponIndex;
+    else if (info->_weaponType & MaskSlotHandGun) weaponIndex = Type()->_handGunIndex;
+    if (weaponIndex < 0) return VZero;
+    Shape* proxyContainer = _shape->MemoryLevel();
+    if (!proxyContainer) return VZero;
+    const ProxyObject& proxy = proxyContainer->Proxy(weaponIndex);
+    const Matrix4 animTrans = AnimateProxyMatrix(_shape->FindMemoryLevel(), proxy);
+    Vector3 dir = animTrans.Rotate(muzzle->_muzzleDir);
+    if (dir.SquareSize() < 1e-8f) return VZero;
+    dir.Normalize();
+    return dir;
 }
 
 bool Man::GetWeaponCartridgePos(int weapon, Matrix4& pos, Vector3& vel) const
@@ -996,7 +1064,8 @@ bool Man::GetWeaponCartridgePos(int weapon, Matrix4& pos, Vector3& vel) const
             Shape* proxyContainer = _shape->MemoryLevel();
             const ProxyObject& proxy = proxyContainer->Proxy(weaponIndex);
 
-            Matrix4 animTrans = AnimateProxyMatrix(_shape->FindMemoryLevel(), proxy);
+            Matrix4 animTrans = AnimateProxyMatrix(_shape->FindMemoryLevel(), proxy) *
+                                HeldModelPointCorrection(proxy, info);
 
             const MuzzleType* muzzle = GetMagazineSlot(weapon)._muzzle;
 
@@ -1333,8 +1402,8 @@ bool Man::CombatShotSafe(int weapon, const Target* target) const
     if (!target || !target->idExact) return false;
     const auto shell = Ballistics::ShellParamsFor(*ammo);
     const auto& fuseSettings = GrenadeFuse::Get();
-    const float fuse = fuseSettings.enabled && ammo->explosionTime > 0
-        ? (fuseSettings.fuseOverrideSeconds > 0 ? fuseSettings.fuseOverrideSeconds : ammo->explosionTime) : 0;
+    // the fuse the round will really have: stock hand grenades get one too now (AI-XRAY-003)
+    const float fuse = GrenadeFuse::FuseSeconds(ammo->explosionTime, ammo->thrown);
     if (fuse > 8 || shell.initTime > 0) return false;
     Vector3 position = origin;
     Vector3 velocity = Speed() + direction * magazine->_type->_initSpeed;
@@ -1534,6 +1603,18 @@ bool Soldier::FireWeapon(int weapon, TargetType* target)
         {
             if (!EnableMissile())
             {
+                // OP_FORCEFIRE_LOG=1 (see EntityAI::SimulateWeapons): a scripted launcher shot
+                // waits here while the soldier's move does not allow a missile.
+                static const bool forceFireLog = [] {
+                    const char* e = std::getenv("OP_FORCEFIRE_LOG");
+                    return e && *e == '1';
+                }();
+                if (forceFireLog && _forceFireWeapon >= 0)
+                {
+                    LOG_INFO(AI, "force fire {}: missile not enabled in move {} (factor {:.2f})",
+                             (const char*)GetDebugName(), (const char*)Type()->GetMoveName(_primaryMove.id),
+                             _primaryFactor);
+                }
                 return false;
             }
             // check relative missile direction
@@ -1582,6 +1663,19 @@ bool Soldier::FireWeapon(int weapon, TargetType* target)
                     MoveId moveWanted = map->GetAction(selAction);
                     if (moveWanted != MoveIdNone)
                     {
+                        // AI-XRAY-001: the squad grenade interval (AIHunt) is claimed when the throw starts. The
+                        // grenade leaves the hand only when the animation ends (ThrowGrenadeAction), so recording
+                        // it then let every squadmate who chose to throw in that 1-2 s through (Malprave job 23:
+                        // four grenades in 1.6 s from one group). Not claimed when this pose has no throw.
+                        AIUnit* thrower = Brain();
+                        if (thrower && !thrower->IsAnyPlayer() && mode->_ammo->_simulation == AmmoShotShell)
+                        {
+                            if (!Hunt::GrenadeAllowed(thrower->GetGroup()))
+                            {
+                                return false;
+                            }
+                            Hunt::OnGrenadeThrown(thrower->GetGroup());
+                        }
                         Ref<ActionContextDefault> context = new ActionContextDefault;
                         context->function = MFThrowGrenade;
                         context->param = weapon;
@@ -1651,10 +1745,48 @@ bool Soldier::FireWeapon(int weapon, TargetType* target)
     return false;
 }
 
+// PIM-RECOIL: a magazine this big or bigger means a belt-fed weapon rather than a rifle.
+static const int kMgMagazineRounds = 100;
+// STANDING or crouched, a belt-fed weapon is a handful: no bipod, all of that mass and rate of
+// fire fighting the shooter's arms. This is how much of the unbraced recoil it keeps anyway
+// (0 = steadies like a rifle, 1 = stance makes no difference at all).
+static const float& kMgRecoilBracedKeep = GRecoilTune.mgBracedKeep;
+
+// MG-vs-rifle is read off magazine capacity rather than the class name: belt-fed weapons in
+// this game carry 100+ rounds where rifles carry 30, which is a config fact rather than a
+// naming convention, so it survives addons.
+bool Soldier::IsMachineGunFire() const
+{
+    const int w = SelectedWeapon();
+    if (w < 0 || w >= NMagazineSlots())
+    {
+        return false;
+    }
+    const Magazine* mag = GetMagazineSlot(w)._magazine;
+    return mag && mag->_type && mag->_type->_maxAmmo >= kMgMagazineRounds;
+}
+
 float Soldier::GetRecoilFactor() const
 {
-    return GetAimPrecision();
+    float f = GetAimPrecision();
+
+    // Machine guns gain LESS from going prone than a rifle does. A bipod steadies the gun,
+    // but the mass and the rate of fire still move it, so an MG should not settle to a
+    // rifle's prone steadiness. Pull the factor part of the way back toward unbraced.
+    if (IsMachineGunFire())
+    {
+        f += (1.0f - f) * kMgRecoilBracedKeep;
+        // Prone gets a further multiplier for the bipod. Applied ON TOP of the line above
+        // rather than replacing it, so the default of 1.00 leaves the stock behaviour exactly
+        // intact - below 1 a bipodded gun settles, above 1 it stays lively.
+        if (IsDown())
+        {
+            f *= GRecoilTune.mgBipod;
+        }
+    }
+    return f;
 }
+
 
 void Soldier::OnRecoilAbort()
 {
@@ -1709,6 +1841,29 @@ void Soldier::FireWeaponEffects(int weapon, const Magazine* magazine, EntityAI* 
             const Vector3 muzzleWorld = GetHierachyParent() ? WorldTransform().FastTransform(muzzleModel)
                                                           : PositionModelToWorld(muzzleModel);
             _mGunFire.StartMuzzle(muzzleWorld);
+            {
+                // Cosmetic particle burst. Its seed is a private counter mixed with
+                // the shooter and the clock -- never the gameplay RNG.
+                static std::uint32_t shots = 0;
+                // the barrel as the model holds it (owner, 2026-10-19: "are you sure the muzzle
+                // fire is aligned with the rifle barrel?" -- the aim direction is not)
+                Vector3 barrel = GetWeaponDirection(weapon);
+                const Vector3 barrelModel = GetWeaponBarrelDirection(weapon);
+                if (barrelModel.SquareSize() > 0.5f)
+                    barrel = GetHierachyParent() ? WorldTransform().Rotate(barrelModel) : DirectionModelToWorld(barrelModel);
+                const Vector3 carrier = WorldSpeed();
+                Poseidon::render::MuzzleBurstShot shot;
+                shot.muzzle = {muzzleWorld.X(), muzzleWorld.Y(), muzzleWorld.Z()};
+                shot.forward = {barrel.X(), barrel.Y(), barrel.Z()};
+                shot.carrier = {carrier.X(), carrier.Y(), carrier.Z()};
+                shot.birthMs = Glob.time.toInt();
+                // BOOM-005: the flash grows with the charge: a 5.56 rifle (hit ~8) = 1, a pistol
+                // smaller, a 7.62 MG larger
+                shot.size = std::clamp(std::sqrt(std::max(mode->_ammo->hit, 1.0f) / 8.0f), 0.55f, 1.8f);
+                shot.seed = ++shots * 2654435761u ^ std::uint32_t(reinterpret_cast<std::uintptr_t>(this) >> 4) ^
+                            std::uint32_t(shot.birthMs);
+                Poseidon::render::RecordMuzzleBurst(shot);
+            }
             _mGunFireFrames = 1;
             _mGunFireTime = Glob.uiTime;
             int newPhase;
@@ -1970,10 +2125,35 @@ float Man::GetAimed(int weapon, Target* target) const
         // An accepted aim also must not erase emission-gate rejections.
     }
     if (log)
-        LOG_INFO(AI, "COMBAT-AUDIT t={} weapon={} current={} gate={} visibility={} miss={} tolerance={} aimed={} seenAge={} posError={}",
+    {
+        // AI-AIM-001: who he aims at, whether he is moving, and how far his body and his gun are turned off the
+        // target (degrees)
+        float bodyOff = 0, gunOff = 0;
+        if (target && target->idExact)
+        {
+            Vector3 to = target->idExact->AimingPosition() - Position();
+            to[1] = 0;
+            Vector3 body = Direction();
+            body[1] = 0;
+            Vector3 gun = weapon >= 0 && weapon < NMagazineSlots() ? GetWeaponDirection(weapon) : Direction();
+            gun[1] = 0;
+            if (to.SquareSize() > 1e-4f && body.SquareSize() > 1e-4f && gun.SquareSize() > 1e-4f)
+            {
+                bodyOff = std::acos(std::clamp(body.Normalized() * to.Normalized(), -1.0f, 1.0f)) * 57.2958f;
+                gunOff = std::acos(std::clamp(gun.Normalized() * to.Normalized(), -1.0f, 1.0f)) * 57.2958f;
+            }
+        }
+        LOG_INFO(AI, "COMBAT-AUDIT t={} weapon={} current={} gate={} visibility={} miss={} tolerance={} aimed={} seenAge={} posError={} target={} speed={:.1f} bodyOff={:.0f} gunOff={:.0f} hide={} cmd={} move={}",
             Glob.time.toFloat(), weapon, _currentWeapon, diagnostics.gate,
             diagnostics.visibility, diagnostics.error, diagnostics.targetSize, result,
-            target ? Glob.time - target->lastSeen : -1.0f, target ? target->posError.Size() : -1.0f);
+            target ? Glob.time - target->lastSeen : -1.0f, target ? target->posError.Size() : -1.0f,
+            target && target->idExact ? (const char*)target->idExact->GetDebugName() : "-", Speed().Size(), bodyOff,
+            gunOff, GetHideBehind() ? 1 : 0,
+            Brain() && Brain()->GetSubgroup() && Brain()->GetSubgroup()->GetCommand()
+                ? int(Brain()->GetSubgroup()->GetCommand()->_message)
+                : -1,
+            (const char*)GetPrimaryMoveName());
+    }
     return result;
 }
 
@@ -2456,6 +2636,22 @@ void Soldier::AIPilot(float deltaT, SimulationImportance prec)
     }
     else _combatLaneWait.Clear();
 
+    // AI-AIM-001 (CfgAIFork shootFirst): for a few seconds after taking a target he can see, and while nobody is
+    // shooting at him, he aims at once and stays up (AICombatPace.hpp); after that, stock: down, then cover
+    bool shootFirst = false;
+    if (CombatPace::ShootFirstEnabled() && !unit->IsPlayer() && IsLocal() && !QIsManual())
+    {
+        const Target* t = _fire._fireTarget;
+        if (t != _shootFirstTarget)
+        {
+            _shootFirstTarget = t;
+            _shootFirstSince = Glob.time;
+        }
+        shootFirst = t && t->idExact && !t->idExact->IsDammageDestroyed() && t->lastSeen >= Glob.time - 1.0f &&
+                     Glob.time - _shootFirstSince < CombatPace::kShootFirstWindow && !unit->IsDanger() &&
+                     !unit->IsPinnedDown() && unit->GetSuppression() <= 0.05f;
+    }
+
     if (unit->GetState() == AIUnit::Stopping)
     {
         unit->SendAnswer(AI::StepCompleted);
@@ -2488,7 +2684,8 @@ void Soldier::AIPilot(float deltaT, SimulationImportance prec)
         }
         if (_fireState == FireInit)
         {
-            if (Glob.time > _fireStateDelay)
+            // AI-AIM-001: in a firing window, no wait (moving on meanwhile) before aiming
+            if (Glob.time > _fireStateDelay || shootFirst)
             {
                 float maxDist = 1000;
                 if (mode && mode->_ammo)
@@ -2640,6 +2837,14 @@ void Soldier::AIPilot(float deltaT, SimulationImportance prec)
         minPos = ManPosWeapon;
         maxPos = ManPosWeapon;
     }
+    else if (_forceFireWeapon >= 0 && _forceFireWeapon == _currentWeapon && LauncherSelected() && LauncherReady())
+    {
+        // A scripted `fire` of a launcher (unit fire "LAWLauncher"): raise it as an AT soldier
+        // in combat would. Without this a soldier out of combat stayed in his rifle move,
+        // where FireWeapon refuses a missile, and the shot never left (CWA and Arma alike).
+        minPos = ManPosWeapon;
+        maxPos = ManPosWeapon;
+    }
     else if (LauncherSelected() && LauncherReady() && fabs(speedWanted) < 0.5f && unit->GetCombatMode() >= CMCombat &&
              LauncherWanted())
     {
@@ -2651,7 +2856,11 @@ void Soldier::AIPilot(float deltaT, SimulationImportance prec)
     }
     else if (_unitPos == UPAuto)
     {
-        if ((unit->IsDanger() || unit->IsPinnedDown()) && !_inBuilding)
+        if (shootFirst && !IsDown())
+        {
+            minPos = maxPos = ManPosCombat; // AI-AIM-001: up and firing first; he lies down after the window
+        }
+        else if ((unit->IsDanger() || unit->IsPinnedDown()) && !_inBuilding)
         {
             maxPos = ManPosLying; // force lying (in danger, or pinned down by incoming fire)
         }

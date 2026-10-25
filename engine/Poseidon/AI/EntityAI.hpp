@@ -142,6 +142,8 @@ struct FireDecision
 	Foundation::Time _nextTargetAquire;
 	//! Time when changing target is enabled
 	Foundation::Time _nextTargetChange;
+	//! AI-XRAY-002: when _fireTarget was last changed (the X-Ray enemy inertia counts from it)
+	Foundation::Time _targetSince;
 
 	//! Initial state of target.
 	//! We continue to fire until state is decreased.
@@ -173,6 +175,7 @@ struct UserActionDescription
 };
 
 class LightReflectorOnVehicle;
+class LightPointOnVehicle;
 
 class IndicesUpdateEntityAIWeapons;
 
@@ -363,6 +366,9 @@ protected:
 
 	//! Light of all lights on vehicle
 	RefArray<LightReflectorOnVehicle> _reflectors;
+	//! LGT-AUTO-001: point lights at the tail / brake lamps (VehicleAutoLights.cpp)
+	RefArray<LightPointOnVehicle> _autoTailLights;
+	RefArray<LightPointOnVehicle> _autoBrakeLights;
 
 	//! Flag (support for Capture the flag)
 	Ref<Flag> _flag;
@@ -372,6 +378,10 @@ protected:
 
 	//! Textures on hidden selections
 	RefArray<Texture> _hiddenSelectionsTextures;
+	// REFLECT-001 B2: material per hidden selection (hiddenSelectionsMaterials, setObjectMaterial),
+	// null = the model's own; and the section materials it replaced between Animate and Deanimate.
+	RefArray<TexMaterial> _hiddenSelectionsMaterials;
+	AutoArray<SavedSectionMaterial> _hiddenSelectionsSavedMaterials;
 
 	//! user defined actions
 	//! List of all user defined actions
@@ -388,7 +398,44 @@ protected:
 	//@{
 	Ref<RecoilFunction> _recoil;
 	float _recoilTime; //!< current position in recoil
-	float _recoilFactor; //!< recoil factor - used when prone or crouch
+	float _recoilFactor; //!< scale applied to the authored curve (kRecoilScale)
+	//! The recoilFactor the CURRENTLY PLAYING curve was started with. Exists only so the
+	//! "current recoil is stronger - prefer it" test in StartRecoil compares like with like.
+	//! _recoilFactor above cannot serve: it is the curve scale, a different quantity in
+	//! different units, and comparing an incoming aim-precision against it silently dropped
+	//! whole shots (prone aimPrecision 0.3 < kRecoilScale 0.5) whenever the trigger came
+	//! back before the previous curve had finished.
+	float _recoilFactorAsked = 0;
+	//! Spring-damper recoil kick, in radians. Each shot adds an impulse to the VELOCITY in
+	//! a random direction; the spring pulls the displacement back to zero. Sharp onset,
+	//! smooth decay, and shots during a burst compound instead of restarting.
+	float _recoilKickX = 0, _recoilKickY = 0;    //!< displacement (pitch, yaw)
+	float _recoilKickVX = 0, _recoilKickVY = 0;  //!< velocity
+
+	//! PERMANENT part of the kick, pending application to the player's aim. Arma 3 splits
+	//! each shot's muzzle displacement into a temporary component that springs back and a
+	//! permanent one that does not - the permanent part is what makes sustained fire walk
+	//! your aim up the target and stay there until you pull back down. The spring above is
+	//! the temporary half; this is the other. Consumed once by the UI, which owns the
+	//! cursor, so it only ever affects a human player.
+	float _recoilPermPitch = 0, _recoilPermYaw = 0;
+
+	//! CAMERA-only kick - Arma 3's kickVisual. A second spring that punches the view
+	//! without touching the aim, so the shot is felt as well as seen. Bullets are
+	//! unaffected: they follow the weapon, and this moves only the head.
+	float _recoilCamX = 0, _recoilCamY = 0;
+	float _recoilCamVX = 0, _recoilCamVY = 0;
+
+	public:
+	//! Take and clear the pending permanent kick. Returns false when there is none.
+	bool TakeRecoilPermanent(float &pitch, float &yaw)
+	{
+		if (_recoilPermPitch == 0 && _recoilPermYaw == 0) return false;
+		pitch = _recoilPermPitch; yaw = _recoilPermYaw;
+		_recoilPermPitch = _recoilPermYaw = 0;
+		return true;
+	}
+	protected:
 	int _recoilFFIndex; // which recoil ramp is currently played
 
 	//! Start recoil effect
@@ -747,6 +794,9 @@ protected:
 	virtual PackedColor GetOpticsColor(Person *person);
 	//! Check if optics must be used
 	virtual bool GetForceOptics(Person *person) const;
+	//! The aiming view looks through the weapon model's own 3D sights (Arma 2's
+	//! modelOptics "-") instead of over a 2D optics overlay
+	virtual bool LooksThroughSights(Person *person) const {return false;}
 
 	//! Get texture that is currently used to draw flag
 	//! This function is implemented directly in Flag
@@ -759,6 +809,7 @@ protected:
 
 	//! Change texture in hiddenSelections
 	void SetObjectTexture(int index, Texture *texture);
+	void SetObjectMaterial(int index, TexMaterial *material);
 
 	/*!
 	\name Flag support
@@ -894,6 +945,11 @@ protected:
 
 	//! ask vehicle about recoil factor
 	virtual float GetRecoilFactor() const;
+
+	//! True when the firing weapon is belt-fed, which selects the MG multipliers in
+	//! RecoilTuning.hpp. Only Soldier answers yes - a vehicle-mounted gun is bolted to a hull
+	//! that already absorbs the recoil, so it wants no separate profile.
+	virtual bool IsMachineGunFire() const { return false; }
 
 	void OnAddImpulse(Vector3Par force, Vector3Par torque) override;
 
@@ -1185,6 +1241,11 @@ public:
 	(
 		int weapon, const Magazine *magazine, EntityAI *target
 	);
+	//! The volumetric muzzle flash of a vehicle gun at `muzzleModel` pointing `dirModel`
+	//! (model space), for a class that asks for it (a1MuzzleFlash=1): an Arma 1 vehicle's
+	//! "zasleh" holds a flash PROXY, which CWA never draws, so the HMMWV's M2 fired with
+	//! no flash at all.
+	void ArmaVehicleMuzzleBurst(Vector3Par muzzleModel, Vector3Par dirModel, const WeaponModeType *mode);
 
 	// cost: time necessary for 1m travel
 	virtual float GetCost( const GeographyInfo &info ) const {return 1.0;}
@@ -1258,6 +1319,9 @@ public:
 	bool IsUserStopped() const {return _userStopped;}
 
 	virtual bool EngineIsOn() const {return true;}
+	//! LGT-AUTO-001: true while the brake lamps glow (TankOrCar); switches their cast light
+	virtual bool AutoBrakeLightsOn() const {return false;}
+	void UpdateAutoVehicleLights();
 	virtual void EngineOn() {}
 	virtual float MakeAirborne() {return 0;}
 	virtual void EngineOff() {}

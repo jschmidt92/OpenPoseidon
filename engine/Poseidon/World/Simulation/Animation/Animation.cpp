@@ -12,6 +12,8 @@
 
 #include <Poseidon/Foundation/Common/Filenames.hpp>
 #include <stdio.h>
+#include <algorithm>
+#include <vector>
 #include <string.h>
 #include <cfloat>
 #include <cmath>
@@ -145,6 +147,16 @@ void FaceSelection::RescanSections(Shape* shape, const char* debugName)
 {
     AUTO_STATIC_ARRAY(int, sections, 256);
 
+    // LOAD-003: the face offsets of this selection, sorted, so each face of each section is one
+    // binary search instead of a scan of the whole selection -- O(faces x selection) per
+    // selection was billions of compares on a 200k-face model with a wheel selection.
+    std::vector<int> offsets(static_cast<size_t>(Size()));
+    for (int oo = 0; oo < Size(); oo++)
+    {
+        offsets[static_cast<size_t>(oo)] = offsetToInt((*this)[oo]);
+    }
+    std::sort(offsets.begin(), offsets.end());
+
     for (int s = 0; s < shape->NSections(); s++)
     {
         const ShapeSection& sec = shape->GetSection(s);
@@ -153,15 +165,7 @@ void FaceSelection::RescanSections(Shape* shape, const char* debugName)
         bool all = true;
         for (Offset so = sec.beg; so < sec.end; shape->NextFace(so))
         {
-            bool found = false;
-            for (int oo = 0; oo < Size(); oo++)
-            {
-                if ((*this)[oo] == so)
-                {
-                    found = true;
-                    break;
-                }
-            }
+            const bool found = std::binary_search(offsets.begin(), offsets.end(), offsetToInt(so));
             if (found)
             {
                 some = true; // face is there
@@ -635,12 +639,29 @@ void Animation::Transform(LODShape* shape, const Matrix4& trans, int level) cons
     lShape->SaveOriginalPos();
     PoseidonAssert(lShape);
     const NamedSelection& sel = lShape->NamedSel(_selection[level]);
+    // PERF: a parked vehicle animates every LOD it draws with transforms that leave the
+    // selection where it already is (no wheel turn, no damper travel). Dirtying the vertex
+    // buffer for that made the renderer re-hash the whole mesh per draw -- ~0.4 ms per
+    // 280k-vertex car, every car, every frame. Only a vertex that actually moved dirties it.
+    bool changed = false;
     int i;
     for (i = 0; i < sel.Size(); i++)
     {
         int posI = sel[i];
-        lShape->SetPos(posI).SetFastTransform(trans, lShape->OrigPos(posI));
-        lShape->SetNorm(posI).SetRotate(trans, lShape->OrigNorm(posI));
+        Vector3 pos;
+        Vector3 norm;
+        pos.SetFastTransform(trans, lShape->OrigPos(posI));
+        norm.SetRotate(trans, lShape->OrigNorm(posI));
+        if (!changed && (pos != lShape->Pos(posI) || norm != lShape->Norm(posI)))
+        {
+            changed = true;
+        }
+        lShape->SetPos(posI) = pos;
+        lShape->SetNorm(posI) = norm;
+    }
+    if (!changed)
+    {
+        return;
     }
     // AST-016 diagnostic (temporary): a bridged tank's turret VANISHES the
     // first time this runs on it, on both renderers. Name the moment: if this
@@ -770,10 +791,19 @@ void Animation::Restore(LODShape* shape, int level) const
         return;
     }
     const NamedSelection& sel = lShape->NamedSel(_selection[level]);
+    bool changed = false; // PERF: see Transform -- restoring an unmoved selection dirties nothing
     for (int i = 0; i < sel.Size(); i++)
     {
         int posI = sel[i];
+        if (!changed && lShape->Pos(posI) != lShape->OrigPos(posI))
+        {
+            changed = true;
+        }
         lShape->SetPos(posI) = lShape->OrigPos(posI);
+    }
+    if (!changed)
+    {
+        return;
     }
     lShape->InvalidateNormals();
     lShape->InvalidateBuffer();
@@ -908,6 +938,60 @@ void AnimationSection::SetTexture(LODShape* shape, int level, Texture* texture) 
         int sec = sel.GetSection(i);
         ShapeSection& ss = lShape->GetSection(sec);
         ss.properties.SetTexture(texture);
+    }
+}
+
+void AnimationSection::SetMaterial(LODShape* shape, int level, TexMaterial* material,
+                                   AutoArray<SavedSectionMaterial>& saved) const
+{
+    if (_selection[level] < 0 || !material)
+    {
+        return;
+    }
+    Shape* lShape = shape->Level(level);
+    if (!lShape)
+    {
+        return;
+    }
+    const NamedSelection& sel = lShape->NamedSel(_selection[level]);
+    for (int i = 0; i < sel.NSections(); i++)
+    {
+        const int sec = sel.GetSection(i);
+        ShapeSection& ss = lShape->GetSection(sec);
+        if (ss.surfMat.GetRef() == material)
+        {
+            continue; // already showing it: keep the first saved original
+        }
+        bool known = false;
+        for (int s = 0; s < saved.Size() && !known; s++)
+        {
+            known = saved[s].level == level && saved[s].section == sec;
+        }
+        if (!known)
+        {
+            SavedSectionMaterial& entry = saved[saved.Add()];
+            entry.level = level;
+            entry.section = sec;
+            entry.material = ss.surfMat;
+        }
+        ss.surfMat = material;
+    }
+}
+
+void AnimationSection::RestoreMaterials(LODShape* shape, int level, AutoArray<SavedSectionMaterial>& saved)
+{
+    Shape* lShape = shape ? shape->Level(level) : nullptr;
+    for (int s = saved.Size() - 1; s >= 0; s--)
+    {
+        if (saved[s].level != level)
+        {
+            continue;
+        }
+        if (lShape && saved[s].section >= 0 && saved[s].section < lShape->NSections())
+        {
+            lShape->GetSection(saved[s].section).surfMat = saved[s].material;
+        }
+        saved.Delete(s);
     }
 }
 

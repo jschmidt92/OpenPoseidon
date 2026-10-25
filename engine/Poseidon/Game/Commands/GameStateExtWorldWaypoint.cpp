@@ -71,7 +71,9 @@ GameValue GuardedPointCreate(const GameState* state, GameValuePar oper1)
 GameValue TriggerCreate(const GameState* state, GameValuePar oper1)
 {
     const GameArrayType& array = oper1;
-    if (!CheckSize(state, array, 2))
+    // [type, position] -- Arma 3 adds a third element (make the trigger global), which a
+    // single game has no use for.
+    if (array.Size() != 3 && !CheckSize(state, array, 2))
     {
         return OBJECT_NULL;
     }
@@ -126,7 +128,8 @@ inline Detector* GetDetector(GameValuePar oper)
 GameValue TriggerSetArea(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     const GameArrayType& array = oper2;
-    if (!CheckSize(state, array, 4))
+    // Arma 3 adds a fifth item, the area's height (-1 unlimited); the area here has none
+    if (array.Size() != 5 && !CheckSize(state, array, 4))
     {
         return NOTHING;
     }

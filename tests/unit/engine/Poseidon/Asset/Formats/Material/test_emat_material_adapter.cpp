@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,259 @@ using Poseidon::Asset::Material::ParseEmat;
 using Poseidon::Asset::Material::TranslatedMaterial;
 using Poseidon::Asset::Material::TranslatedSlot;
 using Poseidon::Asset::Material::TranslateEmat;
+
+TEST_CASE("Global overlay metadata round trips and declines unsupported inputs",
+          "[asset][material][emat][global-overlay]")
+{
+    using namespace Poseidon::Asset::Material;
+    const std::string body="MatPBRMulti {\n GlobalMCRMap \"{0000000000000001}Assets/Owned_MCR.edds\"\n"
+        " UVSrcGlobalMaps \"UV set 2\"\n OverlayBlackPower .9\n OverlayWhitePower .6\n";
+    const auto parsed=ParseEmat(body+"}\n");
+    const auto result=ReadNativePbrGlobalOverlay(parsed);
+    REQUIRE(result.supported);
+    REQUIRE(result.texture.path==Poseidon::Asset::VirtualPath::Parse("Assets/Owned_MCR.edds"));
+    REQUIRE(result.blackPower==.9f);
+    REQUIRE(result.whitePower==.6f);
+    const auto round=ReadNativePbrGlobalOverlay(ParseEmat(WriteEmatText(parsed)));
+    REQUIRE(round.supported);
+    REQUIRE(round.texture.path==result.texture.path);
+    REQUIRE(round.blackPower==result.blackPower);
+    REQUIRE(round.whitePower==result.whitePower);
+    for(const char* extra : {"OverlayMode 1\n", "Roughness_1 .5\n", "Color_1 1 1 1 .5\n",
+        "Roughness_2 \"bad\"\n", "GlobalMapsUVTransform { TilingU 2 }\n", "FineMask_2 1\n"})
+        REQUIRE_FALSE(ReadNativePbrGlobalOverlay(ParseEmat(body+extra+"}\n")).supported);
+    for(const char* key : {"OverlayBlackPower","OverlayWhitePower","UVSrcGlobalMaps","GlobalMCRMap"}) {
+        auto missing=parsed;
+        std::erase_if(missing.properties,[&](const auto& property){return EmatMaterial::NameMatches(property.name,key);});
+        REQUIRE_FALSE(ReadNativePbrGlobalOverlay(missing).supported);
+    }
+    for(float invalid : {-1.f,17.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) {
+        auto malformed=parsed;
+        for(auto& property:malformed.properties) if(property.name=="OverlayBlackPower") property.values[0].number=invalid;
+        REQUIRE_FALSE(ReadNativePbrGlobalOverlay(malformed).supported);
+    }
+    auto malformed=parsed;
+    for(auto& property:malformed.properties) if(property.name=="OverlayWhitePower") property.values.push_back(property.values[0]);
+    REQUIRE_FALSE(ReadNativePbrGlobalOverlay(malformed).supported);
+    REQUIRE_FALSE(ReadNativePbrGlobalOverlay(ParseEmat("MatPBRMulti {\n UVSrcGlobalMaps \"UV set 1\"\n OverlayBlackPower 1\n OverlayWhitePower 1\n GlobalMCRMap \"Assets/Owned_MCR.edds\"\n}\n")).supported);
+    REQUIRE_FALSE(ReadNativePbrGlobalOverlay(ParseEmat("MatPBRMulti {\n UVSrcGlobalMaps \"UV set 2\"\n OverlayBlackPower 1\n OverlayWhitePower 1\n GlobalMCRMap \"Assets/Owned_BCR.edds\"\n}\n")).supported);
+}
+
+TEST_CASE("Production GlobalMCR takes Enfusion's defaults for unstated keys",
+          "[asset][material][emat][global-mcr]")
+{
+    using namespace Poseidon::Asset::Material;
+    // GraniteRock_01: white power stated, everything else left to the defaults Workbench shows.
+    const auto rock = ReadEmatGlobalMcr(ParseEmat(
+        "MatPBRMulti {\n GlobalMCRMap \"{7A33F9D2284BC947}Assets/Rocks/Granite/Data/GraniteRock_01_MCR.edds\"\n"
+        " OverlayWhitePower 0.1\n}\n"));
+    REQUIRE(rock.present);
+    REQUIRE(rock.blackPower == 1.0f);
+    REQUIRE(rock.whitePower == 0.1f);
+    REQUIRE_FALSE(rock.multiply);
+    REQUIRE_FALSE(rock.uv1);
+    const auto bare = ParseEmat("MatPBRMulti {\n GlobalMCRMap \"{0000000000000001}Assets/A_MCR.edds\"\n}\n");
+    REQUIRE(ReadEmatGlobalMcr(bare).present);
+    REQUIRE(TranslateEmat(bare, "a.emat", "").globalMcr.present);
+    const auto building = ReadEmatGlobalMcr(ParseEmat(
+        "MatPBRMulti {\n GlobalMCRMap \"{0000000000000001}Assets/B_MCR.edds\"\n GlobalMCRMode Multiply\n UVSrcGlobalMaps \"UV set 2\"\n}\n"));
+    REQUIRE(building.present);
+    REQUIRE(building.multiply);
+    REQUIRE(building.uv1);
+    REQUIRE_FALSE(ReadEmatGlobalMcr(ParseEmat("MatPBRMulti {\n BCRMap \"{0000000000000001}Assets/C_BCR.edds\"\n}\n")).present);
+    REQUIRE_FALSE(ReadEmatGlobalMcr(ParseEmat(
+        "MatPBRMulti {\n GlobalMCRMap \"{0000000000000001}Assets/D_MCR.edds\"\n GlobalMCRMode Screen\n}\n")).present);
+    REQUIRE_FALSE(ReadEmatGlobalMcr(ParseEmat(
+        "MatPBRMulti {\n GlobalMCRMap \"{0000000000000001}Assets/E_MCR.edds\"\n OverlayBlackPower 17\n}\n")).present);
+}
+
+TEST_CASE("Ordered normal parameters keep global UV separate and reject unsupported inputs",
+          "[asset][material][emat][arf][normal-preview]")
+{
+    using namespace Poseidon::Asset::Material;
+    std::string body = "MatPBRMulti {\n NormalPower .2\n"
+        " GlobalNMOMap \"{0000000000000001}Assets/Owned_Global_NMO.edds\"\n"
+        " GlobalNMOUVTransform MatUVTransform \"{0000000000000004}\" { TilingU .25 TilingV .5 OffsetU .1 OffsetV -.2 }\n";
+    for (int i = 1; i <= 4; ++i)
+    {
+        const std::string suffix = std::to_string(i);
+        body += " BCR_" + suffix + " \"{0000000000000002}Assets/Owned_BCR.edds\"\n";
+        body += " NMO_" + suffix + " \"{0000000000000003}Assets/Owned_NMO.edds\"\n";
+        body += " DetNormal_" + suffix + " " + std::to_string(i * .2f) + "\n";
+        body += " UVTransform_" + suffix + " { TilingU 2 TilingV 3 }\n";
+        // RFG-131: layers 2..4 are off unless switched on (Workbench class default Enabled_N 0).
+        if (i != 1) body += " Enabled_" + suffix + " 1\n MaskSharpness_" + suffix + " 1\n";
+    }
+    const auto parsed = ParseEmat(body + "}\n");
+    const auto normal = ReadNativePbrMultiNormals(parsed);
+    REQUIRE(normal.supported);
+    REQUIRE(normal.globalUv == std::array<float, 4>{.25f, .5f, .1f, -.2f});
+    REQUIRE(normal.globalPower == .2f);
+    REQUIRE(normal.detailStrength[0].value == .2f);
+    REQUIRE(normal.detailStrength[3].value == .8f);
+    REQUIRE(ReadNativePbrMultiAo(parsed).supported);
+    REQUIRE(ReadNativePbrMultiAo(parsed).scale == std::array<float, 4>{1, 1, 1, 1});
+    const auto authoredAo = ParseEmat(body + " AO_1 0\n AO_3 2\n}\n");
+    REQUIRE(ReadNativePbrMultiAo(authoredAo).supported);
+    REQUIRE(ReadNativePbrMultiAo(authoredAo).scale == std::array<float, 4>{0, 1, 2, 1});
+    for (const float invalid : {-1.0f, std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()})
+    {
+        auto bad = authoredAo;
+        for (auto& property : bad.properties)
+            if (EmatMaterial::NameMatches(property.name, "AO_3")) property.values[0].number = invalid;
+        REQUIRE_FALSE(ReadNativePbrMultiAo(bad).supported);
+    }
+    REQUIRE_FALSE(ReadNativePbrMultiAo(ParseEmat(body + " AO_3 \"bad\"\n}\n")).supported);
+    REQUIRE_FALSE(ReadNativePbrMultiAo(ParseEmat(body + " FineMask_2 1\n}\n")).supported);
+    const auto translated = TranslateEmat(parsed, "Assets/Owned.emat", "");
+    REQUIRE(translated.Find(MaterialSlot::BaseColour)->uvTransform.aside[0] == 2.0f);
+    if (EmatPbrProvenanceEnabled())
+    {
+        REQUIRE(translated.ematPbr->normals.supported);
+        REQUIRE(translated.ematPbr->normals.globalUv == normal.globalUv);
+        REQUIRE(TranslateEmat(authoredAo, "Assets/Owned.emat", "").ematPbr->layerAo.scale ==
+                std::array<float, 4>{0, 1, 2, 1});
+    }
+    for (const char* key : {"NormalPower", "DetNormal_2", "GlobalNMOMap", "NMO_4", "GlobalNMOUVTransform"})
+    {
+        auto missing = parsed;
+        std::erase_if(missing.properties, [key](const auto& p) { return EmatMaterial::NameMatches(p.name, key); });
+        REQUIRE_FALSE(ReadNativePbrMultiNormals(missing).supported);
+    }
+    for (const char* unsupported : {" FineMask_2 1\n", " UVSrcGlobNormal \"UV set 2\"\n"})
+        REQUIRE_FALSE(ReadNativePbrMultiNormals(ParseEmat(body + unsupported + "}\n")).supported);
+    for (const float invalid : {-1.0f, 17.0f, std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()})
+    {
+        auto bad = parsed;
+        for (auto& property : bad.properties)
+            if (EmatMaterial::NameMatches(property.name, "DetNormal_2")) property.values[0].number = invalid;
+        REQUIRE_FALSE(ReadNativePbrMultiNormals(bad).supported);
+    }
+    for (const char* transform : {"{ Rotation 10 }", "{ TilingU 0 }", "{ TilingV -1 }",
+                                  "{ TilingU \"bad\" }", "{ Shear 1 }"})
+    {
+        auto bad = parsed;
+        const auto replacement = ParseEmat(std::string("MatPBRMulti {\n GlobalNMOUVTransform ") + transform + "\n}\n");
+        for (auto& property : bad.properties)
+            if (EmatMaterial::NameMatches(property.name, "GlobalNMOUVTransform")) property = replacement.properties[0];
+        REQUIRE_FALSE(ReadNativePbrMultiNormals(bad).supported);
+    }
+    auto badLayer = parsed;
+    const auto replacement = ParseEmat("MatPBRMulti {\n UVTransform_2 { TilingU \"bad\" }\n}\n");
+    for (auto& property : badLayer.properties)
+        if (EmatMaterial::NameMatches(property.name, "UVTransform_2")) property = replacement.properties[0];
+    REQUIRE_FALSE(ReadNativePbrMultiNormals(badLayer).supported);
+}
+
+TEST_CASE("Standard ordered masks preserve detail parameters and reject unsupported contracts",
+          "[asset][material][emat][arf][ordered-masks]")
+{
+    using namespace Poseidon::Asset::Material;
+    std::array<std::array<float, 4>, 3> params{};
+    const std::string body = "MatPBRMulti {\n"
+        " BCR_1 \"{0000000000000001}Assets/Owned_BCR.edds\"\n"
+        " MaskSharpness_2 4\n MaskOffset_2 0.125\n MaskUVScale_2 0.25\n"
+        " Mask_2 \"{0000000000000002}Assets/Owned_Mask1.edds\"\n";
+    REQUIRE(ReadNativePbrStandardMasks(ParseEmat(body + "}\n"), params));
+    REQUIRE(params[0] == std::array<float, 4>{0.25f, 4.0f, 0.125f, 0.0f});
+    REQUIRE(params[1] == std::array<float, 4>{1.0f, 0.0f, 0.0f, 0.0f});
+    for (const char* unsupported : {" FineMask_2 1\n", " BlendMode_2 1\n",
+                                   " AngleMask 1\n", " MaskUVScale_2 -1\n",
+                                   " UVTransform_2 { Rotation 15 }\n"})
+    {
+        // Duplicate keys keep the first authored value, so use an independent
+        // material for each unsupported feature rather than overriding body.
+        REQUIRE_FALSE(ReadNativePbrStandardMasks(ParseEmat(std::string("MatPBRMulti {\n") +
+            unsupported + "}\n"), params));
+    }
+    auto invalid = ParseEmat("MatPBRMulti {\n MaskSharpness_2 1\n}\n");
+    invalid.properties[0].values[0].number = std::numeric_limits<double>::infinity();
+    REQUIRE_FALSE(ReadNativePbrStandardMasks(invalid, params));
+    REQUIRE_FALSE(ReadNativePbrStandardMasks(ParseEmat("MatPBRBasic {\n}\n"), params));
+    REQUIRE_FALSE(ReadNativePbrStandardMasks(ParseEmat("MatPBRMulti {\n OpacityMap \"{1}cutout.edds\"\n}\n"), params));
+}
+
+TEST_CASE("Native Multi mask scales preserve identity and authored zero without changing Basic",
+          "[asset][material][emat][arf][mask-scales]")
+{
+    using namespace Poseidon::Asset::Material;
+    TranslatedMaterial material;
+    material.shaderFamily = "MatPBRMulti";
+    REQUIRE(NativePbrMultiMaskScales(material) == std::array<float, 3>{1.0f, 1.0f, 1.0f});
+    auto pbr = std::make_shared<EmatPbrProvenance>();
+    material.ematPbr = pbr;
+    pbr->baseLayerUsesTile = true;
+    pbr->bcrAlphaIsRoughness[0] = true;
+    pbr->maskScale = {{{0.0f, true}, {0.5f, true}, {2.0f, true}}};
+    REQUIRE(NativePbrMultiMaskScales(material) == std::array<float, 3>{0.0f, 0.5f, 2.0f});
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{1.0f, 1.0f});
+    pbr->maskScale = {{{-1.0f, true}, {std::numeric_limits<float>::quiet_NaN(), true},
+                       {std::numeric_limits<float>::infinity(), true}}};
+    REQUIRE(NativePbrMultiMaskScales(material) == std::array<float, 3>{0.0f, 1.0f, 1.0f});
+    material.shaderFamily = "MatPBRBasic";
+    REQUIRE(NativePbrMultiMaskScales(material) == std::array<float, 3>{1.0f, 1.0f, 1.0f});
+    material.shaderFamily = "MatPBRMulti";
+    pbr->baseLayerUsesTile = false;
+    REQUIRE(NativePbrMultiMaskScales(material) == std::array<float, 3>{1.0f, 1.0f, 1.0f});
+
+    // Owned fixture: RGB scales belong to the mask on UV1, while tile transforms
+    // and the global normal's authored UV source remain independent.
+    const auto translated = TranslateEmat(ParseEmat(
+        "MatPBRMulti {\n MaskRedScale 0\n MaskGreenScale 0.5\n MaskBlueScale 2\n"
+        " UVSrcGlobalMaps \"UV set 2\"\n UVSrcGlobNormal \"UV set 1\"\n"
+        " MaskMap \"{0000000000000001}Assets/Owned_mask.edds\"\n"
+        " BCR_1 \"{0000000000000002}Assets/Owned_BCR.edds\"\n"
+        " UVTransform_1 {\n TilingU 4\n TilingV 3\n }\n}\n"), "Assets/Owned.emat", "");
+    REQUIRE(EmatMaskUsesUvSet2(ParseEmat("MatPBRMulti {\n UVSrcGlobalMaps \"UV set 2\"\n}\n")));
+    REQUIRE_FALSE(translated.globalNormalUv1);
+    REQUIRE(translated.Find(MaterialSlot::BaseColour)->uvTransform.aside[0] == 4.0f);
+    if (EmatPbrProvenanceEnabled())
+    {
+        REQUIRE(translated.ematPbr);
+        REQUIRE(NativePbrMultiMaskScales(translated) == std::array<float, 3>{0.0f, 0.5f, 2.0f});
+    }
+}
+
+TEST_CASE("Opaque native PBR Basic scales preserve zero and leave other material routes alone",
+          "[asset][material][emat][arf][pbr-scales]")
+{
+    using namespace Poseidon::Asset::Material;
+    TranslatedMaterial material;
+    material.shaderFamily = "MatPBRBasic";
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{1.0f, 1.0f});
+    auto pbr = std::make_shared<EmatPbrProvenance>();
+    material.ematPbr = pbr;
+    pbr->bcrAlphaIsRoughness[0] = true;
+    pbr->roughnessScale = {0.48f, true};
+    pbr->metalnessScale = {0.0f, true};
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{0.48f, 0.0f});
+    pbr->roughnessScale = {2.0f, true};
+    REQUIRE(NativePbrBasicScales(material)[0] == 2.0f);
+    pbr->roughnessScale = {-1.0f, true};
+    REQUIRE(NativePbrBasicScales(material)[0] == 0.0f);
+    pbr->roughnessScale = {std::numeric_limits<float>::quiet_NaN(), true};
+    pbr->metalnessScale = {std::numeric_limits<float>::infinity(), true};
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{1.0f, 1.0f});
+    pbr->roughnessScale = {0.5f, true};
+    pbr->metalnessScale = {0.2f, true};
+    material.shaderFamily = "MatPBRMulti";
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{1.0f, 1.0f});
+    material.shaderFamily = "MatPBRBasic";
+    pbr->bcrAlphaIsRoughness[0] = false; // opacity composites / converted PAA
+    REQUIRE(NativePbrBasicScales(material) == std::array<float, 2>{1.0f, 1.0f});
+
+    const auto translated = TranslateEmat(
+        ParseEmat("MatPBRBasic {\n RoughnessScale 0.48\n MetalnessScale 0\n"
+                  " BCRMap \"{0000000000000001}Assets/Test_BCR.edds\"\n"
+                  " NMOMap \"{0000000000000002}Assets/Test_NMO.edds\"\n}\n"),
+        "Assets/Test.emat", "");
+    if (EmatPbrProvenanceEnabled())
+        REQUIRE(NativePbrBasicScales(translated) == std::array<float, 2>{0.48f, 0.0f});
+    else
+        REQUIRE_FALSE(translated.ematPbr);
+}
 
 namespace
 {
@@ -326,6 +580,28 @@ const char* kCrownEmat =
     " NTCMap \"{9A6ED533F062788B}Assets/Vegetation/_Polyplanes/polyplane_betula_pendula_NTC.edds\"\n"
     "}";
 } // namespace
+
+TEST_CASE("EMAT two-layer mask uses its authored UV stream independently of global maps",
+          "[asset][material][emat][arf][mask-uv]")
+{
+    using namespace Poseidon::Asset::Material;
+    // Synthetic source representing the separate mask key used by native
+    // two-layer brick/rock materials. No native texture pixels are needed.
+    const auto source = ParseEmat("MatPBR2Layers {\n MaskMap \"{0000000000000003}Assets/Owned_mask.edds\"\n"
+                                  " UVSrcMaskMap \"UV set 2\"\n}\n");
+    REQUIRE(EmatMaskUsesUvSet2(source));
+    const auto translated = TranslateEmat(source, "Assets/Owned.emat", "");
+    const auto* mask = translated.Find(MaterialSlot::Mask);
+    REQUIRE(mask);
+    REQUIRE(mask->uvSource == "tex1");
+    REQUIRE_FALSE(EmatMaskUsesUvSet2(ParseEmat(
+        "MatPBR2Layers {\n UVSrcMaskMap \"UV set 1\"\n UVSrcGlobalMaps \"UV set 2\"\n}\n")));
+    REQUIRE(EmatMaskUsesUvSet2(ParseEmat(
+        "MatPBR2Layers {\n UVSrcGlobalMaps \"UV set 2\"\n}\n")));
+    REQUIRE_FALSE(EmatMaskUsesUvSet2(ParseEmat(
+        "MatPBRMulti {\n UVSrcMaskMap \"UV set 2\"\n}\n")));
+    REQUIRE_FALSE(EmatMaskUsesUvSet2(ParseEmat("MatPBRBasic {\n}\n")));
+}
 
 TEST_CASE("EMAT adapter: a Reforger MatPBRBasic binds its BCR and its NMO", "[asset][material][emat][arf]")
 {
@@ -837,4 +1113,19 @@ TEST_CASE("EMAT deploy: the shipped alder crown, parent and all, through the rea
     // the OpacityMap, and the converter already folds it into the `_ca` face texture.
     // What turned the leaves into solid planes was the 21:23 re-export overwriting the
     // 140 cutout `.paa` files without the FLAG tagg (PAAEncoder.cpp, MAT-047).
+}
+
+TEST_CASE("A {GUID}path reference resolves by its GUID when the database knows it", "[asset][material][emat][rfg-132]")
+{
+    using namespace Poseidon::Asset::Material;
+    const char* text = "MatPBRMulti {\n MaskMap \"{BBA0ACD4E9DCCC05}Assets/H/H_Ext_GLOBAL_MASK.edds\"\n"
+                       " BCR_1 \"{0000000000000009}Assets/H/Tiles_BCR.edds\"\n}\n";
+    REQUIRE(ParseEmat(text).TextureOf("MaskMap") == "Assets/H/H_Ext_GLOBAL_MASK.edds");
+    auto paths = std::make_shared<Detail::EmatGuidPaths>();
+    (*paths)["BBA0ACD4E9DCCC05"] = "Assets/H/H_V2_Ext_GLOBAL_MASK.edds";
+    Detail::SetEmatGuidPaths(paths);
+    const auto parsed = ParseEmat(text);
+    Detail::SetEmatGuidPaths(nullptr);
+    CHECK(parsed.TextureOf("MaskMap") == "Assets/H/H_V2_Ext_GLOBAL_MASK.edds");
+    CHECK(parsed.TextureOf("BCR_1") == "Assets/H/Tiles_BCR.edds"); // unknown GUID keeps its text
 }

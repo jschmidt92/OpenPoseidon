@@ -37,6 +37,13 @@ class AirplaneType: public TransportType
 	AnimationSection _rotorStill, _rotorMove;
 
 	AnimationWithCenter _fWheel,_rWheel,_lWheel;
+	// Arma 1 models name the gear by the model.cfg skeleton (gear_1..3 with gear_N_axis,
+	// wheel_N, struts) instead of "predni kolo"/"levy kolo": every part of one leg turns
+	// with that leg about its axis. _a1GearFront: the forward-most leg (the nose gear).
+	enum {MaxA1GearParts=32};
+	AnimationWithCenter _a1Gear[MaxA1GearParts];
+	bool _a1GearFront[MaxA1GearParts];
+	int _nA1Gear = 0;
 
 	Indicator _altRadarIndicator;
 	Indicator _altRadarIndicator2;
@@ -187,6 +194,9 @@ class Airplane: public Transport
 	LSError Serialize(ParamArchive &ar) override;
 
 	void RepairGear() { _gearDammage = false; }
+
+	// its own class id: without one dyn_cast<Airplane> answers yes for every object of its base
+	USE_CASTING(base)
 };
 
 enum AirplaneState
@@ -231,6 +241,13 @@ class AirplaneAuto: public Airplane
 
 	AutopilotState _state;
 	AirplaneState _planeState;
+	// Which of the world's airports this plane uses. In the air: the nearest its side may use (not closed or given
+	// to another side by the mission) and does not know to be held by the enemy, else the nearest it may use, else
+	// the nearest. Re-checked every 2 s: in the pattern it diverts only away from a field turned hostile or closed
+	// (going around first when on short final). On the ground: the field it is on. -1 = not chosen yet.
+	int _airport = -1;
+	Foundation::Time _airportCheckTime;
+	int Airport();
 
 	public:
 	AirplaneAuto( VehicleType *name, Person *pilot );

@@ -34,6 +34,9 @@
 #include <Poseidon/Foundation/Types/LLinks.hpp>
 #include <Poseidon/Foundation/Types/Pointers.hpp>
 
+namespace Poseidon { class EntityAI; class Person; }
+bool Arma2RunUserAction(Poseidon::EntityAI* veh, Poseidon::Person* caller, int id, const RString& script); // GameStateExtA2.cpp
+
 namespace Poseidon
 {
 const float LostUnitMin = 150.0f;
@@ -1181,7 +1184,11 @@ void EntityAI::PerformAction(const UIAction& action, AIUnit* unit)
             if (unit)
             {
                 const UserActionDescription* desc = FindUserAction(action.param);
-                if (desc && desc->script.GetLength() > 0)
+                if (desc && desc->script.GetLength() > 0 &&
+                    Arma2RunUserAction(this, unit->GetPerson(), desc->id, desc->script))
+                {
+                }
+                else if (desc && desc->script.GetLength() > 0)
                 {
                     GameArrayType arguments;
                     arguments.Add(GameValueExt(this));
@@ -1638,7 +1645,10 @@ int EntityAI::AddEventHandler(EntityEvent event, RString expression)
 }
 void EntityAI::RemoveEventHandler(EntityEvent event, int handle)
 {
-    _eventHandlers[event].Delete(handle);
+    // the slot is emptied, not taken out: the handles of the handlers after it stay theirs (Arma 3
+    // scripts keep them -- a handler removes itself by _thisEventHandler)
+    if (handle >= 0 && handle < _eventHandlers[event].Size())
+        _eventHandlers[event][handle] = RString();
 }
 void EntityAI::ClearEventHandlers(EntityEvent event)
 {
@@ -1673,13 +1683,17 @@ bool EntityAI::IsEventHandler(EntityEvent event) const
 
 void EntityAI::OnEvent(EntityEvent event, const GameValue& pars)
 {
-    const AutoArray<RString>& handlers = GetEventHandlers(event);
+    // a copy: a handler may add or remove handlers (itself) while they run
+    const AutoArray<RString> handlers = GetEventHandlers(event);
     for (int i = 0; i < handlers.Size(); i++)
     {
+        if (handlers[i].GetLength() == 0)
+            continue; // removed
         GameVarSpace local;
         GameState* gstate = GWorld->GetGameState();
         gstate->BeginContext(&local);
         gstate->VarSetLocal("_this", pars, true);
+        gstate->VarSetLocal("_thisEventHandler", GameValue(static_cast<float>(i)), true);
         RString handler = handlers[i];
         gstate->Execute(handler);
         gstate->EndContext();

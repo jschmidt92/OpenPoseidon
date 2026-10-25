@@ -76,5 +76,17 @@ namespace DebugOverlay
     void AdoptFreeFlyCamera(CameraVehicle* camera);
     // Harness uses the same enter/teleport path as the Zeus coordinate control.
     bool SetFreeFlyTestPose(const char* coordinates);
+    // Earth-only geographic teleport; same path for the UI and harness SQF.
+    bool SetEarthPreviewLocation(double latitude,double longitude,double altitude);
+    // Earth-only: free-fly camera `altitude` metres above the moon. surface=false: over its sunlit side,
+    // looking at it. surface=true: over a near-side point with the sun ~15 deg up, looking along the
+    // ground away from the sun, pitched by `pitchDegrees` (the Earth is overhead).
+    // surface 2: the sub-Earth point (the Earth at the zenith), looking along the ground pitched by `pitchDegrees`.
+    bool SetEarthMoonPose(double altitude, double pitchDegrees, int surface);
+    // Ends free flight and hands the view back to the player (the Zeus "disable" path).
+    void DisableFreeFly();
+    // Zeus "Beam player here" (dev/harness): stands the player below the free-fly camera and ends free
+    // flight. Returns the Zeus status line, which says why when it could not.
+    const char* BeamPlayerHere();
 } // namespace DebugOverlay
 } // namespace Poseidon::Dev

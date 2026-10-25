@@ -1,3 +1,7 @@
+#include <Poseidon/Game/Commands/GameStateExtA3Rsc.hpp>
+#include <Poseidon/UI/Arma3Menu.hpp>
+#include <Poseidon/World/Terrain/EarthFreeFlight.hpp>
+#include <Poseidon/World/Effects/BuildingBreach.hpp>
 #include <SDL3/SDL_scancode.h>
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 hooks, empty unless POSEIDON_DIAG
 
@@ -95,6 +99,7 @@ extern void SDLGamepad_PlayRamp(float beg, float end, float dur);
 
 #include <Poseidon/World/WorldShared.hpp>
 AbstractOptionsUI* CreateChannelUI();
+void Arma2CampaignAutoStep(); // Game/Compat/Arma2CampaignAuto.cpp
 
 namespace Poseidon
 {
@@ -110,6 +115,29 @@ using Poseidon::Foundation::IsOutOfMemory;
 namespace Poseidon
 {
 extern int gPerfDrawCalls;
+}
+
+namespace
+{
+// The clock before and after the last tick (seconds), for PresentationClockSeconds().
+float s_clockBeforeLastTick = 0.0f;
+float s_clockAfterLastTick = 0.0f;
+
+void NoteClockTick(float before, float after)
+{
+    s_clockBeforeLastTick = before;
+    s_clockAfterLastTick = after;
+}
+} // namespace
+
+float Poseidon::PresentationClockSeconds()
+{
+    const float now = Glob.time.toFloat();
+    // A clock set from outside the tick (load, setDate, a test) is not interpolated.
+    if (!Object::RenderInterpEnabled() || now != s_clockAfterLastTick)
+        return now;
+    const float alpha = Object::RenderInterpAlpha();
+    return s_clockBeforeLastTick + (now - s_clockBeforeLastTick) * alpha;
 }
 
 namespace
@@ -589,7 +617,7 @@ void World::Simulate(float deltaT, bool& enableDraw)
         {
             if (person)
             {
-                enableOptics = camAI->GetOpticsModel(person) != nullptr;
+                enableOptics = camAI->GetOpticsModel(person) != nullptr || camAI->LooksThroughSights(person);
                 forceOptics = camAI->GetForceOptics(person);
             }
         }
@@ -1278,6 +1306,7 @@ void World::Simulate(float deltaT, bool& enableDraw)
     // the accumulator's leftover fraction into the last tick. Set once per frame, here,
     // so every draw of this frame -- objects, shadows, camera -- agrees on the same time.
     Object::SetRenderInterpAlpha(stepFrame.running ? stepFrame.alpha : 1.0f);
+    Object::SetRenderInterpStep(stepFrame.stepSeconds);
 
     if (IsSimulationEnabled())
     {
@@ -1291,7 +1320,12 @@ void World::Simulate(float deltaT, bool& enableDraw)
         {
             _cutEffect.Free();
         }
+        for (auto it = _cutLayers.begin(); it != _cutLayers.end();)
+            it = !it->second || it->second->IsTerminated() ? _cutLayers.erase(it) : std::next(it);
+        for (auto& [layer, effect] : _cutLayers)
+            effect->Simulate(deltaT);
 
+        LiftStuckBlack();
         if (_titleEffect)
         {
             _titleEffect->Simulate(deltaT);
@@ -1382,6 +1416,18 @@ void World::Simulate(float deltaT, bool& enableDraw)
                 fov = object ? object->CamEffectFOV() : 0.7f;
             }
             transform = _cameraEffect->GetTransform();
+            // REN-INTERP-001 for camera effects: the effect follows its object at TICK time, so
+            // the dev free-fly camera (a CameraVehicle behind an "Internal" effect) moved one
+            // tick on some frames and two on others at ~35 fps against 60 Hz -- the owner's
+            // "33 fps but not fluid". The vehicle branch below already rides the drawn frame;
+            // this maps the effect's view the same way. POSEIDON_CAMEFFECT_INTERP=0 = tick time.
+            static const bool camEffectInterp = [] {
+                const char* value = std::getenv("POSEIDON_CAMEFFECT_INTERP");
+                return !(value && value[0] == '0');
+            }();
+            if (camEffectInterp)
+                if (const Object* followed = _cameraEffect->GetObject())
+                    transform = followed->RenderDelta() * transform;
 
             if (_cameraEffect->IsInside())
             {
@@ -1684,6 +1730,24 @@ void World::Simulate(float deltaT, bool& enableDraw)
                         Vector3 focPos = renderDelta.FastTransform(cameraVehicle->CameraPosition());
                         Vector3 camPos = vehOrient * dist + focPos;
                         ClipCamera(camPos, cameraVehicle, focPos, _camMaxDist[_camType]);
+                        // ClipCamera tests objects only. On steep real-world relief (Whole World) a convex
+                        // slope between camera and body hid the player completely; lift the camera until
+                        // its line of sight to the focus clears the ground in between.
+                        {
+                            float needY = camPos.Y();
+                            for (int s = 2; s < 10; ++s)
+                            {
+                                const float t = s / 10.0f; // fraction of the way from the focus to the camera
+                                const Vector3 p = focPos + (camPos - focPos) * t;
+                                const float groundY = GLandscape->SurfaceY(p.X(), p.Z()) + 0.3f;
+                                if (groundY > p.Y())
+                                {
+                                    saturateMax(needY, focPos.Y() + (groundY - focPos.Y()) / t);
+                                }
+                            }
+                            const float maxLift = (camPos - focPos).Size();
+                            camPos[1] = std::min(needY, camPos.Y() + maxLift);
+                        }
                         transform.SetPosition(camPos);
                         camChange = M3Identity;
                         camInsideVehicle = nullptr;
@@ -1724,11 +1788,13 @@ void World::Simulate(float deltaT, bool& enableDraw)
             // Sinkhole W3: on a swimmer the floor is the waves, not the flat mean sea -- in first person none
             // at all (the swim keeps his eyes over the water; a trough lifted the view into his head), in 3rd
             // person the wave surface under the camera, so it rides over the crests.
+            // Sinkhole W4: on a diver the view goes under with him, held only above the bed.
             float swimWaterY = 0;
+            const bool diverView = SwimmerDiving(cameraVehicle.GetLink());
             const bool swimView =
                 !mayDive && SwimmerCameraWater(cameraVehicle.GetLink(), camPos.X(), camPos.Z(), swimWaterY);
             float minCamY = _scene.GetLandscape()->CameraFloorY(camPos, camFocusObj ? &camFocus : nullptr,
-                                                                !mayDive && !swimView);
+                                                                !mayDive && !swimView && !diverView);
             if (swimView && _camType != CamInternal)
             {
                 minCamY = std::max(minCamY, swimWaterY + 0.15f);
@@ -1766,6 +1832,30 @@ void World::Simulate(float deltaT, bool& enableDraw)
                 }
             }
         }
+        // A non-finite view draws nothing at all, and every view after it eases from it, so the
+        // screen stayed black for good (Old Man after its intro: "camera -nan, -nan, -nan"). Such
+        // a frame keeps the last finite view; the first one says where it came from.
+        {
+            static Matrix4 lastFinite;
+            static bool haveFinite = false;
+            const auto finite = [](Vector3Par v)
+            { return std::isfinite(v.X()) && std::isfinite(v.Y()) && std::isfinite(v.Z()); };
+            if (finite(transform.Position()) && finite(transform.Direction()) && finite(transform.DirectionUp()))
+            {
+                lastFinite = transform;
+                haveFinite = true;
+            }
+            else
+            {
+                static int reported = 0;
+                if (reported++ < 3)
+                    LOG_WARN(World, "Camera view not finite (camType {}, effect {}, on {}): kept the last finite view",
+                             static_cast<int>(_camType), _cameraEffect ? "yes" : "no",
+                             cameraVehicle ? (const char*)cameraVehicle->GetDebugName() : "none");
+                if (haveFinite)
+                    transform = lastFinite;
+            }
+        }
         camera.SetTransform(transform);
 
         if (cameraVehicle)
@@ -1792,6 +1882,10 @@ void World::Simulate(float deltaT, bool& enableDraw)
         // normal soldier fov is about 0.85
         float cNear = 0.067f / fov;
         saturate(cNear, 0.07f, 0.2f);
+        // Through 3D sights the rear sight sits a few centimetres from the eye; a zoomed
+        // view's 0.2 m near plane would cut the sights away.
+        if (_camType == CamGunner && camAI && camAI->LooksThroughSights(PlayerOn()))
+            cNear = 0.07f;
         // FAR-001: the far plane and the fog range were literally this one
         // expression -- `GetFogMaxRange()` was handed straight in as `cFar`, which
         // is why an aircraft above ~900 m flew over a world that had stopped being
@@ -1845,6 +1939,7 @@ void World::Simulate(float deltaT, bool& enableDraw)
         {
             _options->SimulateHUD(nullptr);
         }
+        Arma2CampaignAutoStep(); // OP_A2_CAMPAIGN only: walk a campaign unattended
         if (!HasOptions() && _cameraOn != nullptr && !_userDlg)
         {
             if (_ui && IsUIEnabled())
@@ -1928,15 +2023,30 @@ void World::Simulate(float deltaT, bool& enableDraw)
         // so probing once is safe.
         if (GLandscape && GEngine)
         {
+            // Arma 2 worlds (Chernarus, Utes, Takistan) keep their map objects ONLY in the
+            // streamed placement list, so with no residency update an OpenGL 3.3 run had no
+            // buildings, no trees and no ship: C0_FirstToFight's crew stood on the water where
+            // Utes' LHD should be (census: 0-1 map models within 150 m on every Arma 2
+            // mission). The residency update creates ordinary Objects, which every renderer
+            // draws; it now runs on every engine. OP_RESIDENCY_WGPU_ONLY=1 restores the gate.
             static const bool modernObjectsEngine = []
             {
+                const char* only = std::getenv("OP_RESIDENCY_WGPU_ONLY");
+                if (!(only && *only == '1'))
+                    return true;
                 Engine::ObjectStatsOut probe;
                 return GEngine->GetObjectStats(probe);
             }();
             Camera* residencyCamera = _scene.GetCamera();
+            static const bool farTierEngine = []
+            {
+                Engine::ObjectStatsOut probe;
+                return GEngine->GetObjectStats(probe);
+            }();
             if (modernObjectsEngine && residencyCamera)
             {
-                farResidencySupported = true;
+                // the far instance tier is the WGPU renderer's own; only it gets that update
+                farResidencySupported = farTierEngine;
                 GLandscape->UpdateModernObjectResidency(residencyCamera->Position());
             }
         }
@@ -1969,6 +2079,8 @@ void World::Simulate(float deltaT, bool& enableDraw)
         // outside BeginObjects/EndObjects silently draws nothing, which reads as
         // "the ball does not exist" while the physics log shows it rolling.
         Dev::DrawPhysicsProbes();
+        // BOOM-002: chunks of breached walls (Box3D bodies), same window.
+        BuildingBreach::DrawDebris();
     }
 
     markInitProbe(beginObjectsMs);
@@ -1984,6 +2096,10 @@ void World::Simulate(float deltaT, bool& enableDraw)
     markInitProbe(activeLightsMs);
     perf.Mark(Dev::FrameProfiler::PhaseDrawInit);
 
+    // Optics and other screen overlays drawn from inside the world pass are queued and
+    // drawn display-referred right after the scene resolve below (Object::FlushDeferredOverlays).
+    Object::BeginDeferredOverlays();
+
     if (_scene.GetLandscape())
     {
         // remove all vehicles that should be removed
@@ -1994,7 +2110,10 @@ void World::Simulate(float deltaT, bool& enableDraw)
 
         if (enableDraw)
         {
-            if (!_showMap && IsDisplayEnabled() && !suppressWorld)
+            // HasMap, not _showMap: the map hides the world only when there is one. Old Man starts
+            // with _showMap set and no map display (shownMap true, visibleMap false), and the world
+            // went black once its intro camera handed back to the player.
+            if (!HasMap() && IsDisplayEnabled() && !suppressWorld)
             {
                 {
                     LandBegEnd objBegEnd;
@@ -2042,12 +2161,31 @@ void World::Simulate(float deltaT, bool& enableDraw)
                         zMax = ObjRange - 1;
                     }
 #define RECT_CLIPPERS 1
+                    // PERF (2026-10-14): this walk touches every object of every cell in view,
+                    // and each first touch -- a virtual Invisible() through the vtable pointer --
+                    // was a cache miss: ~7% of a stock-Everon firefight's main thread sat on
+                    // those loads. The pointers are known ahead, so fetch the next cell's list
+                    // and the objects a few places ahead while this one is processed. Pure
+                    // hints: order and results are untouched. POSEIDON_DRAW_WALK_PREFETCH=0
+                    // turns them off for an A/B.
+                    static const bool walkPrefetch = []
+                    {
+                        const char* v = std::getenv("POSEIDON_DRAW_WALK_PREFETCH");
+                        return !(v && v[0] == '0');
+                    }();
                     for (z = zMin; z <= zMax; z++)
                     {
                         for (x = xMin; x <= xMax; x++)
                         {
                             // build if necessary
                             const ObjectList& list = GLandscape->GetObjects(z, x);
+                            if (walkPrefetch && x < xMax)
+                            {
+                                if (const ObjectListFull* next = GLandscape->GetObjects(z, x + 1).GetList())
+                                {
+                                    PrefetchT0(next);
+                                }
+                            }
                             if (list.Null())
                             {
                                 continue;
@@ -2065,10 +2203,24 @@ void World::Simulate(float deltaT, bool& enableDraw)
 #endif
                             ClipFlags orClip = cam.MayBeClipped(bCenter, bRadius, 1);
                             int n = list.Size();
+                            constexpr int kPrefetchAhead = 4;
+                            if (walkPrefetch)
+                            {
+                                for (int i = 0; i < n && i < kPrefetchAhead; i++)
+                                {
+                                    PrefetchT0(list[i]);
+                                    PrefetchT0Off(list[i], 64);
+                                }
+                            }
                             for (int i = 0; i < n; i++)
                             {
                                 Object* obj = list[i];
                                 PoseidonAssert(obj);
+                                if (walkPrefetch && i + kPrefetchAhead < n)
+                                {
+                                    PrefetchT0(list[i + kPrefetchAhead]);
+                                    PrefetchT0Off(list[i + kPrefetchAhead], 64);
+                                }
                                 if (obj->Invisible())
                                 {
                                     continue;
@@ -2183,6 +2335,7 @@ void World::Simulate(float deltaT, bool& enableDraw)
     // UI composites display-referred. No-op on GL33.
     if (GEngine)
         GEngine->ResolveSceneToDisplay();
+    Object::FlushDeferredOverlays();
 
     if (enableDraw)
     {
@@ -2205,7 +2358,9 @@ void World::Simulate(float deltaT, bool& enableDraw)
                     person->DrawNVOptics();
                 }
 
-                _ui->DrawHUD(*_scene.GetCamera(), camAI, _camType);
+                // a script may hide it (showHUD false: Arma 3's cinematics)
+                if (Arma3Rsc::HudShown())
+                    _ui->DrawHUD(*_scene.GetCamera(), camAI, _camType);
             }
             else if (camVehicle)
             {
@@ -2267,14 +2422,23 @@ void World::Simulate(float deltaT, bool& enableDraw)
 
         if (IsSimulationEnabled())
         {
+            // the numbered layers below 0 first, then layer 0, then those above it
+            for (auto& [layer, effect] : _cutLayers)
+                if (layer < 0)
+                    effect->Draw();
             if (_cutEffect)
             {
                 _cutEffect->Draw();
             }
+            for (auto& [layer, effect] : _cutLayers)
+                if (layer > 0)
+                    effect->Draw();
             if (_titleEffect)
             {
                 _titleEffect->Draw();
             }
+            // Arma 3's controls made by script on its title displays (Old Man's animated opening)
+            Arma3Menu::Script::Draw();
         }
     } // if (enableDraw)
 
@@ -2309,9 +2473,28 @@ void World::Simulate(float deltaT, bool& enableDraw)
         // registration may acquire the exclusive renderer window; do it after
         // traversal so it cannot serialize the whole producer at InitDraw.
         // NextFrame still owns queue publication and GPU-side mutation ordering.
+        const auto tSwap0 = std::chrono::steady_clock::now();
         if (farResidencySupported && GLandscape && _scene.GetCamera())
             GLandscape->UpdateNativeFarResidency(_scene.GetCamera()->Position());
+        const auto tSwap1 = std::chrono::steady_clock::now();
+        if (farResidencySupported && GLandscape && _scene.GetCamera())
+            GEngine->UpdateNativeClutter(_scene.GetCamera()->Position());
+        const auto tSwap2 = std::chrono::steady_clock::now();
         GEngine->NextFrame();
+        // The swap phase is these three calls; a frame-trace spike in swap_ms says nothing about
+        // which. POSEIDON_SWAP_SLOW_MS (default 60, 0 = off) names the one that took the time.
+        static const double swapSlowMs = [] {
+            const char* v = std::getenv("POSEIDON_SWAP_SLOW_MS");
+            return (v != nullptr && v[0] != 0) ? std::atof(v) : 60.0;
+        }();
+        if (swapSlowMs > 0.0)
+        {
+            const auto tSwap3 = std::chrono::steady_clock::now();
+            const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            if (ms(tSwap0, tSwap3) >= swapSlowMs)
+                LOG_INFO(World, "Slow swap: {:.1f} ms | native far {:.1f} clutter {:.1f} NextFrame {:.1f}",
+                         ms(tSwap0, tSwap3), ms(tSwap0, tSwap1), ms(tSwap1, tSwap2), ms(tSwap2, tSwap3));
+        }
     }
 
     perf.Mark(Dev::FrameProfiler::PhaseSwap);
@@ -2444,12 +2627,16 @@ void World::StepSimulation(float deltaT, float noAccDeltaT, Entity* cameraVehicl
                                 switch (stage)
                                 {
                                 case Sim::SimStage::Clock:
+                                {
                                     // Keep the world clock, weather and wind in the same tick as the
                                     // vehicles that consume them. Rendering observes the most recently
                                     // completed tick.
+                                    const float before = Glob.time.toFloat();
                                     Glob.time += step.deltaT;
+                                    NoteClockTick(before, Glob.time.toFloat());
                                     world.SimulateLandscape(step.deltaT);
                                     break;
+                                }
 
                                 case Sim::SimStage::Scripts:
                                     // After the clock so a script observing `time` sees this tick's

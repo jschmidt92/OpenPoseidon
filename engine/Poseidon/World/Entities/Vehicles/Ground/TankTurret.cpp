@@ -308,11 +308,72 @@ void TurretType::InitShape(const ParamEntry& cfg, LODShape* shape)
              (const char*)shape->GetName(), (const char*)turretAxis, _yAxis.X(), _yAxis.Y(), _yAxis.Z(),
              (const char*)gunAxis, _xAxis.X(), _xAxis.Y(), _xAxis.Z(), (const char*)gunBeg, _pos.X(), _pos.Y(), _pos.Z());
 
+    LOG_WARN(Graphics, "TurretType::InitShape {}: gunBeg '{}' {} gunEnd '{}' {} dir {} {} {} turn {:.0f}..{:.0f} elev {:.0f}..{:.0f}",
+             (const char*)shape->GetName(), (const char*)gunBeg, shape->MemoryPointExists(gunBeg) ? "found" : "MISSING",
+             (const char*)gunEnd, shape->MemoryPointExists(gunEnd) ? "found" : "MISSING", _dir.X(), _dir.Y(), _dir.Z(),
+             _minTurn * (180 / H_PI), _maxTurn * (180 / H_PI), _minElev * (180 / H_PI), _maxElev * (180 / H_PI));
+
+    _muzzle = shape->MemoryPointExists(gunBeg) ? shape->MemoryPoint(gunBeg) : _pos;
+
     RString bodyName = cfg >> "body";
     RString gunName = cfg >> "gun";
 
     _body.Init(shape, bodyName, nullptr);
     _gun.Init(shape, gunName, nullptr);
+}
+
+namespace
+{
+RStringB VehicleName(const ParamEntry& vehicle, const char* key)
+{
+    const ParamEntry* e = vehicle.FindEntry(key);
+    if (!e || e->IsClass() || e->IsArray())
+        return RStringB();
+    return *e;
+}
+} // namespace
+
+Vector3 ConfigMemoryPoint(const ParamEntry& vehicle, LODShape* shape, const char* key, const char* fallback)
+{
+    const RStringB name = VehicleName(vehicle, key);
+    if (name.GetLength() > 0 && shape->MemoryPointExists(name))
+        return shape->MemoryPoint(name);
+    return shape->MemoryPoint(fallback);
+}
+
+bool TurretType::ArmaGunPoints(const ParamEntry& vehicle, LODShape* shape)
+{
+    const RStringB beg = VehicleName(vehicle, "a1GunBeg");
+    const RStringB end = VehicleName(vehicle, "a1GunEnd");
+    const RStringB gun = VehicleName(vehicle, "a1GunPoint");
+    bool changed = false;
+    if (beg.GetLength() > 0 && end.GetLength() > 0 && shape->MemoryPointExists(beg) && shape->MemoryPointExists(end))
+    {
+        const Vector3 b = shape->MemoryPoint(beg);
+        const Vector3 e = shape->MemoryPoint(end);
+        if (b.Distance2(e) > 1e-6f)
+        {
+            _pos = (b + e) * 0.5f;
+            _dir = (b - e).Normalized();
+            _muzzle = b;
+            _neutralXRot = atan2(_dir.Y(), _dir.SizeXZ());
+            changed = true;
+        }
+    }
+    // Arma fires from memoryPointGun: the Mi-17's PKT and the AH-1Z's M197, whose models
+    // have no "usti hlavne" -- CWA's point read as the model origin, up over the engines
+    if (gun.GetLength() > 0 && shape->MemoryPointExists(gun))
+    {
+        _pos = shape->MemoryPoint(gun);
+        if (!changed)
+            _muzzle = _pos;
+        changed = true;
+    }
+    if (changed)
+        LOG_INFO(Graphics, "{}: Arma gun points '{}'/'{}'/'{}' -> fires from {:.2f},{:.2f},{:.2f} dir {:.2f},{:.2f},{:.2f}",
+                 (const char*)shape->GetName(), (const char*)beg, (const char*)end, (const char*)gun, _pos.X(), _pos.Y(),
+                 _pos.Z(), _dir.X(), _dir.Y(), _dir.Z());
+    return changed;
 }
 
 Turret::Turret()
@@ -546,6 +607,7 @@ Vector3 Turret::GetCenter(const TurretType& type) const
 void Turret::AnimatePoint(const TurretType& type, Vector3& pos, const Object* obj, int level, int index) const
 {
     Shape* shape = obj->GetShape()->Level(level);
+    bool onGun = false;
     int selI = type._gun.GetSelection(level);
     if (selI >= 0)
     {
@@ -555,9 +617,11 @@ void Turret::AnimatePoint(const TurretType& type, Vector3& pos, const Object* ob
             // apply gun transformation
             Matrix4Val gunTransform = GunTransform(type);
             pos = gunTransform.FastTransform(pos);
+            onGun = true;
         }
     }
 
+    bool onBody = false;
     selI = type._body.GetSelection(level);
     if (selI >= 0)
     {
@@ -567,21 +631,36 @@ void Turret::AnimatePoint(const TurretType& type, Vector3& pos, const Object* ob
             // apply turret transformation
             Matrix4Val turTransform = TurretTransform(type);
             pos = turTransform.FastTransform(pos);
+            onBody = true;
         }
     }
+    // The gun rides on the turret. OFP models say so by selection (every gun point is a
+    // turret point too); Arma models through their skeleton instead, so a gun point need not
+    // be in the turret selection -- the HMMWV M2's muzzle in the memory LOD -- and the gun
+    // then only elevated, never traversed: its gunner saw his target and never fired.
+    if (onGun && !onBody)
+        pos = TurretTransform(type).FastTransform(pos);
 }
 
 void Turret::AnimateMatrix(const TurretType& type, Matrix4& mat, const Object* obj, int level, int selection) const
 {
-    if (selection < 0)
+    if (selection < 0 || !obj || !obj->GetShape() || level < 0)
     {
         return;
     }
+    // A level that is not loaded (a camera asking for a proxy of an Arma 2 helicopter as its
+    // driver is moved in by a script: str_EW2's FSM, 0xC0000005 here in run 39) has nothing
+    // to animate.
     Shape* shape = obj->GetShape()->Level(level);
+    if (!shape || selection >= shape->NNamedSel())
+    {
+        return;
+    }
     const NamedSelection& sel = shape->NamedSel(selection);
 
+    bool onGun = false;
     int selI = type._gun.GetSelection(level);
-    if (selI >= 0)
+    if (selI >= 0 && selI < shape->NNamedSel())
     {
         // check if sel is whole contained in particular selection
         const NamedSelection& tSel = shape->NamedSel(selI);
@@ -590,10 +669,12 @@ void Turret::AnimateMatrix(const TurretType& type, Matrix4& mat, const Object* o
             // apply turret animation to this proxy
             Matrix4Val transform = GunTransform(type);
             mat = transform * mat;
+            onGun = true;
         }
     }
+    bool onBody = false;
     selI = type._body.GetSelection(level);
-    if (selI >= 0)
+    if (selI >= 0 && selI < shape->NNamedSel())
     {
         // check if sel is whole contained in particular selection
         const NamedSelection& tSel = shape->NamedSel(selI);
@@ -602,8 +683,13 @@ void Turret::AnimateMatrix(const TurretType& type, Matrix4& mat, const Object* o
             // apply turret animation to this proxy
             Matrix4Val transform = TurretTransform(type);
             mat = transform * mat;
+            onBody = true;
         }
     }
+    // The gun rides on the turret even where its selection is not inside the turret's (Arma
+    // models, see AnimatePoint).
+    if (onGun && !onBody)
+        mat = TurretTransform(type) * mat;
 }
 
 void Turret::Stabilize(const Object* obj, const TurretType& type, Matrix3Val oldTrans, Matrix3Val newTrans)

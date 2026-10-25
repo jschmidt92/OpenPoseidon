@@ -34,8 +34,9 @@ pub struct Gfx2d {
     globals_bind: wgpu::BindGroup,
     // [depth_mode][blend]: depth mode = WgrDepthMode (none / test / test+write).
     // `pipelines` -> scene colour target; `pipelines_display` -> swapchain (UI phase).
-    pipelines: [[wgpu::RenderPipeline; 3]; 3],
-    pipelines_display: [[wgpu::RenderPipeline; 3]; 3],
+    // Row 3 is WGR_DEPTH_TEST_WRITE_CUTOUT (4): test + write with fs_cutout.
+    pipelines: [[wgpu::RenderPipeline; 3]; 4],
+    pipelines_display: [[wgpu::RenderPipeline; 3]; 4],
     // SMK-037: depth mode 3 (WGR_DEPTH_TEST_SOFT). Same depth state as mode 1 -- test,
     // no write -- but a fourth bind group carrying the scene-depth snapshot and the
     // fs_soft entry point that fades against it. A separate pipeline LAYOUT, so the three
@@ -121,11 +122,11 @@ impl Gfx2d {
         // pos(x,y,z), (rhw, fog), uv, color.
         let attrs =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x2, 3 => Unorm8x4];
-        let vbuf_layout = wgpu::VertexBufferLayout {
+        let vbuf_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<WgrVertex2D>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &attrs,
-        };
+        });
 
         // (test, write): plain 2D / sky use (false,false); transparent meshes
         // (false… ) — see callers below. test gates GreaterEqual (reversed-Z) vs Always.
@@ -133,7 +134,8 @@ impl Gfx2d {
                              test: bool,
                              write: bool,
                              format: wgpu::TextureFormat,
-                             samples: u32| {
+                             samples: u32,
+                             fragment: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("wgr_2d_pipeline"),
                 layout: Some(&pipeline_layout),
@@ -166,7 +168,7 @@ impl Gfx2d {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
@@ -175,7 +177,7 @@ impl Gfx2d {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
 
@@ -207,9 +209,10 @@ impl Gfx2d {
         // resolve. Identical when HDR is off (surface_format == overlay_format).
         let make_set = |format: wgpu::TextureFormat, samples: u32| {
             [
-                std::array::from_fn(|b| make_pipeline(blends[b], false, false, format, samples)),
-                std::array::from_fn(|b| make_pipeline(blends[b], true, false, format, samples)),
-                std::array::from_fn(|b| make_pipeline(blends[b], true, true, format, samples)),
+                std::array::from_fn(|b| make_pipeline(blends[b], false, false, format, samples, "fs_main")),
+                std::array::from_fn(|b| make_pipeline(blends[b], true, false, format, samples, "fs_main")),
+                std::array::from_fn(|b| make_pipeline(blends[b], true, true, format, samples, "fs_main")),
+                std::array::from_fn(|b| make_pipeline(blends[b], true, true, format, samples, "fs_cutout")),
             ]
         };
         let pipelines = make_set(surface_format, sample_count);
@@ -282,7 +285,7 @@ impl Gfx2d {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get(&device),
             })
         };
         let pipelines_soft: [wgpu::RenderPipeline; 3] =
@@ -302,11 +305,11 @@ impl Gfx2d {
                 module: &overlay_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<WgrOverlayVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &overlay_attrs,
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -337,7 +340,7 @@ impl Gfx2d {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
 
         Gfx2d {
@@ -434,7 +437,11 @@ impl Gfx2d {
                     .unwrap_or(&set[WgrBlend::Alpha as usize])
             }
             None => {
-                let idx = if b.depth == 3 { 1 } else { b.depth as usize };
+                let idx = match b.depth {
+                    3 => 1, // soft without a snapshot: plain test
+                    4 => 3, // WGR_DEPTH_TEST_WRITE_CUTOUT
+                    d => d as usize,
+                };
                 let set = sets.get(idx).unwrap_or(&sets[0]);
                 set.get(b.blend as usize)
                     .unwrap_or(&set[WgrBlend::Alpha as usize])

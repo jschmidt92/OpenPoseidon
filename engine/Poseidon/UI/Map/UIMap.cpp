@@ -1,3 +1,4 @@
+#include <Poseidon/Game/Compat/ArmaOriginalUi.hpp>
 #include <Poseidon/UI/LocalMapWorlds.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/Input/CheatCode.hpp>
@@ -19,6 +20,19 @@
 
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <Poseidon/World/Terrain/Roads.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthFrame.hpp>
+#include <Poseidon/World/Terrain/EarthPlannerMap.hpp>
+#include <Poseidon/Graphics/Textures/TextureBank.hpp>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <future>
+#include <atomic>
+#include <thread>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/World/Detection/Detector.hpp>
@@ -339,7 +353,7 @@ CStaticMap::CStaticMap(ControlsContainer* parent, int idc, const ParamEntry& cls
 
     EnableCtrl(true);
 
-    const ParamEntry& cfgMap = Pars >> "CfgInGameUI" >> "IslandMap";
+    const ParamEntry& cfgMap = ArmaOriginalUi::Config("CfgInGameUI") >> "IslandMap";
     _iconPlayer = GlobLoadTexture(GetPictureName(cfgMap >> "iconPlayer"));
     _iconSelect = GlobLoadTexture(GetPictureName(cfgMap >> "iconSelect"));
     _iconCamera = GlobLoadTexture(GetPictureName(cfgMap >> "iconCamera"));
@@ -385,6 +399,9 @@ CStaticMap::CStaticMap(ControlsContainer* parent, int idc, const ParamEntry& cls
 
     _scaleMin = scaleMin;
     _scaleMax = scaleMax;
+    // Whole World: zoom out from the mission square to the whole planet (one map unit is the 12.8 km world).
+    if (EarthStreaming::Enabled())
+        _scaleMax = std::max(_scaleMax, 3200.0f);
     _scaleX = _scaleDefault = scaleDefault;
 
     Reset();
@@ -749,8 +766,387 @@ struct MountainList
     }
 };
 
+static void MapExtent(float& x0, float& x1, float& z0, float& z1);
+
+// Whole World: the landscape behind the editor/briefing map is an empty placeholder, so the map shows the
+// provider's satellite image of the world square around the chosen place instead (the origin anchors map
+// [6400,6400]). One 2048 px overview (~6 m/px over 12.8 km) under a 4x4 grid of 1024 px detail tiles
+// (~3 m/px), all built once per run on one worker through EarthPlannerMap, nearest the centre first.
+namespace
+{
+struct EarthMapPiece
+{
+    float x0, z0, x1, z1; // world square it covers
+    int size;
+    std::filesystem::path file;
+    Ref<Texture> texture;
+    bool ready = false;
+    bool under = false; // the 256 km regional image: drawn below the overview, between it and the globe
+};
+struct EarthMapImageryState
+{
+    std::vector<EarthMapPiece> pieces; // [0] = overview
+    // Detached on purpose: a std::future's destructor would hold process exit (and the editor's move-the-mission
+    // restart) until every remaining tile download finished. Exit sets `stop`; a running download ends with it.
+    std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
+    ~EarthMapImageryState() { stop->store(true); }
+    std::shared_ptr<std::vector<std::pair<int, std::string>>> done = std::make_shared<std::vector<std::pair<int, std::string>>>();
+    std::shared_ptr<std::mutex> lock = std::make_shared<std::mutex>();
+    std::string status = "Loading the satellite map...";
+    bool started = false;
+    Ref<Texture> globe; // the whole planet (provider overview, else NASA Blue Marble) for the zoomed-out map
+};
+
+EarthMapImageryState& EarthMapImagery()
+{
+    static EarthMapImageryState state;
+    if (state.started)
+    {
+        std::vector<std::pair<int, std::string>> finished;
+        {
+            std::lock_guard<std::mutex> guard(*state.lock);
+            finished.swap(*state.done);
+        }
+        for (const auto& [index, message] : finished)
+        {
+            auto& piece = state.pieces[index];
+            piece.ready = true;
+            if (!message.empty())
+            {
+                if (index == 0)
+                    state.status = message;
+                continue;
+            }
+            const auto name = piece.file.u8string();
+            piece.texture = GlobLoadTexture(RStringB(std::string(name.begin(), name.end()).c_str()));
+            if (index == 0)
+            {
+                state.status = piece.texture ? std::string() : "The satellite map could not be loaded as a texture.";
+                LOG_INFO(Graphics, "Whole World editor map: overview {}", piece.texture ? "loaded" : "FAILED");
+            }
+        }
+        return state;
+    }
+    state.started = true;
+    if (const char* cacheRoot = std::getenv("POSEIDON_EARTH_CACHE"))
+    {
+        // Any provider's complete overview (EarthImageryTiles::Overview), else the bundled NASA image.
+        std::filesystem::path globe;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::u8path(cacheRoot) / "imagery", ec))
+            if (std::filesystem::exists(entry.path() / "overview-v2-4096.jpg", ec))
+                globe = entry.path() / "overview-v2-4096.jpg";
+        if (globe.empty() && std::filesystem::exists(std::filesystem::u8path(cacheRoot) / "blue-marble-june-5400.jpg", ec))
+            globe = std::filesystem::u8path(cacheRoot) / "blue-marble-june-5400.jpg";
+        if (!globe.empty())
+        {
+            const auto name = globe.u8string();
+            state.globe = GlobLoadTexture(RStringB(std::string(name.begin(), name.end()).c_str()));
+        }
+    }
+    const auto builder = EarthPlannerMap::Hook();
+    const char* cache = std::getenv("POSEIDON_EARTH_CACHE");
+    const char* latText = std::getenv("POSEIDON_EARTH_LATITUDE");
+    const char* lonText = std::getenv("POSEIDON_EARTH_LONGITUDE");
+    if (!builder || !cache || !latText || !lonText)
+    {
+        state.status = "No satellite map: whole-world imagery is not available in this renderer.";
+        return state;
+    }
+    const double lat = std::atof(latText), lon = std::atof(lonText);
+    const float size = LandGrid * LandRange;
+    const auto cacheDir = std::filesystem::u8path(cache);
+    const auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    state.pieces.push_back({0, 0, size, size, 2048, cacheDir / "planner" / ("editor-" + stamp + "-all.png")});
+    // A 256 km regional image (~125 m/px) so the middle zoom range is not the blurry planet image.
+    state.pieces.push_back({Earth::Anchor - 128000.0f, Earth::Anchor - 128000.0f, Earth::Anchor + 128000.0f,
+                            Earth::Anchor + 128000.0f, 2048, cacheDir / "planner" / ("editor-" + stamp + "-region.png")});
+    state.pieces.back().under = true;
+    constexpr int Grid = 4;
+    std::vector<std::pair<float, int>> order;
+    for (int j = 0; j < Grid; ++j)
+        for (int i = 0; i < Grid; ++i)
+        {
+            const float step = size / Grid;
+            state.pieces.push_back({i * step, j * step, (i + 1) * step, (j + 1) * step, 1024,
+                                    cacheDir / "planner" / ("editor-" + stamp + "-" + std::to_string(i) + "-" + std::to_string(j) + ".png")});
+            const float dx = (i + 0.5f) * step - 0.5f * size, dz = (j + 0.5f) * step - 0.5f * size;
+            order.push_back({dx * dx + dz * dz, int(state.pieces.size()) - 1});
+        }
+    std::sort(order.begin(), order.end());
+    std::vector<int> sequence = {0, 1};
+    for (const auto& item : order)
+        sequence.push_back(item.second);
+    struct Job
+    {
+        int index;
+        double south, west, north, east;
+        int size;
+        std::filesystem::path file;
+    };
+    std::vector<Job> jobs;
+    for (int index : sequence)
+    {
+        const auto& piece = state.pieces[index];
+        try
+        {
+            const auto sw = Earth::FromLocal(lat, lon, piece.x0, piece.z0), ne = Earth::FromLocal(lat, lon, piece.x1, piece.z1);
+            jobs.push_back({index, sw.latitude, sw.longitude, ne.latitude, ne.longitude, piece.size, piece.file});
+        }
+        catch (...)
+        {
+        }
+    }
+    auto done = state.done;
+    auto lock = state.lock;
+    const auto stop = state.stop;
+    std::thread([=]
+    {
+        for (const auto& job : jobs)
+        {
+            if (stop->load())
+                return;
+            std::string message;
+            const bool ok = builder(cacheDir, job.south, job.west, job.north, job.east, job.size, job.file, message,
+                                    [stop] { return stop->load(); });
+            if (stop->load())
+                return;
+            std::lock_guard<std::mutex> guard(*lock);
+            done->push_back({job.index, ok ? std::string() : (message.empty() ? std::string("No imagery.") : message)});
+        }
+    }).detach();
+    return state;
+}
+
+// Whole World: the OpenStreetMap roads over the satellite map, so the planner can see where the
+// streets are (the 3D roads come from the same cells). Fetched on one worker in 3 x 3 sub-squares,
+// nearest the centre first, each shown as it arrives.
+struct EarthMapRoad
+{
+    EarthPlannerMap::Road road;
+    float x0, z0, x1, z1; // bounds, for culling
+};
+struct EarthMapRoadsState
+{
+    std::vector<EarthMapRoad> roads;
+    std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
+    ~EarthMapRoadsState() { stop->store(true); }
+    std::shared_ptr<std::vector<EarthPlannerMap::Road>> done = std::make_shared<std::vector<EarthPlannerMap::Road>>();
+    std::shared_ptr<std::mutex> lock = std::make_shared<std::mutex>();
+    bool started = false;
+};
+
+EarthMapRoadsState& EarthMapRoads()
+{
+    static EarthMapRoadsState state;
+    if (state.started)
+    {
+        std::vector<EarthPlannerMap::Road> arrived;
+        {
+            std::lock_guard<std::mutex> guard(*state.lock);
+            arrived.swap(*state.done);
+        }
+        for (auto& road : arrived)
+        {
+            EarthMapRoad r{std::move(road), 1e30f, 1e30f, -1e30f, -1e30f};
+            for (size_t i = 0; i + 1 < r.road.xz.size(); i += 2)
+            {
+                r.x0 = std::min(r.x0, r.road.xz[i]), r.x1 = std::max(r.x1, r.road.xz[i]);
+                r.z0 = std::min(r.z0, r.road.xz[i + 1]), r.z1 = std::max(r.z1, r.road.xz[i + 1]);
+            }
+            state.roads.push_back(std::move(r));
+        }
+        return state;
+    }
+    state.started = true;
+    const auto builder = EarthPlannerMap::RoadsHook();
+    const char* cache = std::getenv("POSEIDON_EARTH_CACHE");
+    const char* latText = std::getenv("POSEIDON_EARTH_LATITUDE");
+    const char* lonText = std::getenv("POSEIDON_EARTH_LONGITUDE");
+    if (!builder || !cache || !latText || !lonText)
+        return state;
+    const double lat = std::atof(latText), lon = std::atof(lonText);
+    const float size = LandGrid * LandRange;
+    const auto cacheDir = std::filesystem::u8path(cache);
+    struct Job
+    {
+        double south, west, north, east;
+    };
+    std::vector<std::pair<float, Job>> order;
+    constexpr int Grid = 3;
+    const float step = size / Grid;
+    for (int j = 0; j < Grid; ++j)
+        for (int i = 0; i < Grid; ++i)
+            try
+            {
+                const auto sw = Earth::FromLocal(lat, lon, i * step, j * step);
+                const auto ne = Earth::FromLocal(lat, lon, (i + 1) * step, (j + 1) * step);
+                const float dx = (i + 0.5f) * step - 0.5f * size, dz = (j + 0.5f) * step - 0.5f * size;
+                order.push_back({dx * dx + dz * dz, Job{sw.latitude, sw.longitude, ne.latitude, ne.longitude}});
+            }
+            catch (...)
+            {
+            }
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    auto done = state.done;
+    auto lock = state.lock;
+    const auto stop = state.stop;
+    std::thread([=]
+    {
+        size_t total = 0;
+        for (const auto& [distance, job] : order)
+        {
+            if (stop->load())
+                return;
+            std::vector<EarthPlannerMap::Road> roads;
+            std::string message;
+            builder(cacheDir, lat, lon, job.south, job.west, job.north, job.east, roads, message,
+                    [stop] { return stop->load(); });
+            if (stop->load())
+                return;
+            total += roads.size();
+            std::lock_guard<std::mutex> guard(*lock);
+            for (auto& road : roads)
+                done->push_back(std::move(road));
+        }
+        LOG_INFO(Graphics, "Whole World editor map: {} OpenStreetMap roads", total);
+    }).detach();
+    return state;
+}
+} // namespace
+
+// Whole World: the planner's roads, over the satellite image (OSM ways; see EarthMapRoads)
+void CStaticMap::DrawEarthRoads()
+{
+    auto& state = EarthMapRoads();
+    if (state.roads.empty())
+        return;
+    // pixels per metre at this zoom
+    const DrawCoord o = WorldToScreen(Vector3(0, 0, 0)), e = WorldToScreen(Vector3(100, 0, 0));
+    const float ppm = std::fabs(e.x - o.x) * _wScreen / 100.0f;
+    float vx0, vx1, vz0, vz1;
+    {
+        const Point2DFloat tl(_x, _y), br(_x + _w, _y + _h);
+        const Vector3 a = ScreenToWorld(tl), b = ScreenToWorld(br);
+        vx0 = std::min(a.X(), b.X()), vx1 = std::max(a.X(), b.X());
+        vz0 = std::min(a.Z(), b.Z()), vz1 = std::max(a.Z(), b.Z());
+    }
+    using Road = EarthPlannerMap::Road;
+    const PackedColor colors[3] = {PackedColor(Color(0.95f, 0.62f, 0.2f, 1.0f)), PackedColor(Color(0.97f, 0.95f, 0.86f, 0.95f)),
+                                   PackedColor(Color(0.62f, 0.48f, 0.32f, 0.9f))};
+    const PackedColor casing(Color(0.15f, 0.12f, 0.1f, 0.75f));
+    for (const auto& r : state.roads)
+    {
+        // zoomed out, the small ways would be a grey felt: tracks from ~1 px/10 m, the rest from ~1 px/40 m
+        if (r.road.kind == Road::Track && ppm < 0.1f)
+            continue;
+        if (r.road.kind == Road::Minor && ppm < 0.025f)
+            continue;
+        if (r.x1 < vx0 || r.x0 > vx1 || r.z1 < vz0 || r.z0 > vz1)
+            continue;
+        const float widthPx = std::max(r.road.width * ppm, r.road.kind == Road::Major ? 2.0f : 1.0f);
+        const PackedColor color = colors[r.road.kind];
+        for (size_t i = 0; i + 3 < r.road.xz.size(); i += 2)
+        {
+            const DrawCoord a = WorldToScreen(Vector3(r.road.xz[i], 0, r.road.xz[i + 1]));
+            const DrawCoord b = WorldToScreen(Vector3(r.road.xz[i + 2], 0, r.road.xz[i + 3]));
+            const float ax = a.x * _wScreen, ay = a.y * _hScreen, bx = b.x * _wScreen, by = b.y * _hScreen;
+            if (widthPx < 2.5f)
+            {
+                GEngine->DrawLine(Line2DPixel(ax, ay, bx, by), color, color, _clipRect);
+                continue;
+            }
+            // a band the road's width, on a dark casing a pixel wider each side
+            const float dx = bx - ax, dy = by - ay, len = std::sqrt(dx * dx + dy * dy);
+            if (len < 0.5f)
+                continue;
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                const float h = 0.5f * widthPx + (pass == 0 ? 1.0f : 0.0f);
+                const float nx = -dy / len * h, ny = dx / len * h;
+                Vertex2DPixel vs[4];
+                const float xs[4] = {ax + nx, bx + nx, bx - nx, ax - nx}, ys[4] = {ay + ny, by + ny, by - ny, ay - ny};
+                for (int k = 0; k < 4; ++k)
+                {
+                    vs[k].x = xs[k];
+                    vs[k].y = ys[k];
+                    vs[k].u = 0;
+                    vs[k].v = 0;
+                    vs[k].color = pass == 0 ? casing : color;
+                }
+                MipInfo mip = GEngine->TextBank()->UseMipmap(nullptr, 0, 0);
+                GEngine->DrawPoly(mip, vs, 4, _clipRect);
+            }
+        }
+    }
+}
+
 void CStaticMap::DrawBackground()
 {
+    if (EarthStreaming::Enabled())
+    {
+        auto& imagery = EarthMapImagery();
+        const float size = LandGrid * LandRange;
+        const auto drawSquare = [&](float x0, float z0, float x1, float z1, Texture* texture, PackedColor color)
+        {
+            const DrawCoord topLeft = WorldToScreen(Vector3(x0, 0, z1)), bottomRight = WorldToScreen(Vector3(x1, 0, z0));
+            const Rect2DPixel rect(topLeft.x * _wScreen, topLeft.y * _hScreen, (bottomRight.x - topLeft.x) * _wScreen,
+                                   (bottomRight.y - topLeft.y) * _hScreen);
+            Draw2DPars pars;
+            pars.mip = GLOB_ENGINE->TextBank()->UseMipmap(texture, 0, 0);
+            pars.SetColor(color);
+            pars.spec = NoZBuf | IsAlpha | IsAlphaFog;
+            pars.SetU(0, 1);
+            pars.SetV(0, 1);
+            GEngine->Draw2D(pars, rect, _clipRect);
+        };
+        if (imagery.globe)
+        {
+            // The planet behind the mission square, equirectangular about the chosen place: east/north metres
+            // from the anchor follow longitude/latitude, which matches the local frame near it.
+            float x0, x1, z0, z1;
+            MapExtent(x0, x1, z0, z1);
+            // The image spans longitude -180..180; shift it (wrapping) so the chosen longitude is in the middle.
+            const char* lonText = std::getenv("POSEIDON_EARTH_LONGITUDE");
+            const float u0 = float((lonText ? std::atof(lonText) : 0.0) / 360.0);
+            const DrawCoord topLeft = WorldToScreen(Vector3(x0, 0, z1)), bottomRight = WorldToScreen(Vector3(x1, 0, z0));
+            Draw2DPars pars;
+            pars.mip = GLOB_ENGINE->TextBank()->UseMipmap(imagery.globe, 0, 0);
+            pars.SetColor(PackedColor(Color(1, 1, 1, 1)));
+            pars.spec = NoZBuf | IsAlpha | IsAlphaFog | NoClamp;
+            pars.SetU(u0, u0 + 1.0f);
+            pars.SetV(0, 1);
+            GEngine->Draw2D(pars, Rect2DPixel(topLeft.x * _wScreen, topLeft.y * _hScreen, (bottomRight.x - topLeft.x) * _wScreen,
+                                              (bottomRight.y - topLeft.y) * _hScreen), _clipRect);
+        }
+        for (const auto& piece : imagery.pieces)
+            if (piece.under && piece.texture)
+                drawSquare(piece.x0, piece.z0, piece.x1, piece.z1, piece.texture.GetRef(), PackedColor(Color(1, 1, 1, 1)));
+        const bool overview = !imagery.pieces.empty() && imagery.pieces[0].texture;
+        drawSquare(0, 0, size, size, overview ? imagery.pieces[0].texture.GetRef() : nullptr,
+                   overview ? PackedColor(Color(1, 1, 1, 1)) : PackedColor(Color(0.16f, 0.18f, 0.2f, 1)));
+        for (size_t i = 1; i < imagery.pieces.size(); ++i)
+            if (const auto& piece = imagery.pieces[i]; piece.texture && !piece.under)
+                drawSquare(piece.x0, piece.z0, piece.x1, piece.z1, piece.texture.GetRef(), PackedColor(Color(1, 1, 1, 1)));
+        DrawEarthRoads();
+        // The mission square: units, triggers and the 3D world live inside it.
+        {
+            const DrawCoord a = WorldToScreen(Vector3(0, 0, size)), b = WorldToScreen(Vector3(size, 0, 0));
+            const PackedColor edge(Color(1, 0.85f, 0.2f, 0.9f));
+            const float l = a.x * _wScreen, t = a.y * _hScreen, r = b.x * _wScreen, d = b.y * _hScreen;
+            GEngine->DrawLine(Line2DPixel(l, t, r, t), edge, edge, _clipRect);
+            GEngine->DrawLine(Line2DPixel(r, t, r, d), edge, edge, _clipRect);
+            GEngine->DrawLine(Line2DPixel(r, d, l, d), edge, edge, _clipRect);
+            GEngine->DrawLine(Line2DPixel(l, d, l, t), edge, edge, _clipRect);
+        }
+        std::string text = imagery.status;
+        if (text.empty() && _scaleX > 2.0f)
+            text = "Double-click outside the yellow square to move the mission there";
+        if (!text.empty() && _font)
+            GEngine->DrawText(Point2DFloat(_x + 0.02f, _y + 0.02f), _size * 0.55f, Rect2DFloat(_x, _y, _w, _h), _font,
+                              PackedColor(Color(1, 1, 1, 1)), text.c_str());
+        return;
+    }
     float invLandRange = 1.0 / LandRange;
     float ptsLand = 800.0 * _invScaleX * invLandRange; // avoid dependece on video resolution
     float invPtsLand = 1.0 / ptsLand;
@@ -1053,6 +1449,12 @@ void CStaticMap::DrawBackground()
         for (int i = 0; i < mountains.Size(); i++)
         {
             const Vector3& pos = mountains[i];
+            // The quadtree covers [0, 2^30) only: a negative or non-finite peak (NaN converts to
+            // INT_MIN) would make Set() grow the tree until its size shift overflowed. Such a peak
+            // cannot be placed on the map anyway.
+            if (!std::isfinite(pos.X()) || !std::isfinite(pos.Z()) || pos.X() < 0.0f || pos.Z() < 0.0f ||
+                pos.X() >= 1.0e9f || pos.Z() >= 1.0e9f)
+                continue;
             // check if given pos is in the visible range
             int x = toLargeInt(pos.X());
             int z = toLargeInt(pos.Z());
@@ -1982,6 +2384,13 @@ void CStaticMap::DrawGrid()
     float sizeLand = LandGrid * LandRange;
     float invSizeLand = 1.0f / sizeLand;
 
+    // Whole World: the grid belongs to the mission square; zoomed out over the planet its lines would
+    // fill the whole map.
+    if (EarthStreaming::Enabled() && _scaleX > 1.5f)
+    {
+        return;
+    }
+
     const GridInfo* info = GWorld->GetGridInfo(_scaleX);
     if (!info)
     {
@@ -2456,27 +2865,56 @@ void CStaticMap::Precalculate()
     _clipRect.h = _h * _hScreen;
 }
 
+// The pannable extent in world metres: the landscape, or in Whole World the planet around it (the world
+// map, EarthWorldExtent), so a zoomed-out map can pan across the globe.
+static void MapExtent(float& x0, float& x1, float& z0, float& z1)
+{
+    const float size = LandGrid * LandRange;
+    x0 = z0 = 0;
+    x1 = z1 = size;
+    if (EarthStreaming::Enabled())
+    {
+        const char* latText = std::getenv("POSEIDON_EARTH_LATITUDE");
+        const double lat = latText ? std::atof(latText) : 0.0;
+        const double halfX = Earth::Pi * Earth::Radius * std::max(0.05, std::cos(lat * Earth::Pi / 180.0));
+        const double north = (90.0 - lat) * Earth::Pi / 180.0 * Earth::Radius,
+                     south = (90.0 + lat) * Earth::Pi / 180.0 * Earth::Radius;
+        x0 = float(Earth::Anchor - halfX);
+        x1 = float(Earth::Anchor + halfX);
+        z0 = float(Earth::Anchor - south);
+        z1 = float(Earth::Anchor + north);
+    }
+}
+
 void CStaticMap::SaturateX(float& x)
 {
-    if (_invScaleX < _w)
+    float x0, x1, z0, z1;
+    MapExtent(x0, x1, z0, z1);
+    const float invSize = 1.0f / (LandGrid * LandRange);
+    const float lo = _w - x1 * invSize * _invScaleX, hi = -x0 * invSize * _invScaleX;
+    if ((x1 - x0) * invSize * _invScaleX < _w)
     {
-        x = 0.5 * (_w - _invScaleX);
+        x = 0.5f * (lo + hi);
     }
     else
     {
-        saturate(x, _w - _invScaleX, 0);
+        saturate(x, lo, hi);
     }
 }
 
 void CStaticMap::SaturateY(float& y)
 {
-    if (_invScaleY < _h)
+    float x0, x1, z0, z1;
+    MapExtent(x0, x1, z0, z1);
+    const float invSize = 1.0f / (LandGrid * LandRange);
+    const float lo = _h - (1.0f - z0 * invSize) * _invScaleY, hi = -(1.0f - z1 * invSize) * _invScaleY;
+    if ((z1 - z0) * invSize * _invScaleY < _h)
     {
-        y = 0.5 * (_h - _invScaleY);
+        y = 0.5f * (lo + hi);
     }
     else
     {
-        saturate(y, _h - _invScaleY, 0);
+        saturate(y, lo, hi);
     }
 }
 

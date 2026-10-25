@@ -1,5 +1,6 @@
 
 #include <Poseidon/Core/Config/EngineConfig.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
 #include <Poseidon/Core/Version.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
@@ -38,6 +39,9 @@
 #include <Poseidon/Foundation/Containers/Array.hpp>
 #include <Poseidon/Foundation/Containers/BankArray.hpp>
 #include <Poseidon/Foundation/Framework/DebugLog.hpp>
+#include <Poseidon/Foundation/Framework/Log.hpp>
+#include <set>
+#include <string>
 #include <Poseidon/Foundation/Math/Math3D.hpp>
 #include <Poseidon/Foundation/Math/Math3DP.hpp>
 #include <Poseidon/Foundation/Strings/RString.hpp>
@@ -57,6 +61,90 @@ namespace Poseidon
 #include <Poseidon/IO/PreprocC/Preproc.h>
 
 #include <Poseidon/Foundation/Platform/VersionNo.h>
+
+namespace
+{
+// The engine's muzzle name for the one a script names. An Arma 1/2 script says "M4AIM"
+// for the weapon the import generated as A1x_M4AIM (Arma1Compat::ScriptWeaponMatches);
+// identity without --arma1/--arma2 or when the unit has no such muzzle.
+RString EngineMuzzleName(const EntityAI* ai, const RString& scriptName)
+{
+    if (!ai || !Poseidon::Arma1Compat::Active())
+        return scriptName;
+    for (int i = 0; i < ai->NMagazineSlots(); i++)
+    {
+        const MuzzleType* muzzle = ai->GetMagazineSlot(i)._muzzle;
+        if (muzzle && Poseidon::Arma1Compat::ScriptWeaponMatches(muzzle->GetName(), scriptName))
+            return muzzle->GetName();
+    }
+    // Arma names the Throw/Put muzzles after their magazine plus "Muzzle" (HandGrenadeMuzzle,
+    // SmokeShellRedMuzzle, PipeBombMuzzle). The CWA muzzle is the one named like the
+    // magazine, else the one that takes the CWA magazine the Arma one resolves to.
+    const int n = scriptName.GetLength();
+    if (n > 6 && _stricmp(scriptName.Data() + n - 6, "Muzzle") == 0)
+    {
+        const RString base(scriptName.Data(), n - 6);
+        const RString resolved = Poseidon::Arma1Compat::ResolveMagazineClass(base);
+        const MagazineType* type = nullptr;
+        Ref<MagazineType> typeRef;
+        if ((Pars >> "CfgWeapons").FindEntry(resolved))
+        {
+            typeRef = MagazineTypes.New(resolved);
+            type = typeRef;
+        }
+        for (int i = 0; i < ai->NMagazineSlots(); i++)
+        {
+            const MuzzleType* muzzle = ai->GetMagazineSlot(i)._muzzle;
+            if (muzzle && (_stricmp(muzzle->GetName(), base) == 0 || _stricmp(muzzle->GetName(), resolved) == 0))
+                return muzzle->GetName();
+        }
+        if (type)
+            for (int i = 0; i < ai->NMagazineSlots(); i++)
+            {
+                const MuzzleType* muzzle = ai->GetMagazineSlot(i)._muzzle;
+                if (muzzle && muzzle->CanUse(type))
+                    return muzzle->GetName();
+            }
+    }
+    // Arma 3 names a weapon's own muzzle after the weapon ("arifle_MX_GL_F" beside its "GL_3GL_F"):
+    // a weapon of the unit's, by that name, stands for its first muzzle.
+    for (int i = 0; i < ai->NWeaponSystems(); i++)
+    {
+        const WeaponType* weapon = ai->GetWeaponSystem(i);
+        if (weapon && weapon->_muzzles.Size() > 0 && weapon->_muzzles[0] &&
+            Poseidon::Arma1Compat::ScriptWeaponMatches(weapon->GetName(), scriptName))
+            return weapon->_muzzles[0]->GetName();
+    }
+    // Nothing matched: say once per name which muzzles the unit has, so a script's
+    // weapon name the mapping misses shows up in the log instead of silently doing nothing.
+    static std::set<std::string> reported;
+    if (reported.insert(std::string(scriptName.Data())).second)
+    {
+        std::string muzzles;
+        for (int i = 0; i < ai->NMagazineSlots(); i++)
+            if (const MuzzleType* muzzle = ai->GetMagazineSlot(i)._muzzle)
+                if (muzzles.find(std::string(muzzle->GetName()) + ",") == std::string::npos)
+                    muzzles += std::string(muzzle->GetName()) + ",";
+        LOG_WARN(Mission, "{}: no muzzle '{}' on '{}' (muzzles: {})", Poseidon::Arma1Compat::Label(), scriptName.Data(),
+                 ai->GetType() ? (const char*)ai->GetType()->GetName() : "", muzzles);
+    }
+    return scriptName;
+}
+
+// The same for a weapon the unit carries.
+RString EngineWeaponName(const EntityAI* ai, const RString& scriptName)
+{
+    if (!ai || !Poseidon::Arma1Compat::Active())
+        return scriptName;
+    for (int i = 0; i < ai->NWeaponSystems(); i++)
+    {
+        const WeaponType* weapon = ai->GetWeaponSystem(i);
+        if (weapon && Poseidon::Arma1Compat::ScriptWeaponMatches(weapon->GetName(), scriptName))
+            return weapon->GetName();
+    }
+    return scriptName;
+}
+} // namespace
 
 #include <Poseidon/Game/Commands/GameStateExtCommon.hpp>
 
@@ -380,7 +468,14 @@ GameValue ObjAddWeaponCargo(const GameState* state, GameValuePar oper1, GameValu
         return NOTHING;
     }
 
-    RString name = array[0];
+    // Cargo of an Arma 1 mission names Arma 1 weapons: map them like addWeapon does, and skip a class
+    // the config does not define -- constructing a type for it latches a config error that fails the
+    // whole mission start (Arma 1's M02MinerConvoy fills its truck this way).
+    RString name = Poseidon::Arma1Compat::ResolveWeaponClass(RString(array[0])); // identity unless --arma1
+    if (const ParamEntry* weapons = Pars.FindEntry("CfgWeapons"); !weapons || !weapons->FindEntry(name))
+    {
+        return NOTHING;
+    }
     Ref<WeaponType> weapon = WeaponTypes.New(name);
     if (!weapon)
     {
@@ -419,7 +514,11 @@ GameValue ObjAddMagazineCargo(const GameState* state, GameValuePar oper1, GameVa
         return NOTHING;
     }
 
-    RString name = array[0];
+    RString name = Poseidon::Arma1Compat::ResolveMagazineClass(RString(array[0])); // as addWeaponCargo above
+    if (const ParamEntry* weapons = Pars.FindEntry("CfgWeapons"); !weapons || !weapons->FindEntry(name))
+    {
+        return NOTHING;
+    }
     Ref<MagazineType> magazine = MagazineTypes.New(name);
     if (!magazine)
     {
@@ -428,6 +527,75 @@ GameValue ObjAddMagazineCargo(const GameState* state, GameValuePar oper1, GameVa
     int count = toInt((float)array[1]);
     veh->AddMagazineCargo(magazine, count, true);
     return NOTHING;
+}
+
+namespace
+{
+// [[names], [counts]] of a crate's or vehicle's cargo, one name per kind.
+GameValue CargoList(const GameState* state, const AutoArray<RString>& names)
+{
+    GameValue kinds = state->CreateGameValue(GameArray);
+    GameValue counts = state->CreateGameValue(GameArray);
+    GameArrayType& k = kinds;
+    GameArrayType& c = counts;
+    for (int i = 0; i < names.Size(); i++)
+    {
+        int found = -1;
+        for (int j = 0; j < k.Size(); j++)
+        {
+            const RString kind = k[j];
+            if (stricmp(kind, names[i]) == 0)
+                found = j;
+        }
+        if (found < 0)
+        {
+            k.Add(GameValue(names[i]));
+            c.Add(GameValue(1.0f));
+        }
+        else
+        {
+            const float n = c[found];
+            c[found] = GameValue(n + 1.0f);
+        }
+    }
+    GameValue value = state->CreateGameValue(GameArray);
+    GameArrayType& array = value;
+    array.Add(kinds);
+    array.Add(counts);
+    return value;
+}
+} // namespace
+
+// Arma 1: reload unit -- loads every weapon of the unit that has no magazine in it.
+GameValue A1Reload(const GameState* state, GameValuePar oper1)
+{
+    if (EntityAI* ai = dyn_cast<EntityAI>(GetObject(oper1)))
+    {
+        ai->AutoReloadAll();
+    }
+    return NOTHING;
+}
+
+// Arma 1: getWeaponCargo box -> [["M16A2", "M136"], [10, 4]] (Arma names of the weapons).
+GameValue A1GetWeaponCargo(const GameState* state, GameValuePar oper1)
+{
+    AutoArray<RString> names;
+    if (const VehicleSupply* veh = dyn_cast<VehicleSupply>(GetObject(oper1)))
+        for (int i = 0; i < veh->GetWeaponCargoSize(); i++)
+            if (const WeaponType* weapon = veh->GetWeaponCargo(i))
+                names.Add(Poseidon::Arma1Compat::ScriptClassName(weapon->GetName()));
+    return CargoList(state, names);
+}
+
+// Arma 1: getMagazineCargo box -> [["M16", "HandGrenade"], [40, 12]].
+GameValue A1GetMagazineCargo(const GameState* state, GameValuePar oper1)
+{
+    AutoArray<RString> names;
+    if (const VehicleSupply* veh = dyn_cast<VehicleSupply>(GetObject(oper1)))
+        for (int i = 0; i < veh->GetMagazineCargoSize(); i++)
+            if (const Magazine* magazine = veh->GetMagazineCargo(i); magazine && magazine->_type)
+                names.Add(RString(magazine->_type->GetName()));
+    return CargoList(state, names);
 }
 
 GameValue ObjSelectWeapon(const GameState* state, GameValuePar oper1, GameValuePar oper2)
@@ -447,7 +615,7 @@ GameValue ObjSelectWeapon(const GameState* state, GameValuePar oper1, GameValueP
         return NOTHING;
     }
 
-    RString name = oper2;
+    RString name = EngineMuzzleName(veh, oper2);
     for (int i = 0; i < veh->NMagazineSlots(); i++)
     {
         const MuzzleType* muzzle = veh->GetMagazineSlot(i)._muzzle;
@@ -530,7 +698,7 @@ GameValue ObjGetPrimaryWeapon(const GameState* state, GameValuePar oper1)
         }
         if ((weapon->_weaponType & MaskSlotPrimary) != 0)
         {
-            return weapon->GetName();
+            return Poseidon::Arma1Compat::ScriptClassName(weapon->GetName());
         }
     }
 
@@ -559,7 +727,7 @@ GameValue ObjGetSecondaryWeapon(const GameState* state, GameValuePar oper1)
         }
         if ((weapon->_weaponType & MaskSlotSecondary) != 0 && (weapon->_weaponType & MaskSlotPrimary) == 0)
         {
-            return weapon->GetName();
+            return Poseidon::Arma1Compat::ScriptClassName(weapon->GetName());
         }
     }
 
@@ -593,7 +761,7 @@ GameValue ObjGetAllWeapons(const GameState* state, GameValuePar oper1)
         {
             continue;
         }
-        array.Add(weapon->GetName());
+        array.Add(Poseidon::Arma1Compat::ScriptClassName(weapon->GetName()));
     }
 
     return value;
@@ -615,6 +783,8 @@ GameValue ObjGetAllMagazines(const GameState* state, GameValuePar oper1)
         return value;
     }
 
+    // Arma 1/2 units: the Arma names of their magazines (identity otherwise).
+    const RString unitClass = ai->GetType() ? RString(ai->GetType()->GetName()) : RString();
     for (int i = 0; i < ai->NMagazines(); i++)
     {
         const Magazine* magazine = ai->GetMagazine(i);
@@ -625,7 +795,7 @@ GameValue ObjGetAllMagazines(const GameState* state, GameValuePar oper1)
         const MagazineType* type = magazine->_type;
         if (type)
         {
-            array.Add(type->GetName());
+            array.Add(Poseidon::Arma1Compat::ScriptMagazineName(unitClass, type->GetName()));
         }
     }
 
@@ -923,7 +1093,7 @@ GameValue ObjAmmo(const GameState* state, GameValuePar oper1, GameValuePar oper2
     {
         return 0.0f;
     }
-    GameStringType weapon = oper2;
+    GameStringType weapon = EngineMuzzleName(ai, oper2);
     for (int i = 0; i < ai->NMagazineSlots(); i++)
     {
         const MagazineSlot& slot = ai->GetMagazineSlot(i);
@@ -936,6 +1106,56 @@ GameValue ObjAmmo(const GameState* state, GameValuePar oper1, GameValuePar oper2
             continue;
         }
         return float(slot._magazine->_ammo);
+    }
+    // Arma 3: a vehicle runs on the CWA vehicle it stands in for, with that vehicle's
+    // weapons, while the mission asks after its own ("missiles_DAGR", "LMG_Minigun").
+    // Count the rounds of the CWA weapons that fire the same kind of shot -- the Arma
+    // weapon's first magazine's ammo simulation -- so a mission that divides by them
+    // (the helicopter showcase's ammo monitor) is not dividing by zero.
+    if (Poseidon::Arma1Compat::Active() && Poseidon::Arma1Compat::Generation() >= 3 && !dyn_cast<Man>(ai))
+    {
+        const ParamEntry* armaWeapon = Poseidon::Arma1Compat::FindConfigClass("CfgWeapons", RString(oper2));
+        const ParamEntry* mags = armaWeapon ? armaWeapon->FindEntry("magazines") : nullptr;
+        const ParamEntry* mag = mags && mags->IsArray() && mags->GetSize() > 0
+                                    ? Poseidon::Arma1Compat::FindConfigClass("CfgMagazines", (RStringB)(*mags)[0])
+                                    : nullptr;
+        const ParamEntry* ammoName = mag ? mag->FindEntry("ammo") : nullptr;
+        const ParamEntry* ammo = ammoName && !ammoName->IsClass() && !ammoName->IsArray()
+                                     ? Poseidon::Arma1Compat::FindConfigClass("CfgAmmo", (RStringB)*ammoName)
+                                     : nullptr;
+        const ParamEntry* sim = ammo ? ammo->FindEntry("simulation") : nullptr;
+        if (sim && !sim->IsClass() && !sim->IsArray())
+        {
+            const RStringB simulation = *sim;
+            // Arma's shotSubmunitions and shotCM have no CWA kind; rockets and missiles are one
+            const AmmoSimulation kind = !strcmpi(simulation, "shotBullet") || !strcmpi(simulation, "shotSpread")
+                                            ? AmmoShotBullet
+                                        : !strcmpi(simulation, "shotShell") ? AmmoShotShell
+                                        : !strcmpi(simulation, "shotMissile") || !strcmpi(simulation, "shotRocket")
+                                            ? AmmoShotMissile
+                                            : AmmoNone;
+            float total = 0.0f;
+            for (int i = 0; kind != AmmoNone && i < ai->NMagazineSlots(); i++)
+            {
+                const MagazineSlot& slot = ai->GetMagazineSlot(i);
+                const Magazine* magazine = slot._magazine;
+                if (!magazine || !magazine->_type || magazine->_type->_modes.Size() <= 0)
+                    continue;
+                const AmmoType* cwaAmmo = magazine->_type->_modes[0]->_ammo;
+                if (!cwaAmmo)
+                    continue;
+                AmmoSimulation cwaKind = cwaAmmo->_simulation;
+                if (cwaKind == AmmoShotRocket)
+                    cwaKind = AmmoShotMissile;
+                // a magazine shared by two muzzles is counted once
+                bool seen = false;
+                for (int j = 0; j < i && !seen; j++)
+                    seen = ai->GetMagazineSlot(j)._magazine == magazine;
+                if (cwaKind == kind && !seen)
+                    total += float(magazine->_ammo);
+            }
+            return total;
+        }
     }
     return 0.0f;
 }
@@ -999,11 +1219,13 @@ GameValue ObjUnitLoadout(const GameState* state, GameValuePar oper1)
         {
             continue;
         }
-        weaponArray.Add(weapon->GetName());
+        // Arma 1/2 units report their Arma names, as `weapons` does (identity otherwise).
+        weaponArray.Add(Poseidon::Arma1Compat::ScriptClassName(weapon->GetName()));
     }
 
     GameValue magazines = state->CreateGameValue(GameArray);
     GameArrayType& magazineArray = magazines;
+    const RString unitClass = ai->GetType() ? RString(ai->GetType()->GetName()) : RString();
     for (int i = 0; i < ai->NMagazines(); i++)
     {
         const Magazine* magazine = ai->GetMagazine(i);
@@ -1011,7 +1233,7 @@ GameValue ObjUnitLoadout(const GameState* state, GameValuePar oper1)
         {
             continue;
         }
-        magazineArray.Add(magazine->_type->GetName());
+        magazineArray.Add(Poseidon::Arma1Compat::ScriptMagazineName(unitClass, magazine->_type->GetName()));
         magazineArray.Add(static_cast<float>(magazine->_ammo));
     }
 
@@ -1032,6 +1254,8 @@ GameValue ObjUnitLoadout(const GameState* state, GameValuePar oper1)
     return value;
 }
 
+GameValue A3SetUnitLoadout(const GameState* state, GameValuePar oper1, GameValuePar oper2); // GameStateExtA3.cpp
+
 GameValue ObjSetUnitLoadout(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
     Object* obj = GetObject(oper1);
@@ -1046,6 +1270,8 @@ GameValue ObjSetUnitLoadout(const GameState* state, GameValuePar oper1, GameValu
     }
 
     const GameArrayType& loadout = oper2;
+    if (loadout.Size() >= 6 && Poseidon::Arma1Compat::Generation() >= 3)
+        return A3SetUnitLoadout(state, oper1, oper2); // Arma 3's [primary, secondary, handgun, uniform, ...]
     if (loadout.Size() < 2)
     {
         state->SetError(EvalDim, loadout.Size(), 2);
@@ -1088,7 +1314,11 @@ GameValue ObjSetUnitLoadout(const GameState* state, GameValuePar oper1, GameValu
 
     for (int i = 0; i < magazines.Size(); i += 2)
     {
-        GameStringType magazineName = magazines[i];
+        // Names as addMagazine takes them: Arma 1/2 names resolve to their CWA carriers, and an
+        // unknown class is skipped under the compat layer (its config reads would fail).
+        GameStringType magazineName = Poseidon::Arma1Compat::ResolveMagazineClass(GameStringType(magazines[i]));
+        if (Poseidon::Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(magazineName))
+            continue;
         const int ammo = toInt(static_cast<float>(magazines[i + 1]));
         Ref<MagazineType> magazineType = MagazineTypes.New(magazineName);
         if (!magazineType)
@@ -1102,7 +1332,9 @@ GameValue ObjSetUnitLoadout(const GameState* state, GameValuePar oper1, GameValu
 
     for (int i = 0; i < weapons.Size(); ++i)
     {
-        GameStringType weaponName = weapons[i];
+        GameStringType weaponName = Poseidon::Arma1Compat::ResolveWeaponClass(GameStringType(weapons[i]));
+        if (Poseidon::Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(weaponName))
+            continue;
         ai->AddWeapon(weaponName);
     }
 
@@ -1144,7 +1376,7 @@ GameValue ObjAmmoArray(const GameState* state, GameValuePar oper1, GameValuePar 
         return value;
     }
 
-    GameStringType muzzle = oper2;
+    GameStringType muzzle = EngineMuzzleName(ai, oper2);
     const MagazineSlot* pSlot = ai->GetmagazineSlotByMuzzle(muzzle);
     if (!pSlot)
     {
@@ -1366,7 +1598,7 @@ GameValue ObjHasWeapon(const GameState* state, GameValuePar oper1, GameValuePar 
         return false;
     }
 
-    GameStringType name = oper2;
+    GameStringType name = EngineWeaponName(veh, oper2);
     for (int i = 0; i < veh->NWeaponSystems(); i++)
     {
         const WeaponType* weapon = veh->GetWeaponSystem(i);
@@ -1389,7 +1621,11 @@ GameValue ObjAddWeapon(const GameState* state, GameValuePar oper1, GameValuePar 
     {
         return NOTHING;
     }
-    GameStringType weapon = oper2;
+    GameStringType weapon = Poseidon::Arma1Compat::ResolveWeaponClass(oper2); // identity unless --arma1
+    if (Poseidon::Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(weapon))
+    {
+        return NOTHING; // unknown weapon (another game's class): its config reads would fail the mission
+    }
     ai->AddWeapon(weapon);
     ai->AutoReloadAll();
     return NOTHING;
@@ -1402,7 +1638,7 @@ GameValue ObjRemoveWeapon(const GameState* state, GameValuePar oper1, GameValueP
     {
         return NOTHING;
     }
-    GameStringType weapon = oper2;
+    GameStringType weapon = EngineWeaponName(ai, oper2);
     ai->RemoveWeapon(weapon);
     return NOTHING;
 }
@@ -1425,7 +1661,11 @@ GameValue ObjAddMagazine(const GameState* state, GameValuePar oper1, GameValuePa
     {
         return NOTHING;
     }
-    GameStringType magazine = oper2;
+    GameStringType magazine = Poseidon::Arma1Compat::ResolveMagazineClass(oper2); // identity unless --arma1
+    if (Poseidon::Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(magazine))
+    {
+        return NOTHING;
+    }
     ai->AddMagazine(magazine);
     ai->AutoReloadAll();
     return NOTHING;
@@ -1438,7 +1678,7 @@ GameValue ObjRemoveMagazine(const GameState* state, GameValuePar oper1, GameValu
     {
         return NOTHING;
     }
-    GameStringType magazine = oper2;
+    GameStringType magazine = Poseidon::Arma1Compat::ResolveMagazineClass(oper2); // identity unless --arma1
     ai->RemoveMagazine(magazine);
     return NOTHING;
 }
@@ -1450,7 +1690,7 @@ GameValue ObjRemoveMagazines(const GameState* state, GameValuePar oper1, GameVal
     {
         return NOTHING;
     }
-    GameStringType magazine = oper2;
+    GameStringType magazine = Poseidon::Arma1Compat::ResolveMagazineClass(oper2); // identity unless --arma1
     ai->RemoveMagazines(magazine);
     return NOTHING;
 }
@@ -1468,7 +1708,7 @@ GameValue ObjFire(const GameState* state, GameValuePar oper1, GameValuePar oper2
         return NOTHING;
     }
 
-    GameStringType muzzle = oper2;
+    GameStringType muzzle = EngineMuzzleName(veh, oper2);
 
     for (int i = 0; i < veh->NMagazineSlots(); i++)
     {
@@ -1507,7 +1747,7 @@ GameValue ObjMuzzleReloadTime(const GameState* state, GameValuePar oper1, GameVa
         return -1.0f;
     }
 
-    GameStringType muzzle = oper2;
+    GameStringType muzzle = EngineMuzzleName(veh, oper2);
 
     const MagazineSlot* pSlot = veh->GetmagazineSlotByMuzzle(muzzle);
     if (!pSlot)
@@ -1557,13 +1797,14 @@ GameValue ObjFireEx(const GameState* state, GameValuePar oper1, GameValuePar ope
             {
                 return NOTHING;
             }
-            magazine = array[2];
+            magazine = Poseidon::Arma1Compat::ResolveMagazineClass(array[2]); // identity unless --arma1
+            [[fallthrough]];
         case 2:
             if (array[0].GetType() != GameString)
             {
                 return NOTHING;
             }
-            muzzle = array[0];
+            muzzle = EngineMuzzleName(veh, array[0]);
             if (array[1].GetType() != GameString)
             {
                 return NOTHING;
@@ -1574,6 +1815,10 @@ GameValue ObjFireEx(const GameState* state, GameValuePar oper1, GameValuePar ope
             return NOTHING;
     }
 
+    // Arma 1/2: a mode name CWA's weapon does not have (FullAuto on an M4 that CWA's M16
+    // fires Single/Burst, HandGrenadeMuzzle as the grenade's mode) fires the muzzle in
+    // its first mode instead of not at all.
+    int anyMode = -1;
     for (int i = 0; i < veh->NMagazineSlots(); i++)
     {
         const MagazineSlot& slot = veh->GetMagazineSlot(i);
@@ -1582,7 +1827,8 @@ GameValue ObjFireEx(const GameState* state, GameValuePar oper1, GameValuePar ope
             continue;
         }
 
-        if (magazine.GetLength() > 0)
+        if (magazine.GetLength() > 0 &&
+            (!Poseidon::Arma1Compat::Active() || (Pars >> "CfgWeapons").FindEntry(magazine)))
         {
             Ref<MagazineType> type = MagazineTypes.New(magazine);
             int best = veh->FindBestMagazine(type, 0);
@@ -1599,8 +1845,12 @@ GameValue ObjFireEx(const GameState* state, GameValuePar oper1, GameValuePar ope
         // check mode
         const WeaponModeType* modeType = veh->GetWeaponMode(i);
         PoseidonAssert(modeType);
-        if (stricmp(modeType->GetName(), mode) != 0)
+        if (!modeType || stricmp(modeType->GetName(), mode) != 0)
         {
+            if (anyMode < 0)
+            {
+                anyMode = i;
+            }
             continue;
         }
 
@@ -1611,6 +1861,14 @@ GameValue ObjFireEx(const GameState* state, GameValuePar oper1, GameValuePar ope
 
         veh->ForceFire(i);
         return NOTHING;
+    }
+    if (anyMode >= 0 && Poseidon::Arma1Compat::Active())
+    {
+        const MagazineSlot& slot = veh->GetMagazineSlot(anyMode);
+        if (slot._magazine && !(slot._magazine->_type->_maxAmmo > 0 && slot._magazine->_ammo == 0))
+        {
+            veh->ForceFire(anyMode);
+        }
     }
     return NOTHING;
 }

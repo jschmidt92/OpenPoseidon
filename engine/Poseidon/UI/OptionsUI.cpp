@@ -1,5 +1,7 @@
 
+#include <Poseidon/UI/Arma3Menu.hpp>
 #include <Poseidon/UI/Options/OptionsShell.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Dev/Diag/OpDiag.hpp> // DIAG-001 hooks, empty unless POSEIDON_DIAG
 #include <Poseidon/Game/Mission/MissionPathLoader.hpp>
 #include <Poseidon/Foundation/Framework/Log.hpp>
@@ -151,6 +153,9 @@ RString GetUserParams()
 RString GetCampaignDirectory(RString campaign)
 {
     PoseidonAssert(campaign.GetLength() > 0);
+    // an Arma 2 campaign lives inside its archive ("ca/missions/campaign/")
+    if (const std::string base = Arma1Compat::CampaignBase((const char*)campaign); !base.empty())
+        return RString(base.c_str());
     return RString("campaigns/") + campaign + RString("/");
 }
 
@@ -158,6 +163,8 @@ RString GetCampaignMissionDirectory(RString campaign, RString mission)
 {
     PoseidonAssert(campaign.GetLength() > 0);
     PoseidonAssert(mission.GetLength() > 0);
+    if (const std::string base = Arma1Compat::CampaignBase((const char*)campaign); !base.empty())
+        return RString(base.c_str()) + RString("missions/") + mission + RString("/");
     return RString("campaigns/") + campaign + RString("/missions/") + mission + RString("/");
 }
 
@@ -289,6 +296,18 @@ RString GetMissionSaveDirectory(RString mission)
     return dir;
 }
 
+// A mission's sound file: beside the mission, unless the name is a path from the root of
+// the game's file system that only exists there ("\\a3\\sounds_f\\...", or Arma 3's
+// "@a3\\..." -- GetDefaultName drops the leading marker), which mission-relative lookup
+// would turn into "<mission>\\a3\\..." and never find.
+static RString MissionSoundPath(const RString& name)
+{
+    const RString inMission = GetMissionDirectory() + name;
+    if (!QIFStreamB::FileExist(inMission) && QIFStreamB::FileExist(name))
+        return name;
+    return inMission;
+}
+
 void FindEnvSound(RString name, SoundPars& day, SoundPars& night)
 {
     // ignore @ - not used now
@@ -300,17 +319,17 @@ void FindEnvSound(RString name, SoundPars& day, SoundPars& night)
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("CfgEnvSounds");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(day, (*entry) >> "sound");
         if (day.name.GetLength() > 0)
         {
-            day.name = GetMissionDirectory() + day.name;
+            day.name = MissionSoundPath(day.name);
         }
         GetValue(night, (*entry) >> "soundNight");
         if (night.name.GetLength() > 0)
         {
-            night.name = GetMissionDirectory() + night.name;
+            night.name = MissionSoundPath(night.name);
         }
         return;
     }
@@ -318,7 +337,7 @@ void FindEnvSound(RString name, SoundPars& day, SoundPars& night)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgEnvSounds");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(day, (*entry) >> "sound");
         if (day.name.GetLength() > 0)
@@ -336,10 +355,18 @@ void FindEnvSound(RString name, SoundPars& day, SoundPars& night)
     // find in config
     cls = Pars.FindEntry("CfgEnvSounds");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(day, (*entry) >> "sound");
         GetValue(night, (*entry) >> "soundNight");
+        return;
+    }
+
+    // Arma 1 content (--arma1): its global config is the last place to look.
+    if (const ParamEntry* a1 = Arma1Compat::FindConfigClass("CfgEnvSounds", name); a1 && a1->IsClass())
+    {
+        GetValue(day, (*a1) >> "sound");
+        GetValue(night, (*a1) >> "soundNight");
         return;
     }
 
@@ -359,13 +386,13 @@ void FindSFX(RString name, SoundEntry& emptySound, AutoArray<SoundEntry>& sounds
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("CfgSFX");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         // load empty sound
         emptySound = DynSound::LoadEntry((*entry) >> "empty");
         if (emptySound.name.GetLength() > 0)
         {
-            emptySound.name = GetMissionDirectory() + emptySound.name;
+            emptySound.name = MissionSoundPath(emptySound.name);
         }
         // load sound scheme
         const ParamEntry& list = (*entry) >> "sounds";
@@ -378,7 +405,7 @@ void FindSFX(RString name, SoundEntry& emptySound, AutoArray<SoundEntry>& sounds
             sound = DynSound::LoadEntry((*entry) >> name);
             if (sound.name.GetLength() > 0)
             {
-                sound.name = GetMissionDirectory() + sound.name;
+                sound.name = MissionSoundPath(sound.name);
                 PreferExistingVoiceLanguageOverride(sound);
             }
         }
@@ -389,7 +416,7 @@ void FindSFX(RString name, SoundEntry& emptySound, AutoArray<SoundEntry>& sounds
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgSFX");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         // load empty sound
         emptySound = DynSound::LoadEntry((*entry) >> "empty");
@@ -419,7 +446,7 @@ void FindSFX(RString name, SoundEntry& emptySound, AutoArray<SoundEntry>& sounds
     // find in config
     cls = Pars.FindEntry("CfgSFX");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         // load empty sound
         emptySound = DynSound::LoadEntry((*entry) >> "empty");
@@ -434,6 +461,20 @@ void FindSFX(RString name, SoundEntry& emptySound, AutoArray<SoundEntry>& sounds
             sound = DynSound::LoadEntry((*entry) >> name);
         }
         return; // Pars.GetName();
+    }
+
+    if (const ParamEntry* a1 = Arma1Compat::FindConfigClass("CfgSFX", name); a1 && a1->IsClass())
+    {
+        emptySound = DynSound::LoadEntry((*a1) >> "empty");
+        const ParamEntry& list = (*a1) >> "sounds";
+        int n = list.GetSize();
+        sounds.Resize(n);
+        for (int i = 0; i < n; i++)
+        {
+            RString soundName = list[i];
+            sounds[i] = DynSound::LoadEntry((*a1) >> soundName);
+        }
+        return;
     }
 
     Poseidon::Foundation::WarningMessage("SFX %s not found", (const char*)name);
@@ -461,12 +502,12 @@ const ParamEntry* FindSound(RString name, SoundPars& pars)
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("CfgSounds");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
         {
-            pars.name = GetMissionDirectory() + pars.name;
+            pars.name = MissionSoundPath(pars.name);
             // Per-language voice override: prefer "<base>.<voiceLang>.<ext>" if it exists.
             // Resolved at play time so a runtime voice-language switch picks up the new
             // file on the next say/playSound — currently-playing audio is unaffected.
@@ -478,7 +519,7 @@ const ParamEntry* FindSound(RString name, SoundPars& pars)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgSounds");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
@@ -492,7 +533,7 @@ const ParamEntry* FindSound(RString name, SoundPars& pars)
     // find in config
     cls = Pars.FindEntry("CfgSounds");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         return entry;
@@ -503,6 +544,12 @@ const ParamEntry* FindSound(RString name, SoundPars& pars)
     // through LOG_WARN rather than WarningMessage — the latter is a no-op in the
     // shipping app frame, which is why a bad `say`/sound surfaced only as the
     // file server's context-free "Empty or nullptr name not allowed".)
+    if (const ParamEntry* a1 = Arma1Compat::FindConfigClass("CfgSounds", name); a1 && a1->IsClass())
+    {
+        GetValue(pars, (*a1) >> "sound");
+        return a1;
+    }
+
     LOG_WARN(Audio, "Sound '{}' not found in any CfgSounds — nothing will play", (const char*)name);
 #if POSEIDON_DIAG
     Dev::OpDiag::OnSoundMissing("CfgSounds", (const char*)name); // DIAG-001
@@ -515,12 +562,12 @@ const ParamEntry* FindMusic(RString name, SoundPars& pars)
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("CfgMusic");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
         {
-            pars.name = GetMissionDirectory() + pars.name;
+            pars.name = MissionSoundPath(pars.name);
         }
         return entry;
     }
@@ -528,7 +575,7 @@ const ParamEntry* FindMusic(RString name, SoundPars& pars)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgMusic");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
@@ -541,10 +588,16 @@ const ParamEntry* FindMusic(RString name, SoundPars& pars)
     // find in config
     cls = Pars.FindEntry("CfgMusic");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         return entry;
+    }
+
+    if (const ParamEntry* a1 = Arma1Compat::FindConfigClass("CfgMusic", name); a1 && a1->IsClass())
+    {
+        GetValue(pars, (*a1) >> "sound");
+        return a1;
     }
 
     Poseidon::Foundation::WarningMessage("Music %s not found", (const char*)name);
@@ -556,12 +609,12 @@ const ParamEntry* FindRadio(RString name, SoundPars& pars)
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("CfgRadio");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
         {
-            pars.name = GetMissionDirectory() + pars.name;
+            pars.name = MissionSoundPath(pars.name);
             PreferExistingVoiceLanguageOverride(pars);
         }
         return entry;
@@ -570,7 +623,7 @@ const ParamEntry* FindRadio(RString name, SoundPars& pars)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("CfgRadio");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         if (pars.name.GetLength() > 0)
@@ -584,10 +637,16 @@ const ParamEntry* FindRadio(RString name, SoundPars& pars)
     // find in config
     cls = Pars.FindEntry("CfgRadio");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         GetValue(pars, (*entry) >> "sound");
         return entry;
+    }
+
+    if (const ParamEntry* a1 = Arma1Compat::FindConfigClass("CfgRadio", name); a1 && a1->IsClass())
+    {
+        GetValue(pars, (*a1) >> "sound");
+        return a1;
     }
 
     Poseidon::Foundation::WarningMessage("Radio message %s not found", (const char*)name);
@@ -662,7 +721,28 @@ RString FindScript(RString name)
         return fullname;
     }
 
+    // Arma 1's own global scripts (ca.pbo: data\scripts\Timing.sqs, Area.sqf,
+    // GlobRunning.sqs), which its multiplayer missions call by bare name without
+    // shipping them (mp07capturetheflag: player exec "timing.sqs", execVM "Area.sqf").
+    if (Poseidon::Arma1Compat::Generation() == 1)
+    {
+        fullname = RString("ca\\data\\scripts\\") + name;
+        if (QIFStreamB::FileExist(fullname))
+        {
+            return fullname;
+        }
+    }
+
+    // Arma 1/2 also take a path inside the game's archives without its leading
+    // backslash: exec "ca\air2\halo\data\Scripts\HALO_init.sqs"
+    if (Poseidon::Arma1Compat::Active() && QIFStreamB::FileExist(name))
+    {
+        return name;
+    }
+
     Poseidon::Foundation::WarningMessage("Script %s not found", (const char*)name);
+    if (Poseidon::Arma1Compat::Active())
+        LOG_WARN(Script, "Script {} not found", (const char*)name);
     return "";
 }
 
@@ -759,7 +839,7 @@ const ParamEntry* FindRscTitle(RString name)
     // find in mission
     const ParamEntry* cls = ExtParsMission.FindEntry("RscTitles");
     const ParamEntry* entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         return entry;
     }
@@ -767,7 +847,7 @@ const ParamEntry* FindRscTitle(RString name)
     // find in campaign
     cls = ExtParsCampaign.FindEntry("RscTitles");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         return entry;
     }
@@ -775,7 +855,7 @@ const ParamEntry* FindRscTitle(RString name)
     // find in resource
     cls = Res.FindEntry("RscTitles");
     entry = cls ? cls->FindEntry(name) : nullptr;
-    if (entry)
+    if (entry && entry->IsClass())
     {
         return entry;
     }
@@ -1416,7 +1496,11 @@ GameValue PoolAddWeapon(const GameState* state, GameValuePar oper1)
         return GameValue();
     }
 
-    RString name = array[0];
+    RString name = Arma1Compat::ResolveWeaponClass(RString(array[0])); // identity unless --arma1
+    if (Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(name))
+    {
+        return GameValue();
+    }
     int count = toInt((float)array[1]);
 
     int i = GetGCampaignHistory().battles.Size() - 1;
@@ -1444,7 +1528,11 @@ GameValue PoolAddMagazine(const GameState* state, GameValuePar oper1)
         return GameValue();
     }
 
-    RString name = array[0];
+    RString name = Arma1Compat::ResolveMagazineClass(RString(array[0])); // identity unless --arma1
+    if (Arma1Compat::Active() && !(Pars >> "CfgWeapons").FindEntry(name))
+    {
+        return GameValue();
+    }
     int count = toInt((float)array[1]);
 
     int i = GetGCampaignHistory().battles.Size() - 1;
@@ -2052,6 +2140,27 @@ DisplayInterrupt::DisplayInterrupt(ControlsContainer* parent) : Display(parent)
 {
     _enableSimulation = false;
     _enableUI = false;
+    // --arma-original-ui with Arma 3: its own RscDisplayInterrupt, read from its config (Arma3Menu)
+    if (Arma3Menu::Active())
+    {
+        _arma3 = std::make_shared<Arma3Menu::Screen>();
+        if (_arma3->Load(*this, "RscDisplayInterrupt", _controlsBackground, _controlsForeground))
+        {
+            // the mission display tells its pause menu by this idd (Abort, Save, Load on closing)
+            _idd = IDD_INTERRUPT;
+            const bool multiplayer = GWorld->GetMode() == GModeNetware;
+            const bool saved = QIFStream::FileExists(GetSaveDirectory() + RString("save.fps"));
+            // the mission's own name (description.ext briefingName), else its folder
+            RString missionName = Glob.header.filename;
+            if (const ParamEntry* name = ExtParsMission.FindEntry("briefingName"); name && !name->IsClass())
+                missionName = *name;
+            _arma3->InitInterrupt(multiplayer, saved, missionName);
+            NextCtrl();
+            InputSubsystem::Instance().ChangeGameFocus(+1);
+            return;
+        }
+        _arma3.reset();
+    }
     Load("RscDisplayInterrupt");
     UnregisterLanguageChangedCallback(_langCbToken);
     _langCbToken = RegisterLanguageChangedCallback(
@@ -2061,11 +2170,17 @@ DisplayInterrupt::DisplayInterrupt(ControlsContainer* parent) : Display(parent)
             RefreshLanguage();
         });
 
+    // A layout without one of these (--arma-original-ui draws Arma's) must not crash the menu.
+    const auto hide = [this](int idc)
+    {
+        if (IControl* ctrl = GetCtrl(idc))
+            ctrl->ShowCtrl(false);
+    };
     if (GWorld->GetMode() == GModeNetware)
     {
-        GetCtrl(IDC_INT_SAVE)->ShowCtrl(false);
-        GetCtrl(IDC_INT_LOAD)->ShowCtrl(false);
-        GetCtrl(IDC_INT_RETRY)->ShowCtrl(false);
+        hide(IDC_INT_SAVE);
+        hide(IDC_INT_LOAD);
+        hide(IDC_INT_RETRY);
         //		GetCtrl(IDC_INT_RESTART)->ShowCtrl(false);
     }
     else
@@ -2073,11 +2188,11 @@ DisplayInterrupt::DisplayInterrupt(ControlsContainer* parent) : Display(parent)
         RString name = GetSaveDirectory() + RString("save.fps");
         if (QIFStream::FileExists(name))
         {
-            GetCtrl(IDC_INT_SAVE)->ShowCtrl(false);
+            hide(IDC_INT_SAVE);
         }
         else
         {
-            GetCtrl(IDC_INT_LOAD)->ShowCtrl(false);
+            hide(IDC_INT_LOAD);
         }
     }
     InputSubsystem::Instance().ChangeGameFocus(+1);
@@ -2113,6 +2228,8 @@ Control* DisplayInterrupt::OnCreateCtrl(int type, int idc, const ParamEntry& cls
 
 void DisplayInterrupt::OnButtonClicked(int idc)
 {
+    if (_arma3)
+        idc = _arma3->InterruptClick(idc);
     switch (idc)
     {
         case IDC_INT_OPTIONS:
@@ -2279,6 +2396,19 @@ void StartRandomCutscene(RString world)
         subdir = "assets\\menu\\";
     }
     SetMission(world, name, subdir);
+
+    // Arma 3's own menu (Arma3Menu) covers the screen with its backdrop: a scene behind it is never
+    // seen, and its soldier -- an Arma 3 man under --arma3 -- made the menu wait ~8 s for Arma 3's
+    // whole move set. The menu island is loaded empty instead (it still clears a finished mission).
+    if (Arma3Menu::Active())
+    {
+        CurrentTemplate.Clear();
+        LOG_INFO(UI, "Menu scene: none behind Arma 3's menu (its backdrop covers the screen)");
+        GLOB_WORLD->SwitchLandscape(GetWorldName(WorldInstalled("Intro") ? RString("Intro") : world));
+        GLOB_WORLD->InitGeneral(CurrentTemplate.intel);
+        GLOB_WORLD->InitVehicles(GModeIntro, CurrentTemplate);
+        return;
+    }
 
     const bool parsed = ParseIntro();
     LOG_INFO(UI, "Menu scene: world={} name={} dir={} sea={} parsed={} groups={} installed={} asset={}",

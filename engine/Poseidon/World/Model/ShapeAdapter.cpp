@@ -1,3 +1,5 @@
+#include <Poseidon/Foundation/Platform/EnvOnce.hpp>
+#include <cstdio>
 #include <mutex>
 #include <memory>
 #include <Poseidon/Foundation/Threads/ThreadAffinity.hpp>
@@ -6,11 +8,13 @@
 #include <Poseidon/World/Model/ShapeAdapter.hpp>
 #include <Poseidon/Dev/Diag/ScopedTimer.hpp>
 #include <Poseidon/World/Model/Model.hpp>
+#include <Poseidon/Asset/Formats/Enfusion/XobTangentFrame.hpp>
 
 #include <Poseidon/Graphics/Rendering/Shape/Shape.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Material.hpp>
 #include <Poseidon/Graphics/Textures/TextureBank.hpp>
 #include <Poseidon/IO/ParamFileExt.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/IO/Streams/ArchiveSourceBinding.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
 #include <Poseidon/Graphics/Rendering/Draw/SpecLods.hpp>
@@ -423,6 +427,145 @@ static void SynthesizeBoxGeometryMass(LODShapeWithShadow* shape, Shape* geom, Au
 //   MLOD: MLODLoader converts raw POINT_* flags (data3d.h) to ClipFlags, encodes
 //         materials into ClipUserMask, then stores in vertex.flags.
 // Both paths are identical here — always cast vertex.flags to ClipFlags directly.
+std::vector<std::string> ResolveCfgModelSections(const std::string& sourcePath)
+{
+    std::vector<std::string> names;
+    const ParamEntry* models = Pars.FindEntry("CfgModels");
+    if (!models || sourcePath.empty())
+        return names;
+    // GetFilename's rule (last separator, cut at the first '.'), on a std::string so a long
+    // path cannot overflow a fixed buffer.
+    std::string shortName = sourcePath;
+    if (const size_t cut = shortName.find_last_of("\\/"); cut != std::string::npos)
+        shortName.erase(0, cut + 1);
+    if (const size_t dot = shortName.find('.'); dot != std::string::npos)
+        shortName.resize(dot);
+    for (char& c : shortName)
+    {
+        if (c == ' ' || c == '-' || c == '/' || c == '(' || c == ')')
+            c = '_';
+    }
+    const ParamEntry* cls = models->FindEntry(shortName.c_str());
+    if (!cls)
+        cls = models->FindEntry("default");
+    // `sectionsInherit` is a chain; a cycle in a broken addon must not hang the load.
+    for (int depth = 0; cls && depth < 32; ++depth)
+    {
+        if (const ParamEntry* sections = cls->FindEntry("sections"); sections && sections->IsArray())
+        {
+            for (int i = 0; i < sections->GetSize(); ++i)
+            {
+                const RStringB name = (*sections)[i];
+                if (name.GetLength() > 0)
+                    names.emplace_back(static_cast<const char*>(name));
+            }
+        }
+        const ParamEntry* inherit = cls->FindEntry("sectionsInherit");
+        if (!inherit)
+            break;
+        const RStringB parent = *inherit;
+        if (parent.GetLength() <= 0)
+            break;
+        cls = models->FindEntry(parent);
+    }
+    return names;
+}
+
+// WGPU-021: mark the CfgModels section selections of one MLOD LOD before FindSections, as
+// Shape::DefineSections does on the legacy path. Without it a hidden selection that shares a
+// texture with the rest of the model owns no section of its own, and hiddenSelections,
+// setObjectTexture and the "hide" animations change nothing on the vertex-buffer draw path.
+// POSEIDON_MLOD_CFG_SECTIONS=0 restores the old behaviour.
+static void MarkCfgModelSections(Shape* lod, const std::vector<std::string>& names)
+{
+    static const bool enabled = []
+    {
+        const char* v = std::getenv("POSEIDON_MLOD_CFG_SECTIONS");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled || !lod)
+        return;
+    for (const std::string& name : names)
+    {
+        const int si = lod->FindNamedSel(name.c_str());
+        if (si >= 0)
+            lod->NamedSel(si).SetNeedsSections(true);
+    }
+}
+
+// WGPU-021: split an explicit section table wherever a face's membership in the section-aware
+// selections changes, so each such selection owns whole sections (what DefineSections and
+// FindShapeSections guarantee on the legacy path). Faces are not reordered: a selection whose faces
+// are scattered through a section simply gets several pieces. Every piece keeps the parent's
+// texture, special flags, material and surfMat, so the image is unchanged; only the number of
+// sections can grow. `facesPerSection` is parallel to `sections` on entry.
+static void SplitSectionsAtSectionSelections(Shape* lod, std::vector<ShapeSection>& sections,
+                                             const std::vector<int>& facesPerSection)
+{
+    if (!lod || sections.size() != facesPerSection.size())
+        return;
+    std::vector<int> aware;
+    for (int si = 0; si < lod->NNamedSel(); ++si)
+    {
+        const ::NamedSelection& sel = lod->NamedSel(si);
+        if (sel.GetNeedsSections() && sel.Faces().Size() > 0)
+            aware.push_back(si);
+    }
+    if (aware.empty())
+        return;
+
+    // Membership signature per face, one bit per section-aware selection. Past 64 selections the
+    // bits are shared, which can only leave two different memberships in one piece -- the old
+    // behaviour for that pair, never a wrong draw.
+    const int nFaces = lod->NFaces();
+    std::vector<uint64_t> signature(static_cast<size_t>(std::max(nFaces, 0)), 0);
+    for (size_t k = 0; k < aware.size(); ++k)
+    {
+        const uint64_t bit = uint64_t(1) << (k % 64);
+        const Selection& faces = lod->NamedSel(aware[k]).Faces();
+        for (int j = 0; j < faces.Size(); ++j)
+        {
+            const int f = faces[j];
+            if (f >= 0 && f < nFaces)
+                signature[static_cast<size_t>(f)] |= bit;
+        }
+    }
+
+    auto& faceStream = lod->Faces();
+    std::vector<ShapeSection> split;
+    split.reserve(sections.size());
+    int face = 0;
+    for (size_t s = 0; s < sections.size(); ++s)
+    {
+        const int count = facesPerSection[s];
+        if (count <= 0)
+        {
+            split.push_back(sections[s]);
+            continue;
+        }
+        ShapeSection piece = sections[s];
+        Offset pos = sections[s].beg;
+        uint64_t current = face < nFaces ? signature[static_cast<size_t>(face)] : 0;
+        for (int f = 0; f < count; ++f, ++face)
+        {
+            const uint64_t here = face < nFaces ? signature[static_cast<size_t>(face)] : 0;
+            if (f > 0 && here != current)
+            {
+                piece.end = pos;
+                split.push_back(piece);
+                piece = sections[s];
+                piece.beg = pos;
+                current = here;
+            }
+            faceStream.Next(pos);
+        }
+        piece.end = pos;
+        split.push_back(piece);
+    }
+    if (split.size() != sections.size())
+        sections.swap(split);
+}
+
 void BuildAdapterBankTables(const Poseidon::Model::Model& model, AdapterBankTables& tables)
 {
     static const bool trace = [] {
@@ -437,6 +580,9 @@ void BuildAdapterBankTables(const Poseidon::Model::Model& model, AdapterBankTabl
     tables.surfMats.resize(lodCount);
     tables.mlodSurfMats.clear();
     tables.mlodSurfMats.resize(lodCount);
+    tables.cfgSections.clear();
+    if (!isODOL)
+        tables.cfgSections = ResolveCfgModelSections(model.sourcePath);
     for (int i = 0; i < lodCount; ++i)
     {
         const Mesh& mesh = model.lodLevels[i].mesh;
@@ -503,6 +649,77 @@ void BuildAdapterBankTables(const Poseidon::Model::Model& model, AdapterBankTabl
                  model.sourceFormat, lodCount, textureCalls, materialCalls, loadMs, headerMs, materialMs);
 }
 
+// A CWA crew proxy (CfgNonAIVehicles class, simulation ProxyCrew) for an Arma 1 crew
+// placeholder, chosen by the seat its name states. Empty when the name is no seat
+// (view anchors, turned-out duplicates) or CWA defines no proxy for that seat.
+static RString Arma1CrewProxyStandIn(const RString& modelName)
+{
+    const char* base = modelName;
+    for (const char* q = modelName; *q; q++)
+        if (*q == '\\' || *q == '/')
+            base = q + 1;
+    std::string leaf(base);
+    for (char& c : leaf)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    // Arma 1's own CfgNonAIVehicles says what the proxy is; the name heuristics
+    // below are the fallback for names it does not list.
+    std::string a1Simulation;
+    int a1Position = -1;
+    if (Arma1Compat::ProxyKind(modelName, a1Simulation, a1Position))
+    {
+        const char* kind = a1Simulation == "proxyweapon"      ? "Weapon"
+                           : a1Simulation == "proxysecweapon" ? "SecWeapon"
+                           : a1Simulation == "proxyhandgun"   ? "HandGun"
+                           : a1Simulation == "flag"           ? "Flag"
+                                                              : nullptr;
+        if (kind && (Pars >> "CfgNonAIVehicles").FindEntry(RString("Proxy") + RString(kind)))
+            return RString(kind);
+    }
+    if (leaf.rfind("view", 0) == 0 || leaf.find("out") != std::string::npos)
+        return RString();
+    int position = -1; // CrewPosition: 0 driver, 1 gunner, 2 commander, 3 cargo
+    if (leaf.find("cargo") != std::string::npos || leaf.find("codriver") != std::string::npos ||
+        leaf.find("passenger") != std::string::npos)
+        position = 3;
+    else if (leaf.find("commander") != std::string::npos)
+        position = 2;
+    else if (leaf.find("gunner") != std::string::npos)
+        position = 1;
+    else if (leaf.find("driver") != std::string::npos || leaf.find("pilot") != std::string::npos)
+        position = 0;
+    if (a1Position >= 0)
+        position = a1Position;
+    if (position < 0)
+        return RString();
+
+    static RString chosen[4];
+    static bool scanned = false;
+    if (!scanned)
+    {
+        scanned = true;
+        const ParamEntry& classes = Pars >> "CfgNonAIVehicles";
+        for (int i = 0; i < classes.GetEntryCount(); i++)
+        {
+            const ParamEntry& cls = classes.GetEntry(i);
+            if (!cls.IsClass())
+                continue;
+            const char* name = cls.GetName();
+            if (strnicmp(name, "Proxy", 5) != 0 || !name[5])
+                continue;
+            const ParamEntry* sim = cls.FindEntry("simulation");
+            const ParamEntry* pos = cls.FindEntry("crewPosition");
+            if (!sim || !pos || stricmp((const char*)(RStringB)*sim, "ProxyCrew") != 0)
+                continue;
+            const int p = (int)*pos;
+            if (p >= 0 && p < 4 && chosen[p].GetLength() == 0)
+                chosen[p] = RString(name + 5);
+        }
+        LOG_INFO(Graphics, "Arma 1 crew proxies stand in as CWA driver '{}' gunner '{}' commander '{}' cargo '{}'",
+                 (const char*)chosen[0], (const char*)chosen[1], (const char*)chosen[2], (const char*)chosen[3]);
+    }
+    return chosen[position];
+}
+
 // Proxy objects for a converted shape. MAIN THREAD ONLY: the probe reads the
 // config (Pars) and the file table (QIFStreamB), and NewProxyObject/NewObject
 // recurse into ShapeBank::New. Split out of convertToLODShape so the geometry
@@ -560,8 +777,29 @@ void CreateAdapterProxies(LODShapeWithShadow* shape, const Poseidon::Model::Mode
                 // the file probe is the fallback for config-less paths
                 // (the Arma-era \ca\temp\... placeholders this probe was
                 // written for, which have neither class nor file).
-                const bool proxyHasConfigClass =
+                bool proxyHasConfigClass =
                     (Pars >> "CfgNonAIVehicles").FindEntry(RString("Proxy") + modelName) != nullptr;
+                // --arma1: Arma 1 crew placeholders (\ca\temp\proxies\uaz\driver, ...cargo01)
+                // name only a seat. Stand a CWA crew proxy of the same seat in for them, so
+                // the vehicle gets its driver/gunner/commander/cargo positions and the crew
+                // is drawn where Arma 1 seats it instead of not at all.
+                // --arma3: the head placeholder every Arma 3 man carries is drawn with the
+                // default Arma 3 head (Arma 3 puts the identity's head there).
+                if (!proxyHasConfigClass && Arma1Compat::Active())
+                {
+                    const RString head = Arma1Compat::Arma3HeadForProxy(modelName);
+                    if (head.GetLength() > 0 && QIFStreamB::FileExist(GetShapeName(head)))
+                        modelName = head;
+                }
+                if (!proxyHasConfigClass && Arma1Compat::Active() && !QIFStreamB::FileExist(GetShapeName(modelName)))
+                {
+                    RString substitute = Arma1CrewProxyStandIn(modelName);
+                    if (substitute.GetLength() > 0)
+                    {
+                        modelName = substitute;
+                        proxyHasConfigClass = true;
+                    }
+                }
                 if (!proxyHasConfigClass && !QIFStreamB::FileExist(GetShapeName(modelName)))
                 {
                     // MAT-053: before dropping a PILOT/DRIVER seat, remember where it
@@ -622,8 +860,14 @@ void CreateAdapterProxies(LODShapeWithShadow* shape, const Poseidon::Model::Mode
                 trans.SetPosition(::Vector3(m[0][3], m[1][3], m[2][3]));
 
                 LODShapeWithShadow* pshape = po->obj->GetShape();
+                // The proxy places the proxied model's SOURCE origin. An Arma ODOL model
+                // (revision 40 on) is stored around its binariser's bounding centre, which
+                // this engine keeps out of BoundingCenter() (it stays zero for drawing) and
+                // records as AnimationOrigin(): where the source origin lies in the stored
+                // coordinates. Without it a proxied model is drawn off by its whole centre --
+                // the corepatch M16A4 (centre 0.98 m up, 0.48 m along) at a soldier's feet.
                 if (pshape)
-                    trans.SetPosition(trans.FastTransform(pshape->BoundingCenter()));
+                    trans.SetPosition(trans.FastTransform(pshape->BoundingCenter() - pshape->AnimationOrigin()));
                 po->obj->SetTransform(trans);
                 po->invTransform = trans.InverseScaled();
                 po->obj->SetDestructType(DestructNo);
@@ -869,6 +1113,8 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
         const auto tanT0 = ::Poseidon::Dev::Perf::Now();
         const std::vector<std::array<float, 3>> generatedTangents = buildTangents(mesh, generatedBinormals);
         tanMs += ::Poseidon::Dev::Perf::ElapsedMs(tanT0);
+        const bool authoredTangentProducer = Asset::Formats::Enfusion::HasXobAuthoredTangentProducer(model);
+        bool anyAuthoredTangent = false;
         bool hasGeneratedTangentFrame = false;
         for (size_t vertexIndex = 0; vertexIndex < generatedTangents.size(); ++vertexIndex)
         {
@@ -925,16 +1171,23 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
             anyUv1 = mesh.vertices[v].uv1.u != 0.0f || mesh.vertices[v].uv1.v != 0.0f;
         if (anyUv1)
             shape->_lods[i]->ResizeUV1(vertexCount);
+        if (authoredTangentProducer) shape->_lods[i]->ResizeAuthoredTangentVertices(vertexCount);
         const auto vfillT0 = ::Poseidon::Dev::Perf::Now();
         for (int v = 0; v < vertexCount; ++v)
         {
             const Vertex& vertex = mesh.vertices[v];
+            const bool authoredTangentFrame = authoredTangentProducer &&
+                Asset::Formats::Enfusion::ValidXobAuthoredTangentVertex(vertex);
+            if (authoredTangentProducer) shape->_lods[i]->SetAuthoredTangentVertex(v, authoredTangentFrame);
+            anyAuthoredTangent = anyAuthoredTangent || authoredTangentFrame;
             if (anyUv1)
                 shape->_lods[i]->SetUV1(v, vertex.uv1.u, vertex.uv1.v);
             shape->_lods[i]->SetPos(v) = ::Vector3(vertex.position.x, vertex.position.y, vertex.position.z);
             shape->_lods[i]->SetNorm(v) = ::Vector3(vertex.normal.x, vertex.normal.y, vertex.normal.z);
-            shape->_lods[i]->SetTangent(v) = ::Vector3(generatedTangents[v][0], generatedTangents[v][1], generatedTangents[v][2]);
-            shape->_lods[i]->SetBinormal(v) = ::Vector3(generatedBinormals[v][0], generatedBinormals[v][1], generatedBinormals[v][2]);
+            shape->_lods[i]->SetTangent(v) = authoredTangentFrame ? ::Vector3(vertex.tangent.x, vertex.tangent.y, vertex.tangent.z) :
+                ::Vector3(generatedTangents[v][0], generatedTangents[v][1], generatedTangents[v][2]);
+            shape->_lods[i]->SetBinormal(v) = authoredTangentFrame ? ::Vector3(vertex.binormal.x, vertex.binormal.y, vertex.binormal.z) :
+                ::Vector3(generatedBinormals[v][0], generatedBinormals[v][1], generatedBinormals[v][2]);
             shape->_lods[i]->SetU(v, vertex.uv.u);
             shape->_lods[i]->SetV(v, vertex.uv.v);
 
@@ -949,7 +1202,7 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
             shape->_lods[i]->SetClip(v, c);
         }
         vfillMs += ::Poseidon::Dev::Perf::ElapsedMs(vfillT0);
-        shape->_lods[i]->SetHasTangentFrame(hasGeneratedTangentFrame);
+        shape->_lods[i]->SetHasTangentFrame(anyAuthoredTangent || hasGeneratedTangentFrame);
 
         if (isODOL && !mesh.frames.empty())
         {
@@ -1221,6 +1474,9 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
             shape->_lods[i]->_prop.Add(::NamedProperty(prop.name.c_str(), prop.value.c_str()));
         }
 
+        if (anyAuthoredTangent) shape->_lods[i]->SetProperty("wgrnativeframe", "3");
+        else if (shape->_lods[i]->FindProperty("wgrnativeframe") >= 0)
+            shape->_lods[i]->SetProperty("wgrnativeframe", "0");
         shape->_lods[i]->Compact();
 
         if (!isODOL)
@@ -1311,6 +1567,36 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
                     tex = materialIndexToTexture[sec.materialIndex];
                 shapeSections[s].properties.SetTexture(tex);
                 shapeSections[s].properties.SetSpecial(static_cast<int>(sec.hints));
+                // Arma ODOL (revision 40 on) does not carry OFP's alpha bits in the section
+                // hints: its foliage is cut out by the texture's own alpha (*_ca.paa). Without
+                // the bits the GL33 pass drew every Chernarus tree and bush as an opaque card.
+                // Derived from the texture exactly as the MLOD path above does per face.
+                if (isODOL && model.sourceVersion >= 40 && tex)
+                {
+                    int spec = shapeSections[s].properties.Special();
+                    // A streamed world object is converted on a worker (`tables`), where the
+                    // texture's headers are not loaded and IsAlpha() says nothing; there the
+                    // Arma naming rule decides: *_ca.paa carries alpha (colour + alpha), and
+                    // foliage is cut out by it. Measured: the d427d85 run still drew Utes'
+                    // trees as cards, every one of them a streamed object.
+                    if (!tables)
+                    {
+                        tex->LoadHeaders();
+                        if (tex->IsAlpha())
+                            spec |= IsAlpha | IsAlphaOrdered;
+                        if (tex->IsTransparent())
+                            spec |= IsTransparent;
+                    }
+                    // Operation Arrowhead's plants name theirs *_can.paa (alpha, normal-mapped):
+                    // Takistan's bushes still drew as green cards under the *_ca rule alone.
+                    const char* name = tex->Name();
+                    const size_t len = name ? strlen(name) : 0;
+                    const bool alphaNamed = (len > 7 && !strcmpi(name + len - 7, "_ca.paa")) ||
+                                            (len > 8 && !strcmpi(name + len - 8, "_can.paa"));
+                    if (alphaNamed && !(spec & (IsAlpha | IsTransparent)))
+                        spec |= IsTransparent;
+                    shapeSections[s].properties.SetSpecial(spec);
+                }
                 // An Arma P3D section may name an RVMAT independently of its
                 // base texture. Prefer that authored material over the legacy
                 // CfgTextureToMaterial lookup, which cannot recover the RVMAT
@@ -1332,13 +1618,24 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
                     faceStream.Next(nativePos);
                 shapeSections[s].end = nativePos;
             }
-            faceStream.SetSections(shapeSections.data(), nSections);
+            // WGPU-021: an MLOD reaches this branch too (Model::compile generates its section
+            // table), so this is where the CfgModels section selections have to split it.
+            if (!isODOL)
+            {
+                if (tables)
+                    MarkCfgModelSections(shape->_lods[i], tables->cfgSections);
+                else if (Foundation::IsMainThread())
+                    MarkCfgModelSections(shape->_lods[i], ResolveCfgModelSections(model.sourcePath));
+                SplitSectionsAtSectionSelections(shape->_lods[i], shapeSections, facesPerSection);
+            }
+            faceStream.SetSections(shapeSections.data(), static_cast<int>(shapeSections.size()));
             faceMs += ::Poseidon::Dev::Perf::ElapsedMs(faceT0) - 0.0;
             // Pair the explicit WGPU material trace with its model/LOD origin.
             // Shape itself carries no source path at draw time, so this is the
             // only reliable way to distinguish a visible LOD from its similarly
             // numbered shadow LOD without changing runtime data structures.
-            if (const char* trace = std::getenv("WGR_MATERIAL_DEBUG_RVMAT"); trace && std::strcmp(trace, "__trace__") == 0)
+            if (const char* trace = POSEIDON_GETENV_ONCE("WGR_MATERIAL_DEBUG_RVMAT");
+                trace && std::strcmp(trace, "__trace__") == 0)
             {
                 for (int s = 0; s < nSections; ++s)
                 {
@@ -1354,6 +1651,12 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
         }
         else
         {
+            // WGPU-021: the section selections come from the config, which only the main
+            // thread may read. A worker conversion takes them from the bank tables.
+            if (tables)
+                MarkCfgModelSections(shape->_lods[i], tables->cfgSections);
+            else if (Foundation::IsMainThread())
+                MarkCfgModelSections(shape->_lods[i], ResolveCfgModelSections(model.sourcePath));
             shape->_lods[i]->FindSections();
             // RFG-040: an MLOD carries no section table, so the branch above never runs
             // and FindSections -- which groups faces by texture/special only -- leaves
@@ -1498,6 +1801,33 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
         shape->_lods[i]->StoreOriginalMinMax();
         areaMs += ::Poseidon::Dev::Perf::ElapsedMs(areaT0);
     }
+    // --arma1 diagnostic (owner's play test: Sara's runway flickers, the helipad floats): how a
+    // surface-hugging Arma model comes in -- OnSurface (vertices flagged land-on) and z-bias
+    // on LOD 0, its height range. Runways, roads, helipads; once per shape.
+    if (lodCount > 0 && shape->_lods[0])
+    {
+        const std::string lower = [&] {
+            std::string n = shape->Name() ? shape->Name() : "";
+            for (char& c : n)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return n;
+        }();
+        if (lower.find("runway") != std::string::npos || lower.find("\\roads\\") != std::string::npos ||
+            lower.find("heli_h") != std::string::npos || lower.find("draha") != std::string::npos)
+        {
+            const Shape* l0 = shape->_lods[0];
+            int onSurface = 0, biased = 0;
+            for (Offset f = l0->BeginFaces(); f < l0->EndFaces(); l0->NextFace(f))
+            {
+                const int spec = l0->Face(f).Special();
+                onSurface += (spec & OnSurface) != 0;
+                biased += (spec & ZBiasMask) != 0;
+            }
+            LOG_INFO(Graphics, "Surface model {}: lod0 {} faces, {} on surface, {} z-biased, lod special {:#x}, y {:.2f}..{:.2f}",
+                     shape->Name() ? shape->Name() : "?", l0->NFaces(), onSurface, biased, (unsigned)l0->Special(),
+                     model.lodLevels[0].mesh.boundingBox.min.y, model.lodLevels[0].mesh.boundingBox.max.y);
+        }
+    }
     const auto tailT0 = ::Poseidon::Dev::Perf::Now();
 
     if (controlledOffline)
@@ -1534,6 +1864,19 @@ LODShapeWithShadow* ConvertWithContext(const Poseidon::Model::Model& model, bool
         shape->_minMax[1] = ::Vector3(model.boundingBox.max.x, model.boundingBox.max.y, model.boundingBox.max.z);
         shape->_boundingCenter = ::Vector3(model.boundingCenter.x, model.boundingCenter.y, model.boundingCenter.z);
         shape->_geometryCenter = ::Vector3(model.geometryCenter.x, model.geometryCenter.y, model.geometryCenter.z);
+        // Arma 1 (ODOL 40): vertices are stored around the binariser's bounding centre,
+        // the RTM animations in the source model's space. The animation code poses
+        // around this; drawing keeps the zero bounding centre it always had.
+        shape->_animationOrigin = ::Vector3(0, 0, 0);
+        if (const auto centre = model.metadata.find("odolBoundingCenter"); centre != model.metadata.end())
+        {
+            float x = 0, y = 0, z = 0;
+            if (std::sscanf(centre->second.c_str(), "%f %f %f", &x, &y, &z) == 3)
+            {
+                // the source origin, in the centred coordinates the vertices use
+                shape->_animationOrigin = reversed ? ::Vector3(x, -y, z) : ::Vector3(-x, -y, -z);
+            }
+        }
         shape->_aimingCenter = ::Vector3(model.aimingCenter.x, model.aimingCenter.y, model.aimingCenter.z);
         shape->_centerOfMass = ::Vector3(model.centerOfMass.x, model.centerOfMass.y, model.centerOfMass.z);
         shape->_color = PackedColor(model.color);

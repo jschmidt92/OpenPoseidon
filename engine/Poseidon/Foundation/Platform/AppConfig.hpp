@@ -170,6 +170,40 @@ class AppConfig
         _mapArchivePaths = roots.c_str();
         _localMapWorldId = worldId;
     }
+    /// --arma1 / --arma2 / --arma3: the installed Arma 1 (ArmA Gold), Arma 2 or Arma 3 folder
+    /// whose archives are mounted read-only. The newest generation given wins (one at a time).
+    const std::string& GetArma1Root() const
+    {
+        return !_arma3Root.empty() ? _arma3Root : !_arma2Root.empty() ? _arma2Root : _arma1Root;
+    }
+    /// 3 for --arma3, 2 for --arma2, 1 for --arma1, 0 for none.
+    int GetArmaGeneration() const
+    {
+        return !_arma3Root.empty() ? 3 : !_arma2Root.empty() ? 2 : !_arma1Root.empty() ? 1 : 0;
+    }
+    /// --arma2oa: the Arma 2: Operation Arrowhead folder (Expansion, BAF, PMC, ACR), optional.
+    const std::string& GetArma2OaRoot() const { return _arma2OaRoot; }
+    /// --arma1-mission / --arma2-mission / --arma3-mission: mission folder inside the mounted
+    /// mission archives.
+    const std::string& GetArma1Mission() const
+    {
+        return !_arma3Mission.empty() ? _arma3Mission : !_arma2Mission.empty() ? _arma2Mission : _arma1Mission;
+    }
+    /// --arma{1,2,3}-test-seconds: start without briefing, play N seconds, exit.
+    float GetArma1TestSeconds() const
+    {
+        return _arma3TestSeconds > 0.0f   ? _arma3TestSeconds
+               : _arma2TestSeconds > 0.0f ? _arma2TestSeconds
+                                          : _arma1TestSeconds;
+    }
+    /// --arma-original-ui: draw the mounted Arma game's own HUD and menus (its ui.pbo
+    /// patched over CWA's resource) instead of CWA's. Off by default.
+    bool GetArmaOriginalUi() const { return _armaOriginalUi; }
+    /// --arma{1,2,3}-campaign: start a campaign from its mounted archive.
+    const std::string& GetArma1Campaign() const
+    {
+        return !_arma3Campaign.empty() ? _arma3Campaign : !_arma2Campaign.empty() ? _arma2Campaign : _arma1Campaign;
+    }
     uint32_t GetWaitForParent() const { return _waitForParent; }
     const std::string& GetReforgerWorld() const { return _reforgerWorld; }
 
@@ -268,6 +302,7 @@ class AppConfig
 
     /// Test mission path (--test-mission)
     const std::string& GetTestMissionPath() const { return _testMissionPath; }
+    bool TestEditor() const { return _testEditor; }
     const std::vector<std::string>& GetTestModelPaths() const { return _testModelPaths; }
     // Overrides the .wrp the landscape loads, whatever world the mission asked
     // for. The only way to point the engine at an Arma 3 world today: those live
@@ -296,7 +331,7 @@ class AppConfig
     float GetTestModelScale() const { return _testModelScale; }
 
     /// True when --check and --test-mission are combined to run a bounded mission smoke boot.
-    bool IsMissionSmokeCheck() const { return _checkInit && !_testMissionPath.empty(); }
+    bool IsMissionSmokeCheck() const { return _checkInit && (!_testMissionPath.empty() || !GetArma1Mission().empty()); }
 
     /// True when --check and --simulate are combined to run a bounded MP smoke boot.
     bool IsSimulateSmokeCheck() const { return _checkInit && _simulateMode; }
@@ -498,6 +533,20 @@ class AppConfig
     RString _addonArchivePaths;
     RString _mapArchivePaths;
     std::string _localMapWorldId;
+    std::string _arma1Root;
+    std::string _arma1Mission;
+    float _arma1TestSeconds = 0.0f;
+    std::string _arma1Campaign;
+    std::string _arma2Root;
+    std::string _arma2OaRoot;
+    std::string _arma2Mission;
+    float _arma2TestSeconds = 0.0f;
+    std::string _arma2Campaign;
+    std::string _arma3Root;
+    std::string _arma3Mission;
+    float _arma3TestSeconds = 0.0f;
+    std::string _arma3Campaign;
+    bool _armaOriginalUi = false;
     uint32_t _waitForParent = 0;
     std::string _reforgerWorld;
     RString _modsDir;     // resolved --mods-dir base ("" if unset)
@@ -532,6 +581,7 @@ class AppConfig
     float _confirmRevertTimeoutSeconds = 0.f; // 0 → engine default (15s)
     float _appTimeoutSeconds = 0.f;
     std::string _testMissionPath;
+    bool _testEditor = false;
     std::vector<std::string> _testModelPaths;
     std::string _testWorldPath;
     int _testWorldMaxObjects = 0;

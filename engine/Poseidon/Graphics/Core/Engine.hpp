@@ -365,6 +365,11 @@ class Engine : public IGraphicsEngine
     void SetAspectSettings(const AspectSettings& set) { _aspectSettings = set; }
     void GetAspectSettings(AspectSettings& get) const { get = _aspectSettings; }
 
+    // Whether the backend samples a material's per-texel specular map (Arma's SMDI).
+    // One that does not gets the section's specular scaled by the map's mean instead
+    // (ShapeSection::PrepareTL, TexMaterial::SpecularMapLevel).
+    virtual bool SamplesSpecularMaps() const { return true; }
+
     virtual bool IsWBuffer() const { return false; }
     virtual bool CanWBuffer() const { return false; }
     virtual void SetWBuffer(bool val) {}
@@ -512,6 +517,19 @@ class Engine : public IGraphicsEngine
 
     virtual void EnableReorderQueues(bool enableReorded) {}
     virtual void FlushQueues() {}
+
+    // Pass-1 blend recording (Shape.hpp, GBlendRecord). A backend that can capture section
+    // draws into a per-frame side list and splice them back into its command stream later
+    // says so here; every other backend keeps drawing the object twice. Positions are
+    // indices into that side list, valid until the frame is submitted.
+    virtual bool BlendRecordAvailable() const { return false; }
+    virtual void BlendRecordCapture(bool on) {}
+    virtual uint32_t BlendRecordSize() const { return 0; }
+    virtual void BlendRecordReplay(uint32_t beg, uint32_t end) {}
+    // Verification lever: the stream position now, and whether the capture [beg, end)
+    // equals what the stream received since `mark` (the real second draw of the object).
+    virtual uint32_t BlendRecordStreamMark() const { return 0; }
+    virtual bool BlendRecordMatches(uint32_t beg, uint32_t end, uint32_t mark) const { return true; }
 
     // Shadow pipeline.  Wraps the per-caster shadow draw loop in scene.cpp:
     //   BeginShadowPass()   — color writes off, stencil REPLACE 0xFF
@@ -1341,7 +1359,21 @@ class Engine : public IGraphicsEngine
         float dryPatches = 0.08f;
         float dryPatchScale = 0.003f;
         float weedPercent = 0.37f;
-        float flowerPercent = 0.08f;
+        // GRS-VAR: 0.08 -> 0.12 once flower clumps carried visible heads.
+        float flowerPercent = 0.12f;
+        // GRS-VAR: per-clump looks inside each species group (flower heads, weed tints,
+        // seeding grass). Off = the meadow before GRS-VAR exactly. Never on a native world.
+        bool meadowVariety = true;
+        // Drift field frequency (1/m): ~11 m patches of one look at 0.09.
+        float lookDrift = 0.09f;
+        // Share of a flower / seeding clump's blades that carry the head.
+        float headShare = 0.5f;
+        float headBrightness = 0.8f;
+        // Weight of each look in its group, by slot (WgrGrassParams::look_weights):
+        // grass plain/foxtail/bent/fescue, weed clover/nettle/thistle/dock, flower
+        // daisy/poppy/dandelion/cornflower/buttercup/red clover/yarrow/cranesbill.
+        float lookWeights[16] = {3.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
         // Blade silhouette variety. The four grass species shared ONE profile,
         // so a field read as the same blade repeated over and over -- the first
         // thing a tester notices standing in it. 0 reproduces that legacy look
@@ -3125,6 +3157,24 @@ class Engine : public IGraphicsEngine
     };
     // Replace the whole far-proxy set. Called ONCE per world load. Empty releases it.
     virtual void SetFarProxyInstances(const FarProxyInstance* /*data*/, size_t /*count*/) {}
+    // The same, taking ownership: a backend may hand the vector to its render thread instead of
+    // waiting for it (PERF-FAR-PROXY-ASYNC). The default is the copying call.
+    virtual void SetFarProxyInstancesOwned(std::vector<FarProxyInstance>&& instances)
+    {
+        SetFarProxyInstances(instances.data(), instances.size());
+    }
+
+    // RFG-162: a native world's rivers as water. `vertices` = 8 floats per vertex (absolute
+    // world x, y, z; metres along the spline downstream; downstream direction x, z; signed
+    // metres across; half width), `indices` = triangles, `look` = the MatRiver's r, g, b,
+    // HalfLightDistance, FlowSpeed, Fresnel, SunPower, SunInfluence, WetFloor. Empty releases.
+    // A backend without a river renderer answers false from SupportsRiverSurfaces and the
+    // loader keeps building rivers as opaque ribbons.
+    virtual bool SupportsRiverSurfaces() const { return false; }
+    virtual void SetRiverSurfaces(const float* /*vertices*/, size_t /*floatCount*/, const uint32_t* /*indices*/,
+                                  size_t /*indexCount*/, const float* /*look*/, size_t /*lookCount*/)
+    {
+    }
 
     // SECOND CLOUD LAYER look: how MUCH of it there is (0 wisps .. 0.5 shipped .. 1 full veil) and
     // how far it resembles the FIRST layer (0 = high ice cloud, 1 = a second cumulus-like deck).
@@ -3201,6 +3251,10 @@ class Engine : public IGraphicsEngine
 
     // Visual-only authored world instances. Append virtuals to preserve existing slots.
     virtual bool SceneFarObjectCreated(uint32_t, LODShapeWithShadow*, const Matrix4&) { return false; }
+    // PERF-FAR-BC3-PREP: true when `shape`'s registration would not BC3-encode a texture on the
+    // calling thread -- nothing to encode, or the background encodes it started are in. False
+    // while they run (call again later; each call advances the work by at most one texture).
+    virtual bool PrepareGpuModelTexturesAsync(LODShapeWithShadow*) { return true; }
     virtual void SceneFarObjectRemoved(uint32_t) {}
     virtual void ClearFarObjects() {}
 
@@ -3524,6 +3578,16 @@ class Engine : public IGraphicsEngine
     // Appended owner-only opt-in colour diagnostic. -1 queries, 0..4 sets;
     // -2 unavailable/backend/owner, -3 invalid mode. No public renderer ABI grows.
     virtual int ControlWetSoilDiagnostic(int /*mode*/ = -1) { return -2; }
+    // RFG-153: render-only near clutter instances (Reforger's own plant models near the camera).
+    // Unlike SceneFarObjectCreated they keep the normal coverage LOD walk. APPENDED.
+    virtual bool SceneClutterObjectCreated(uint32_t, LODShapeWithShadow*, const Matrix4&) { return false; }
+    virtual void SceneClutterObjectRemoved(uint32_t) {}
+    // RFG-153: once per frame on the producer side, beside UpdateNativeFarResidency.
+    virtual void UpdateNativeClutter(const Vector3& /*camera*/) {}
+    // FAR-002: a native world's far proxies start where its authored far window's real models
+    // end -- a distance, not the cull complement. Negative = the ordinary far-tier start rule.
+    // APPENDED at the class end (vtable-slot note above).
+    virtual void SetNativeFarProxyStart(float /*metres*/) {}
 
   protected:
     // Post-hook fires from OnWindowResized so apps can re-run the aspect policy

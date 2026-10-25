@@ -1,5 +1,6 @@
 
 #include <Poseidon/Core/Config/EngineConfig.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Core/Config/UserConfig.hpp>
 #include <Poseidon/Core/Version.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
@@ -38,6 +39,7 @@
 #include <time.h>
 #include <limits.h>
 #include <string.h>
+#include <map>
 #include <string>
 #include <Poseidon/Foundation/Common/FltOpts.hpp>
 #include <Poseidon/Foundation/Containers/Array.hpp>
@@ -73,6 +75,7 @@ namespace Poseidon
 #include <Poseidon/Foundation/Platform/VersionNo.h>
 
 #include <Poseidon/Game/Commands/GameStateExtCommon.hpp>
+#include <Poseidon/World/Scene/ScriptLight.hpp>
 
 namespace Poseidon
 {
@@ -82,7 +85,7 @@ void AddDeadIdentity(RString);
 
 GameValue VehCreate(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
-    GameStringType type = oper1;
+    GameStringType type = Poseidon::Arma1Compat::ResolveVehicleClass(oper1); // identity unless --arma1
 
     Vector3 pos, normal = VUp;
     if (!GetPos(state, pos, oper2))
@@ -152,18 +155,19 @@ GameValue VehCreate(const GameState* state, GameValuePar oper1, GameValuePar ope
     return GameValueExt(veh.GetRef());
 }
 
-void CreateUnit(AIGroup* group, RString type, Vector3Par position, RString init, float skill, Rank rank)
+static EntityAI* CreateUnitImpl(AIGroup* group, RString type, Vector3Par position, RString init, float skill,
+                                Rank rank)
 {
     if (group->NUnits() >= MAX_UNITS_PER_GROUP)
     {
-        return;
+        return nullptr;
     }
 
     Ref<EntityAI> veh = NewVehicle(type);
     Person* soldier = dyn_cast<Person>(veh.GetRef());
     if (!soldier)
     {
-        return;
+        return nullptr;
     }
 
     Vector3 normal, pos = position;
@@ -232,11 +236,70 @@ void CreateUnit(AIGroup* group, RString type, Vector3Par position, RString init,
     {
         center->SelectLeader(group);
     }
+    return veh.GetRef();
+}
+
+void CreateUnit(AIGroup* group, RString type, Vector3Par position, RString init, float skill, Rank rank)
+{
+    CreateUnitImpl(group, type, position, init, skill, rank);
+}
+
+// Arma 3 has no twelve-unit group: Old Man creates its 3770 modules into the one group of
+// BIS_functions_mainscope. A full group passes its units on to an overflow group of its
+// side (one per full group, by the group's id; ids are not reused within a mission).
+// Logic groups do no group AI, so their number is not capped.
+static AIGroup* A3GroupWithRoom(AIGroup* grp)
+{
+    static std::map<std::pair<int, int>, OLink<AIGroup>> overflows;
+    while (grp && grp->NUnits() >= MAX_UNITS_PER_GROUP && Poseidon::Arma1Compat::Generation() >= 3)
+    {
+        AICenter* center = grp->GetCenter();
+        if (!center)
+            break;
+        OLink<AIGroup>& next = overflows[{static_cast<int>(center->GetSide()), grp->ID()}];
+        if (!next || next->GetCenter() != center)
+        {
+            if (center->GetSide() != TLogic && center->NGroups() >= MaxGroups)
+                break;
+            Ref<AIGroup> group = new AIGroup();
+            center->AddGroup(group);
+            group->AddFirstWaypoint(VZero);
+            Mission mis;
+            mis._action = Mission::Arcade;
+            center->SendMission(group, mis);
+            GetNetworkManager().CreateObject(group);
+            next = group.GetRef();
+        }
+        grp = next;
+    }
+    return grp;
+}
+
+// Arma 1: group createUnit [type, position, markers, placement, special] -> the unit
+GameValue A1UnitCreate(const GameState* state, GameValuePar oper1, GameValuePar oper2)
+{
+    const GameArrayType& array = oper2;
+    if (array.Size() < 2 || array[0].GetType() != GameString)
+    {
+        state->SetError(EvalDim, array.Size(), 5);
+        return GameValueExt((Object*)nullptr);
+    }
+    AIGroup* grp = A3GroupWithRoom(GetGroup(oper1));
+    Vector3 pos;
+    if (!grp || !GetRelPos(state, pos, array[1]))
+        return GameValueExt((Object*)nullptr);
+    const RString type = Poseidon::Arma1Compat::ResolveVehicleClass(RString(array[0]));
+    if (!grp->IsLocal())
+    {
+        GetNetworkManager().AskForCreateUnit(grp, type, pos, "", 0.5f, RankPrivate);
+        return GameValueExt((Object*)nullptr);
+    }
+    return GameValueExt(CreateUnitImpl(grp, type, pos, "", 0.5f, RankPrivate));
 }
 
 GameValue UnitCreate(const GameState* state, GameValuePar oper1, GameValuePar oper2)
 {
-    GameStringType type = oper1;
+    GameStringType type = Poseidon::Arma1Compat::ResolveVehicleClass(oper1); // identity unless --arma1
     const GameArrayType& array = oper2;
 
     Vector3 pos;
@@ -404,6 +467,11 @@ GameValue VehDelete(const GameState* state, GameValuePar oper1)
 {
     Object* obj = GetObject(oper1);
     if (!obj)
+    {
+        return NOTHING;
+    }
+    // LGT-SCRIPT-001: a "#lightpoint" is not an Entity and never in the world lists
+    if (Poseidon::DeleteScriptLight(obj))
     {
         return NOTHING;
     }
@@ -724,7 +792,11 @@ GameValue StrFormat(const GameState* state, GameValuePar oper1)
                 continue;
             }
             const GameValue& value = array[index];
-            RString text = (value.GetType() == GameString) ? value.GetData()->GetString() : value.GetText();
+            RString text;
+            if ((value.GetNil() || !value.GetData()) && Poseidon::Arma1Compat::Active())
+                text = "any"; // Arma 1/2 format a nil value as "any"
+            else
+                text = (value.GetType() == GameString) ? value.GetData()->GetString() : value.GetText();
             result.append(static_cast<const char*>(text), text.GetLength());
         }
         else
@@ -1123,7 +1195,9 @@ GameValue ObjAnimate(const GameState* state, GameValuePar oper1, GameValuePar op
     }
 
     const GameArrayType& array = oper2;
-    if (array.Size() != 2)
+    // [name, phase] -- Arma 2 and 3 add a third element (instant, or a speed), which is
+    // accepted and not used: the phase is reached the OFP way.
+    if (array.Size() < 2 || array.Size() > 3)
     {
         state->SetError(EvalDim, array.Size(), 2);
         return NOTHING;
@@ -1331,7 +1405,14 @@ GameValue IsCheatsEnabled(const GameState* state)
 #if _ENABLE_CHEATS
     return true;
 #else
-    return false;
+    // POSEIDON_A3_FUNCTIONS_LOG=1: as in Bohemia's development build, where Arma 3's function library
+    // (BIS_fnc_log, BIS_fnc_logFormat) writes its trace -- here through diag_log to the game's log
+    static const bool functionsLog = []
+    {
+        const char* e = std::getenv("POSEIDON_A3_FUNCTIONS_LOG");
+        return e && *e == '1';
+    }();
+    return functionsLog;
 #endif
 }
 

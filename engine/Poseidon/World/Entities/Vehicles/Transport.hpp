@@ -40,6 +40,7 @@ class TurretType
 	Vector3 _xAxis;
 
 	Vector3 _pos,_dir; // gun position and direction
+	Vector3 _muzzle; // where the barrel ends: the flash (the gun's begin point, else _pos)
 	float _neutralXRot; // initial turret position (in model)
 	float _neutralYRot; // initial turret position (in model)
 	Animation _body,_gun;
@@ -47,10 +48,19 @@ class TurretType
 	TurretType();
 	void Load(const ParamEntry &cfg);
 	void InitShape(const ParamEntry &cfg, LODShape *shape);
+	//! An Arma model names its gun points itself: the vehicle class `vehicle` may carry
+	//! a1GunBeg/a1GunEnd (the barrel, for the direction) and a1GunPoint (Arma's
+	//! memoryPointGun, where rounds leave). Each one the model has replaces CWA's; returns
+	//! whether any did. Nothing changes for a class without them.
+	bool ArmaGunPoints(const ParamEntry &vehicle, LODShape *shape);
 
 	int GetBodySelection(int level) const {return _body.GetSelection(level);}
 	int GetGunSelection(int level) const {return _gun.GetSelection(level);}
 };
+
+//! The memory point the vehicle class names with `key` (an Arma 1 memoryPointLRocket ...)
+//! when the model has it, else the model's `fallback` point
+Vector3 ConfigMemoryPoint(const ParamEntry &vehicle, LODShape *shape, const char *key, const char *fallback);
 
 class Turret
 {
@@ -939,6 +949,9 @@ protected:
 	void UnloadSound() override;
 
 	virtual float GetEngineVol( float &freq ) const {freq=1;return 0;}
+	// (OP) the lights stay as they were left when nobody is at the controls (a boat with a deck: her helmsman
+	// steps out onto it, owner 2026-10-22); otherwise they go off, as in OFP
+	virtual bool LightsStayUnmanned() const {return false;}
 	virtual float GetEnvironVol( float &freq ) const {freq=1;return 0;}
 	virtual Vector3 GetEnginePos() const; // sound source position in model coord
 	virtual Vector3 GetEnvironPos() const; // sound source position in model coord

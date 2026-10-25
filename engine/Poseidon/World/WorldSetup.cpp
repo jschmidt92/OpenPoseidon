@@ -1,3 +1,7 @@
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/Dev/Debug/DebugOverlay.hpp>
+#include <cstring>
 #include <Poseidon/World/Simulation/StableExtract.hpp>
 #include <cstdlib>
 #include <unordered_map>
@@ -579,6 +583,9 @@ void World::MoveOutAndDelete(VehiclesDistributed& list, float deltaT, bool apply
 // short IsKindOf chain walk per call, well under the Simulate it brackets.
 static void SimulateTimed(Entity* vehicle, VehicleSimulation simul, float deltaT, SimulationImportance prec)
 {
+    // Arma 3: switched off by a script, or frozen by dynamic simulation (DynamicSimulation.hpp)
+    if (vehicle->SimulationFrozen())
+        return;
     // PERF-027: the accounting is OFF unless asked for. What follows is not a
     // couple of clock reads -- it is a type-hierarchy classification per entity
     // per tick, and `_animals` holds one entity per footfall.
@@ -1342,10 +1349,33 @@ void World::SimulateLandscape(float deltaT)
     timeD += _timeToSkip;
     _timeToSkip = 0;
     //
-    if (Glob.clock.AdvanceTime(timeD))
+    // Whole world: the sun and moon are the ephemeris for the live geographic origin, expressed in its
+    // tangent frame. Free flight rebases that origin (every few tens of km, and to the moon); without a
+    // recalculation the sky kept the old frame's directions until the clock's next step, so the sun and
+    // moon sat in the wrong place and then jumped.
+    static uint64_t earthRevision = 0;
+    // (A switch to or across the moon frame, EarthMoonFrame.hpp, changes the frame the same way.)
+    const uint64_t revision = EarthStreaming::Enabled() ?
+        EarthStreaming::GetLocation().revision ^ (EarthStreaming::Celestial().Frame().revision << 40) : 0;
+    // From altitude the night/day judgement follows the camera's horizon dip (Lights.cpp), so it is
+    // re-evaluated every few frames there rather than once per 20 s clock step.
+    static int earthLightFrames = 0;
+    const bool earthAloft = EarthStreaming::Enabled() && GScene && GScene->GetCamera() &&
+                            GScene->GetCamera()->Position().Y() > 2000.0f && (++earthLightFrames % 4) == 0;
+    if (Glob.clock.AdvanceTime(timeD) || revision != earthRevision || earthAloft)
     {
+        earthRevision = revision;
         sun->Recalculate(this);
     }
+    // WHOLE WORLD "The Moon": once the world has run a moment (the moon's place comes from the light just
+    // computed), put the free-flight camera over the moon's near side; retried until it succeeds.
+    static bool moonStart = [] {
+        const char* v = std::getenv("POSEIDON_EARTH_START_MOON");
+        return EarthStreaming::Enabled() && v && std::strcmp(v, "1") == 0;
+    }();
+    static int moonStartFrames = 0;
+    if (moonStart && ++moonStartFrames > 90 && Dev::DebugOverlay::SetEarthMoonPose(400.0, 4.0, true))
+        moonStart = false;
     float scaledTime = timeD * (1 / OneSecond);
     GLOB_LAND->Simulate(scaledTime);
     _scene.MainLightChanged();
@@ -1393,6 +1423,16 @@ void World::SimulateLandscape(float deltaT)
             _speedFog = fabs(_wantedFog - _actualFog) / time;
         }
     }
+    // FOG-HOLD (2026-10-22, owner: "I still have fog on reforger even when I dial fog to zero").
+    // SetWeather(..., 0) restarts the weather clock, so the very next tick picked a new random
+    // fog target (up to +0.2) and drifted toward it -- and the Reforger haze is at full strength
+    // by 0.2 (RFG-206). A 10-minute Durras flight started at fog 0 had layered fog rendering again
+    // two minutes in. A fog set by hand is held; overcast keeps its weather.
+    if (_heldFog >= 0.0f)
+    {
+        _actualFog = _wantedFog = _heldFog;
+        _speedFog = 0;
+    }
     GLOB_LAND->SetOvercast(_actualOvercast);
     GLOB_LAND->SetFog(_actualFog);
 
@@ -1422,6 +1462,17 @@ void World::SimulateLandscape(float deltaT)
     // camera: a rotor wake nobody can see moves nothing anybody can see, and the
     // emitter list is deliberately small.
     GAirflow.Update(CameraOn() ? CameraOn()->Position() : VZero);
+}
+
+void World::HoldFog(float fog)
+{
+    if (fog < 0.0f)
+    {
+        _heldFog = -1.0f;
+        return;
+    }
+    _heldFog = std::clamp(fog, 0.0f, 1.0f);
+    SetWeather(-1, _heldFog, 0);
 }
 
 void World::SetWeather(float overcast, float fog, float time)
@@ -1528,8 +1579,39 @@ void World::SetTitleEffect(TitleEffect* effect)
 
 void World::SetCutEffect(TitleEffect* effect)
 {
+    if (_cutLayer != 0)
+    {
+        if (effect)
+            _cutLayers[_cutLayer] = effect;
+        else
+            _cutLayers.erase(_cutLayer);
+        return;
+    }
     _cutEffect = effect;
     Log("SetCutEffect %p", (void*)effect);
+}
+
+void World::NoteBlackEffect(const TitleEffect* effect)
+{
+    _blackEffect = effect;
+    _blackSince = Glob.uiTime;
+}
+
+void World::LiftStuckBlack()
+{
+    if (!_blackEffect || Arma1Compat::Generation() != 3 || Glob.uiTime - _blackSince < 30.0f)
+        return;
+    const bool cut = _cutEffect.GetRef() == _blackEffect, title = _titleEffect.GetRef() == _blackEffect;
+    _blackEffect = nullptr;
+    if (!cut && !title)
+        return;
+    LOG_WARN(Mission, "Arma 3: the mission's scripts held the screen black for 30 s and never faded it back in "
+                      "(they wait on Arma 3 features this engine lacks); the black {} layer is lifted",
+             cut ? "cut" : "title");
+    if (cut)
+        _cutEffect.Free();
+    if (title)
+        _titleEffect.Free();
 }
 
 void World::AddScript(Script* script)
@@ -1548,6 +1630,15 @@ void World::TerminateScript(Script* script)
     _scripts.Delete(index);
 }
 
+int World::TerminateAllScripts()
+{
+    const int count = _scripts.Size();
+    _scripts.Clear();
+    return count;
+}
+
+void Arma2RuntimeSimulate(); // GameStateExtA2.cpp: Arma 2 scripted FSMs (--arma2 only)
+
 void World::SimulateScripts()
 {
     for (int i = 0; i < _scripts.Size();)
@@ -1561,6 +1652,7 @@ void World::SimulateScripts()
             i++;
         }
     }
+    Arma2RuntimeSimulate();
 }
 
 void World::SetCameraScript(Script* script)

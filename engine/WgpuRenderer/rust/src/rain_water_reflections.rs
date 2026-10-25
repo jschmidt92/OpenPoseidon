@@ -429,7 +429,7 @@ mod tests {
             module: &shader,
             entry_point: Some("cs_probe"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get(&device),
         });
         let proj = Mat4::perspective_rh(1.0, 1.0, 0.1, 500.0);
         let camera_bytes: [f32; 48] = [
@@ -625,7 +625,7 @@ mod tests {
                 });
                 device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
                 recv.recv().unwrap().unwrap();
-                let bytes = staging.slice(..).get_mapped_range();
+                let bytes = staging.slice(..).get_mapped_range().expect("wgpu: mapped range of a mapped buffer");
                 let result = bytemuck::cast_slice::<u8, [f32; 4]>(&bytes).to_vec();
                 drop(bytes);
                 staging.unmap();

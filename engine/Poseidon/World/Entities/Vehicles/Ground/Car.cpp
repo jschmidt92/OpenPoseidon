@@ -12,8 +12,12 @@
 #include <Poseidon/World/Entities/Vehicles/Ground/Car.hpp>
 #include <Poseidon/World/Entities/Vehicles/Ground/TrackedWaterResponse.hpp>
 #include <Poseidon/World/Weather/MudContact.hpp>
+#include <Poseidon/World/Effects/MudSpray.hpp>
 #include <Poseidon/World/Weather/MudField.hpp>
+#include <Poseidon/World/Weather/MudTraction.hpp>
 #include <Poseidon/Game/OperMap.hpp>
+#include <map>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/Network/Network.hpp>
 #include <Poseidon/Graphics/Rendering/Draw/SpecLods.hpp>
 
@@ -106,6 +110,26 @@ void CarType::InitShape()
     base::InitShape();
 
     // wheel animations
+    // An Arma 2 model names its wheels by bone, wheel_<side>_<n> (side 1 left, 2 right;
+    // n 1 front, 2 back, 3 middle, 4 second front); the ODOL loader gives each wheel bone
+    // a selection. Taken only where the model has none of the CWA names.
+    const Shape* lod0 = _shape->NLevels() > 0 ? _shape->Level(0) : nullptr;
+    const bool a2Wheels =
+        lod0 && lod0->FindNamedSel("levy predni") < 0 && lod0->FindNamedSel("wheel_1_1") >= 0;
+    if (a2Wheels)
+    {
+        _frontLeftWheel.Init(_shape, "wheel_1_1", nullptr, nullptr);
+        _frontRightWheel.Init(_shape, "wheel_2_1", nullptr, nullptr);
+        _front2LeftWheel.Init(_shape, "wheel_1_4", nullptr, nullptr);
+        _front2RightWheel.Init(_shape, "wheel_2_4", nullptr, nullptr);
+        _midLeftWheel.Init(_shape, "wheel_1_3", nullptr, nullptr);
+        _midRightWheel.Init(_shape, "wheel_2_3", nullptr, nullptr);
+        _backLeftWheel.Init(_shape, "wheel_1_2", nullptr, nullptr);
+        _backRightWheel.Init(_shape, "wheel_2_2", nullptr, nullptr);
+        LOG_INFO(Graphics, "Car {}: Arma 2 wheels by bone (wheel_<side>_<n>)", (const char*)GetName());
+    }
+    else
+    {
     _frontLeftWheel.Init(_shape, "levy predni", "levy predni tlumic", nullptr);
     _frontRightWheel.Init(_shape, "pravy predni", "pravy predni tlumic", nullptr);
     _front2LeftWheel.Init(_shape, "levy dalsi", "levy dalsi tlumic", nullptr);
@@ -114,6 +138,7 @@ void CarType::InitShape()
     _midRightWheel.Init(_shape, "pravy prostredni", "pravy prostredni tlumic", nullptr);
     _backLeftWheel.Init(_shape, "levy zadni", "levy zadni tlumic", nullptr);
     _backRightWheel.Init(_shape, "pravy zadni", "pravy zadni tlumic", nullptr);
+    }
 
     _drivingWheel.Init(_shape, "volant", nullptr, "osaVolantKon");
 
@@ -204,6 +229,7 @@ void CarType::InitShape()
     if (_hasTurret)
     {
         _turret.InitShape(par >> "Turret", _shape);
+        _turret.ArmaGunPoints(par, _shape);
     }
 
     _animFire.Init(_shape, "zasleh", nullptr);
@@ -294,6 +320,8 @@ void CarType::InitShape()
 }
 
 int GetTemplateSeed();
+
+DEFINE_CASTING(Car)
 
 Car::Car(VehicleType* name, Person* driver)
     : base(name, driver), _thrustWanted(0), _thrust(0), _turnWanted(0), _turn(0), _turnIncreaseSpeed(1),
@@ -594,6 +622,21 @@ void Car::MoveWeapons(float deltaT)
     }
 
     AIUnit* unit = GunnerUnit();
+    // --arma1 diagnostic (a1gunfire): car turrets that know their target never slew. Once per
+    // vehicle every 2 s for generated Arma 1 classes: is there a gunner unit, where does the
+    // turret point, where does it want to.
+    if (Arma1Compat::Active() && _strnicmp(Type()->GetName(), "A1x_", 4) == 0)
+    {
+        static std::map<const void*, float> last;
+        float& t = last[this];
+        if (t <= 0 || Glob.time.toFloat() - t >= 2.0f)
+        {
+            t = Glob.time.toFloat();
+            LOG_INFO(AI, "A1 turret {}: gunner unit {} yRot {:.3f} wanted {:.3f} xRot {:.3f} wanted {:.3f} stopped {} fireTarget {}",
+                     (const char*)Type()->GetName(), unit ? "yes" : "NO", _turret._yRot, _turret._yRotWanted,
+                     _turret._xRot, _turret._xRotWanted, _isStopped, GetFireTarget() ? "yes" : "no");
+        }
+    }
     if (!unit)
     {
         _turret.Stop(Type()->_turret);
@@ -623,11 +666,52 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
         return !value || std::strcmp(value, "0") != 0;
     }();
     const bool singlePlayer = GWorld && GWorld->GetMode() != GModeNetware;
-    const auto mudProfile = SelectMudWheelProfile(Type()->GetName(), mudTruckEnabled, singlePlayer);
+    // Mud family from the config inheritance (Truck / Car), worked out once per type.
+    if (_mudFamilyType != Type())
+    {
+        _mudFamilyType = Type();
+        RString names[16];
+        const char* chain[16];
+        int count = 0;
+        for (const EntityType* t = Type(); t && count < 16; t = t->_parentType)
+        {
+            names[count] = t->GetName();
+            chain[count] = names[count];
+            ++count;
+        }
+        _mudFamily = ClassifyMudVehicle(chain, count, GetMass());
+        _mudWheelCount = 0;
+        for (int i = 0; i < MaxWheels; ++i)
+            if (Type()->_wheels[i] && !Type()->_wheels[i]->IsEmpty()) ++_mudWheelCount;
+        LOG_INFO(Physics, "MUD_FAMILY class={} family={} wheels={} mass={:.0f} parent={}", Type()->GetName().Data(),
+                 int(_mudFamily), _mudWheelCount, GetMass(), count > 1 ? static_cast<const char*>(names[1]) : "");
+    }
+    auto mudProfile = SelectMudWheelProfile(_mudFamily, _mudWheelCount, mudTruckEnabled, singlePlayer);
+    // Tuning without a rebuild: POSEIDON_MUD_GRIP_LOSS (0..0.8, how much grip deep
+    // wet mud takes away) and POSEIDON_MUD_DIG_MAX (metres a spinning wheel can dig).
+    static const float mudGripLossOverride = [] {
+        const char* value = std::getenv("POSEIDON_MUD_GRIP_LOSS");
+        return value ? std::clamp(float(std::atof(value)), 0.0f, 0.8f) : -1.0f;
+    }();
+    static const float mudDigMaxOverride = [] {
+        const char* value = std::getenv("POSEIDON_MUD_DIG_MAX");
+        return value ? std::clamp(float(std::atof(value)), 0.0f, MudField::MaxDepth) : -1.0f;
+    }();
+    if (mudProfile.enabled && mudGripLossOverride >= 0.0f) mudProfile.gripLoss = mudGripLossOverride;
+    if (mudProfile.enabled && mudDigMaxOverride >= 0.0f) mudProfile.digMax = mudDigMaxOverride;
     // Verified stock truck ruts and rolling resistance are default in SP.
     // Startup overrides set to0 retain the old behavior; MP scope is unchanged.
     const bool mudPrototype = IsLocal() && mudProfile.enabled &&
                               GMud().ContactActive() && DirectionUp().Y() >= 0.3f;
+    // Grip / wheelspin / digging (MudTraction.hpp). Same SP-only scope as the
+    // rolling resistance it extends; POSEIDON_MUD_TRACTION_PROTOTYPE=0 turns it off.
+    const bool mudTraction = mudPrototype && mudTractionEnabled && singlePlayer;
+    if (!mudTraction)
+    {
+        _mudGrip = 1.0f;
+        _mudSoft = 0.0f;
+        _mudSpin = MudSpinApproach(_mudSpin, 0.0f, deltaT);
+    }
     bool mudGrounded[MaxWheels]{};
     Vector3 mudContact[MaxWheels];
     float mudUnder[MaxWheels]{};
@@ -742,6 +826,11 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
 
     float wheelLen = Type()->_wheelCircumference;
     _wheelPhase += speed.Z() * (1 / wheelLen) * deltaT;
+    // Spinning in mud: wheels turn faster than the truck moves (up to ~6 m/s of slip).
+    if (_mudSpin > 0.0f)
+    {
+        _wheelPhase += fSign(_thrust) * _mudSpin * 6.0f * (1 / wheelLen) * deltaT;
+    }
     _wheelPhase = fastFmod(_wheelPhase, 1);
 
     if (_isDead || _isUpsideDown)
@@ -930,6 +1019,9 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
 
                 lAccel *= (1 - GetHit(Type()->_engineHit)) * (1 - lWheelHit);
                 rAccel *= (1 - GetHit(Type()->_engineHit)) * (1 - rWheelHit);
+                // Mud: less grip, less push (and slower steering response).
+                lAccel *= _mudGrip;
+                rAccel *= _mudGrip;
 
                 pForce = Vector3(0, 0, lAccel * GetMass());
                 force += pForce;
@@ -1218,6 +1310,7 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
             _landContact = false;
             _objectContact = false;
             _waterContact = false;
+            _waterDepth = 0.0f;
             if (gCollision.Size() > 0)
             {
 #define MAX_UNDER 0.4f
@@ -1247,6 +1340,7 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
                         const float coefNPoints = 16.0 / 4.0;
                         // first is water is "pushing" everything up - causing some momentum
                         saturateMax(maxUnderWater, info.under);
+                        saturateMax(_waterDepth, info.under); // mud washing (MudCoat)
 
                         // TW-WATER W6-pre: a wreck floods and sinks (TrackedWaterResponse.hpp)
                         const float waterUnder = _isDead ? WreckImmersion(info.under) : info.under;
@@ -1356,6 +1450,13 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
                         if (brakeFriction < 0.7f)
                         {
                             pForce[2] *= 0.1f;
+                        }
+                        // Mud: tyres hold less along (drive and brakes) and a bit less
+                        // sideways, so the truck drifts wide and slides when braking.
+                        if (_mudGrip < 1.0f)
+                        {
+                            pForce[0] *= MudSideGrip(_mudGrip);
+                            pForce[2] *= _mudGrip;
                         }
                         // friction can not be applied in same direction as speed
                         if (pForce[0] * speed[0] < 0)
@@ -1525,22 +1626,53 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
             }
         }
 
-        if (mudPrototype && mudTractionEnabled && singlePlayer && !_waterContact)
+        if (mudTraction && !_waterContact)
         {
             int admitted = 0;
+            float sink = 0.0f; // mean existing rut depth under the wheels that are in mud
             for (int wheel = 0; wheel < MaxWheels; ++wheel)
-                if (mudGrounded[wheel] && AdmitMudWheelContact(*GLOB_LAND, *this, mudContact[wheel])) ++admitted;
-            const float deceleration = MudRollingDeceleration(speed.Z(), GMud().ContactDepth(),
-                GMud().Wetness(), deltaT, admitted, mudProfile.wheels);
+                if (mudGrounded[wheel] && AdmitMudWheelContact(*GLOB_LAND, *this, mudContact[wheel]))
+                {
+                    ++admitted;
+                    sink += std::max(0.0f, -GMud().HeightOffsetAt(mudContact[wheel].X(), mudContact[wheel].Z()));
+                }
+            if (admitted > 0) sink /= float(admitted);
+            const float layer = GMud().LayerDepth();
+
+            // Rolling resistance, stronger when pushing through an existing rut.
+            // Still never reverses or speeds the vehicle up (bounded by |v|/dt).
+            float deceleration = MudRollingDeceleration(speed.Z(), GMud().ContactDepth(),
+                GMud().Wetness(), deltaT, admitted, mudProfile.wheels) * MudSinkResistanceScale(sink, layer);
+            deceleration = MudLimitRollingDeceleration(deceleration);
+            if (deltaT > 0) deceleration = std::copysign(std::min(std::abs(deceleration), std::abs(speed.Z()) / deltaT), deceleration);
             friction += DirectionModelToWorld(Vector3(0, 0, deceleration * GetMass()));
+
+            // Grip and wheelspin for the next step (drive and tyre forces read them).
+            _mudGrip = MudGrip(GMud().Wetness(), sink, layer, admitted, mudProfile.wheels, mudProfile.gripLoss);
+            _mudSoft = admitted > 0 ? MudSoftness(GMud().Wetness()) : 0.0f;
+            _mudSpin = MudSpinApproach(_mudSpin,
+                MudWheelSpinTarget(_mudGrip, _thrust, speed.Z(), Type()->GetMaxSpeedMs()), deltaT);
+
             static const bool mudTrace = [] {
                 const char* value = std::getenv("POSEIDON_MUD_TRACE");
                 return value && std::strcmp(value, "1") == 0;
             }();
-            if (mudTrace && deceleration != 0 && std::fmod(Glob.time.toFloat(), 1.0f) < deltaT)
-                LOG_INFO(Physics, "MUD_RESISTANCE class={} wheels={}/{} speed={:.3f} deceleration={:.3f}",
-                         Type()->GetName().Data(), admitted, mudProfile.wheels, speed.Z(), deceleration);
+            if (mudTrace && admitted > 0 && std::fmod(Glob.time.toFloat(), 1.0f) < deltaT)
+                LOG_INFO(Physics, "MUD_TRACTION class={} wheels={}/{} speed={:.3f} deceleration={:.3f} sink={:.3f} grip={:.3f} spin={:.3f} thrust={:.2f}",
+                         Type()->GetName().Data(), admitted, mudProfile.wheels, speed.Z(), deceleration,
+                         sink, _mudGrip, _mudSpin, _thrust);
         }
+        else if (mudTraction)
+        {
+            // Wading: water physics takes over.
+            _mudGrip = 1.0f;
+            _mudSoft = 0.0f;
+            _mudSpin = MudSpinApproach(_mudSpin, 0.0f, deltaT);
+        }
+        // Mud caked on the wheels and body (drawn by the renderer, MudCoat.hpp).
+        AdvanceMudCoat(_mudCoat, deltaT, mudTraction ? _mudSoft : 0.0f, speed.Z(), mudTraction ? _mudSpin : 0.0f,
+                       _waterContact ? _waterDepth : 0.0f, GLandscape ? GLandscape->GetRainDensity() : 0.0f,
+                       mudProfile.coatRate);
         ApplyForces(deltaT, force, torque, friction, torqueFriction);
 
         bool stopCondition = false;
@@ -1575,7 +1707,9 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
         {
             if (DirectionUp().Y() >= 0.3f)
             {
-                _track.Update(*this, deltaT, !_landContact);
+                // On soft wet mud the deformed ruts (with their shaded tread imprint)
+                // are the track; the flat vanilla tyre decal would only paint over them.
+                _track.Update(*this, deltaT, !_landContact || _mudSoft > 0.2f);
             }
             if (_landContact)
             {
@@ -1589,11 +1723,14 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
                 float dustColor = dSoft * 8;
                 saturate(dustColor, 0, 1);
                 Color color = Color(0.51f, 0.46f, 0.33f) * dustColor + Color(0.5f, 0.5f, 0.5f) * (1 - dustColor);
-                // color.SetA(0.3);
+                // Wet soil does not raise dry dust.
+                density *= 1.0f - _mudSoft;
                 _leftDust.SetColor(color);
                 _rightDust.SetColor(color);
                 _leftDust.Simulate(lPos + _speed * 0.2f, _speed * 0.5f, density, deltaT);
                 _rightDust.Simulate(rPos + _speed * 0.2f, _speed * 0.5f, density, deltaT);
+                // Wet mud is thrown off the tyres per wheel as real clods (MudClods),
+                // see the wheel loop at the end of Simulate.
             }
 
             SimulateExhaust(deltaT, prec);
@@ -1611,6 +1748,20 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
     // Resting vehicles must still keep newly deposited snow below their chassis.
     _track.UpdateSnow(*this, !_landContact || DirectionUp().Y() < 0.3f, deltaT);
 
+    {
+        static const bool mudGateTrace = [] {
+            const char* value = std::getenv("POSEIDON_MUD_TRACE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (mudGateTrace && std::fmod(Glob.time.toFloat(), 1.0f) < deltaT)
+        {
+            int grounded = 0;
+            for (int wheel = 0; wheel < MaxWheels; ++wheel) grounded += mudGrounded[wheel] ? 1 : 0;
+            LOG_INFO(Physics, "MUD_GATE class={} mass={:.0f} profile={} local={} active={} wet={:.2f} up={:.2f} grounded={} water={}",
+                     Type()->GetName().Data(), GetMass(), mudProfile.enabled, IsLocal(), GMud().ContactActive(),
+                     GMud().Wetness(), DirectionUp().Y(), grounded, _waterContact);
+        }
+    }
     // Publish only after all collision forces were evaluated against one field
     // state. Each wheel carries its own actual support; car-wide contact cannot
     // stamp airborne wheels. No contacts during stopped simulation means no dig.
@@ -1622,11 +1773,72 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
             continue;
         }
         const Vector3& point = mudContact[wheel];
+        // MUD-001: a wheel turning in wet soft ground throws mud back and up off its tread (the
+        // renderer's particle mud); more the faster it turns and the wetter the ground.
+        // Where the mud traction runs (single player) the 3D clods below are the wheel's
+        // mud instead, so the two never double up.
+        if (MudSprayEnabled() && !mudTraction)
+        {
+            const Vector3 v = Speed();
+            const float ground = std::min(v.SizeXZ(), 15.0f);
+            if (ground > 1.0f)
+            {
+                const Vector3 fwd = Direction();
+                const float sign = v * fwd >= 0.0f ? 1.0f : -1.0f;
+                MudSprayReport spray;
+                spray.pos = point + VUp * 0.05f;
+                spray.vel = v * 0.35f - fwd * (sign * ground * 0.45f) + VUp * (1.2f + 0.2f * ground);
+                spray.count = ground * 22.0f * deltaT * GMud().Wetness();
+                spray.velSpread = 0.8f + 0.08f * ground;
+                spray.size = 0.03f;
+                spray.posSpread = 0.12f;
+                ReportMudSpray(spray);
+            }
+        }
         _mudWheels[wheel].Update(point.X(), point.Y(), point.Z(),
             true,
             [&](float x, float y, float z) {
                 return StampMudWheelContact(*GLOB_LAND, *this, Vector3(x, y, z), mudProfile);
             });
+        // A spinning wheel keeps digging where it stands, so flooring it in a
+        // bog buries the truck deeper; easing off or rocking is the way out.
+        if (mudTraction && _mudSpin > 0.15f && AdmitMudWheelContact(*GLOB_LAND, *this, point))
+        {
+            const float depth = MudDigDepth(_mudSpin, GMud().ContactDepth(), mudProfile.digMax);
+            if (depth > 0.0f)
+            {
+                // Dig unevenly and throw the spoil out to the sides as messy ridges.
+                const Vector3 dir = Direction();
+                const MudRutStamp dig = PlanMudRutStamp(point.X(), point.Z(), dir.X(), dir.Z(),
+                                                        MudWheelRutRadius(depth) * 0.85f, depth, _mudSpin);
+                const float pressure = MudDigPressure(_mudSpin, deltaT);
+                GMud().Stamp(dig.x, dig.z, dig.radius, dig.depth, pressure);
+                // Shallower digs ahead and behind turn the hole into a trough the
+                // tyre can climb out of, instead of a pit with a wall in front.
+                for (float along : {-0.45f, 0.45f})
+                    GMud().Stamp(dig.x + dir.X() * along, dig.z + dir.Z() * along, dig.radius,
+                                 dig.depth * 0.6f, pressure);
+                for (int k = 0; k < 2; ++k)
+                    GMud().Raise(dig.rimX[k], dig.rimZ[k], dig.rimRadius[k], dig.rimHeight[k]);
+            }
+        }
+        // Mud thrown off the tyre: lumps of wet soil, a few when rolling through
+        // soft ground, a lot when the wheels spin (MudClods / MudClodPhysics).
+        if (mudTraction && _mudSoft > 0.05f && EnableVisualEffects(prec) &&
+            AdmitMudWheelContact(*GLOB_LAND, *this, point))
+        {
+            const float perWheel = MudClodRate(_mudSpin, speed.Z(), _mudSoft);
+            const int count = _mudClods[wheel].Take(perWheel, deltaT);
+            if (count > 0)
+            {
+                const float drive = _thrust != 0.0f ? _thrust : speed.Z();
+                SpawnMudClods(point, Direction(), _speed, drive < 0.0f ? -1.0f : 1.0f, speed.Z(), _mudSpin, count);
+            }
+        }
+        else
+        {
+            _mudClods[wheel].carry = 0.0f;
+        }
     }
 
     if (!CommanderUnit() || CommanderUnit()->IsInCargo())
@@ -1634,6 +1846,11 @@ void Car::Simulate(float deltaT, SimulationImportance prec)
         // Note: virtual function LightsOn/Off — needs LightsOn()/LightsOff() overrides in subclasses
         _pilotLight = false;
     }
+}
+
+bool Car::GetMudCoat(float& encoded, float& planeD, float& upPacked) const
+{
+    return MudCoatRenderLanes(*this, _mudCoat, encoded, planeD, upPacked);
 }
 
 void Car::Eject(AIUnit* unit)
@@ -2221,6 +2438,11 @@ void Car::FireWeaponEffects(int weapon, const Magazine* magazine, EntityAI* targ
                 case AmmoShotBullet:
                     _mGunClouds.Start(0.1);
                     _mGunFire.Start(0.1, 0.4, true);
+                    {
+                        Matrix4Val gun = GunTurretTransform();
+                        ArmaVehicleMuzzleBurst(gun.FastTransform(Type()->_turret._muzzle),
+                                               gun.Rotate(Type()->_turret._dir), mode);
+                    }
                     _mGunFireFrames = 1;
                     _mGunFireTime = Glob.uiTime;
                     int newPhase;
@@ -2574,6 +2796,32 @@ Matrix4 Car::TurretTransform() const
         }
     }
     return MIdentity;
+}
+
+// An Arma 1 car's gunner looks from "gunnerview" over his gun's sights. Its memory LOD ties
+// the point to the gun by the model.cfg skeleton, which the OFP animation does not read, so
+// the point stayed where the gun was at rest while the gun turned: pressing V gave the view
+// past the M2's side (HMMWV, 5t truck; owner, 2026-10-25). For an Arma 1 class (a1MuzzleFlash)
+// whose point the turret did not move, the point rides the gun's own transform.
+bool Car::GetOpticsCamera(Matrix4& transf, CameraType camType) const
+{
+    if (!base::GetOpticsCamera(transf, camType))
+        return false;
+    const AIUnit* unit = GWorld->FocusOn();
+    if (!HasTurret() || !unit || unit->GetPerson() != _gunner || !Type()->_par ||
+        !Type()->_par->FindEntry("a1MuzzleFlash"))
+        return true;
+    Shape* memory = _shape->MemoryLevel();
+    int index = memory ? memory->FindNamedSel("gunnerview") : -1;
+    if (index < 0 && memory)
+        index = memory->FindNamedSel("gunner_view");
+    if (index < 0 || !memory || memory->NamedSel(index).Size() < 1)
+        return true;
+    const Vector3 rest = memory->Pos(memory->NamedSel(index)[0]);
+    const bool unmoved = transf.Position().Distance2(rest) < 1e-6f && transf.Direction().Distance2(VForward) < 1e-6f;
+    if (unmoved)
+        transf = GunTurretTransform() * Matrix4(MTranslation, rest);
+    return true;
 }
 
 Matrix4 Car::GunTurretTransform() const

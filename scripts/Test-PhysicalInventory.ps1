@@ -1,7 +1,8 @@
 <# Installed single-player inventory without a custom invicons asset pack.
    Run under with-game-lock.sh. Uses isolated settings, exits only its own process. #>
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ExpectedCommit,[switch]$Multiplayer,[switch]$CombatAssists)
+param([Parameter(Mandatory)][string]$ExpectedCommit,[switch]$Multiplayer,[switch]$CombatAssists,[switch]$CompassOnly,
+      [switch]$LegacyBindings,[switch]$KeysOnly)
 $ErrorActionPreference = 'Stop'
 if (!$env:LOCK_OWNER) { throw 'Game lock required' }
 $root = Split-Path $PSScriptRoot -Parent
@@ -54,6 +55,10 @@ function Button($down) { $null=Send @{cmd='mouse_button';button=1;down=$down}; S
 function Click($x,$y) { Pointer $x $y; Button $true; Button $false }
 try {
     [IO.File]::WriteAllText((Join-Path $env:POSEIDON_USER_DIR 'graphics.cfg'),"qualityPreset=3;`nmsaaSamples=4;`ndlssMode=0;`nvsync=0;`nfpsCap=60;`n")
+    if ($LegacyBindings) {
+        [IO.File]::WriteAllText((Join-Path $env:POSEIDON_USER_DIR 'contextControls.cfg'),
+            "contextControlsVersion=6;`nctxInfantryInventory[]={18};`nctxInfantryInventoryEditMenu[]={14};`nctxInfantryLockTargets[]={43};`nctxInfantryTurbo[]={225};`nctxTankGunnerLockTargets[]={43};`nctxTankGunnerInventory[]={18};`n")
+    }
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start(); $port=$listener.LocalEndpoint.Port; $listener.Stop()
     $log=Join-Path $out 'engine.log'; $stderr=Join-Path $out 'stderr.log'
     $args=@('--render=wgpu','--window','--dev','--width','1280','--height','720','--harness',"$port",'--private','--log-file',('"'+$log+'"'))
@@ -97,9 +102,49 @@ try {
         $receipt.passed=$true; Write-Host ('Evidence: '+$out); return
     }
     while ((Value 'triSceneReady') -cne 'OK') { Require ([DateTime]::UtcNow -lt $until) 'Scene deadline'; Start-Sleep -Milliseconds 250 }
+    if ($KeysOnly) {
+        Display 46
+        Key 225; Display 46
+        Key 18; Display 46
+        Key 43; Display 62020; Snap 'tab_open'
+        Key 43; Display 46; Snap 'tab_closed'
+        $bindings=Get-Content -LiteralPath (Join-Path $env:POSEIDON_USER_DIR 'contextControls.cfg') -Raw
+        Require ($bindings -match 'contextControlsVersion\s*=\s*7') 'Binding migration version missing'
+        Require ($bindings -match 'ctxInfantryInventory\[\]\s*=\s*\{\s*43\s*\}') 'Infantry inventory not bound to Tab'
+        Require ($bindings -match 'ctxInfantryLockTargets\[\]\s*=\s*\{\s*18\s*\}') 'Infantry target cycle not moved to O'
+        Require ($bindings -match 'ctxTankGunnerLockTargets\[\]\s*=\s*\{\s*43\s*\}') 'Vehicle target cycle changed'
+        $receipt.keyBindings=@{tabOpenedAndClosed=$true;shiftDidNotOpen=$true;oDidNotOpen=$true;legacyMigration=[bool]$LegacyBindings}
+        $null=Send @{cmd='exit'}
+        Require ($p.WaitForExit(20000) -and $p.ExitCode -eq 0) 'Normal key test exit failed'
+        Require (!(Select-String -Path @($log,$stderr) -Pattern 'UNHANDLED EXCEPTION|Validation Error|DeviceLost|panicked at|wgr_create failed' -Quiet)) 'Key test runtime error'
+        Require ((Get-Content (Join-Path $game 'DEPLOYED-FROM.txt') -Raw).Trim() -ceq $stamp) 'Installed pair changed'
+        $receipt.passed=$true
+        Write-Host ('Inventory key checks passed: '+$out)
+        return
+    }
+    if ($CompassOnly) {
+        Exec 'player allowDamage false;0 setRain 0;0 setFog 0;player setDir 0'
+        Display 46
+        Snap 'compass_closed'
+        Exec 'triKeyDown 10'
+        Start-Sleep -Seconds 1
+        Snap 'compass_open'
+        Exec 'triKeyUp 10'
+        Start-Sleep -Seconds 1
+        Snap 'compass_closed_again'
+        Display 46
+        $null=Send @{cmd='exit'}
+        Require ($p.WaitForExit(20000) -and $p.ExitCode -eq 0) 'Normal compass test exit failed'
+        Require (!(Select-String -Path @($log,$stderr) -Pattern 'UNHANDLED EXCEPTION|Validation Error|DeviceLost|panicked at|wgr_create failed' -Quiet)) 'Compass runtime error'
+        Require ((Get-Content (Join-Path $game 'DEPLOYED-FROM.txt') -Raw).Trim() -ceq $stamp) 'Installed pair changed'
+        $receipt.compassVisualReview='pending: readout must appear only in compass_open.png'
+        $receipt.passed=$true
+        Write-Host ('Compass captures ready for inspection: '+$out)
+        return
+    }
     Exec 'player allowDamage false;removeAllWeapons player;player addMagazine "HandGrenade";player addMagazine "HandGrenade";0 setRain 0;0 setFog 0;setAccTime 1'
     $before=Value 'magazines player'
-    Key 18; Display 62020; Snap '01_open'
+    Key 43; Display 62020; Snap '01_open'
     # At 16:9 the first storage tile is centred here; drag across panes to Ground.
     Pointer 0.681 0.318; Button $true; Pointer 0.12 0.40; Button $false
     $afterDrop=Value 'magazines player'
@@ -112,20 +157,20 @@ try {
     Snap '03_pickup'
     Key 14; Snap '04_settings'; Key 14
     Key 41; Display 46
-    Key 18; Display 62020; Snap '05_reopen'; Key 18; Display 46
+    Key 43; Display 62020; Snap '05_reopen'; Key 43; Display 46
     Exec 'removeAllWeapons player;player addMagazine "M16";player addMagazine "M16";player addWeapon "M16"'
-    Key 18; Display 62020; Snap '06_weapon_icons'; Key 41; Display 46
+    Key 43; Display 62020; Snap '06_weapon_icons'; Key 41; Display 46
     # A script may remove the exact magazine being dragged. Its tile/ghost must
     # remain safe to draw, and releasing it must not recreate the removed item.
     Exec 'removeAllWeapons player;player addMagazine "HandGrenade"'
-    Key 18; Display 62020
+    Key 43; Display 62020
     Pointer 0.681 0.318; Button $true; Pointer 0.12 0.40
     Exec 'player removeMagazine "HandGrenade"'
     Snap '07_removed_during_drag'
     Button $false
     Require ((@((Value 'magazines player')|ConvertFrom-Json)).Count -eq 0) 'Removed magazine recreated by stale drag'
     Key 41; Display 46
-    Key 18; Display 62020
+    Key 43; Display 62020
     Snap '08_removed_drag_reopen'
     Click 0.052 0.218
     Require ((Value 'magazines player') -ceq '[]') 'Removed magazine reappeared'
@@ -133,7 +178,7 @@ try {
     # Hold a ground item while a mission script fills the player's inventory.
     # Releasing must check current capacity, not the display's pre-drag snapshot.
     Exec 'player addMagazine "HandGrenade"'
-    Key 18; Display 62020
+    Key 43; Display 62020
     Pointer 0.681 0.318; Button $true; Pointer 0.12 0.40; Button $false
     Pointer 0.052 0.218; Button $true; Pointer 0.70 0.40
     # Ordinary SQF addMagazine obeys stock slots (five AT mines, not eight).
@@ -149,7 +194,7 @@ try {
     Snap '09_live_capacity_refusal'
     Key 41; Display 46
     Exec 'removeAllWeapons player'
-    Key 18; Display 62020; Click 0.052 0.218
+    Key 43; Display 62020; Click 0.052 0.218
     Require ((@((Value 'magazines player')|ConvertFrom-Json)).Count -eq 1) 'Refused pickup lost ground item'
     Snap '10_capacity_recovered'; Key 41; Display 46
     $receipt.audit=@{removedDuringDragSafe=$true;liveCapacityRefused=$true;refusedItemRecovered=$true}
@@ -169,14 +214,14 @@ try {
         Start-Sleep -Milliseconds 700
         Snap '13_grenade_mark'
         $null=Send @{cmd='mouse_button';button=3;down=$false}
-        Key 18; Display 62020; Key 14; Snap '14_combat_settings'
+        Key 43; Display 62020; Key 14; Snap '14_combat_settings'
         Click 0.335 0.6885; Click 0.335 0.715; Click 0.335 0.7415
         $assistCfg=Join-Path $env:POSEIDON_USER_DIR 'combat_assists.cfg'
         $disabled=Get-Content -LiteralPath $assistCfg -Raw
         Require ($disabled -match 'bearingCallouts=0' -and $disabled -match 'bearingReadout=0' -and $disabled -match 'grenadeRange=0') 'Combat options did not persist'
         Key 41; Display 46
         Snap '15_combat_assists_disabled'
-        Key 18; Display 62020
+        Key 43; Display 62020
         Click 0.475 0.781
         $defaults=Get-Content -LiteralPath $assistCfg -Raw
         Require ($defaults -match 'bearingCallouts=1' -and $defaults -match 'bearingReadout=1' -and $defaults -match 'grenadeRange=1') 'Combat reset did not restore defaults'

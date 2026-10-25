@@ -1,4 +1,6 @@
 
+#include <Poseidon/World/Terrain/EarthStreamingMode.hpp>
+#include <Poseidon/World/Terrain/EarthMoonFrame.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
 #include <Poseidon/Dev/Diag/LightingDiag.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Ephemeris.hpp>
@@ -534,7 +536,23 @@ void LightSun::Recalculate(World* world)
     // Everything above this line is the 2001 toy model, kept because it is still the
     // SUN's default (see Engine::SkySettings::sunRealistic) and the fallback when the
     // ephemeris is switched off. Below, the real positions overwrite it.
-    const Engine::SkySettings celestial = ResolveCelestialSettings();
+    Engine::SkySettings celestial = ResolveCelestialSettings();
+    // Whole world: the sun and moon are the real ephemeris for the real place. The observer is the
+    // live geographic origin; the clock stays local mean solar time at the START longitude, i.e. a
+    // fixed universal time, so flying east or west moves you through day and night instead of
+    // carrying noon along. In the origin's tangent frame the light direction then lights the globe
+    // with the real terminator, and the sun sets behind the curved horizon.
+    const bool earth = EarthStreaming::Enabled();
+    double earthLatitude = 0, earthLongitude = 0, earthClockLongitude = 0;
+    if (earth)
+    {
+        const auto origin = EarthStreaming::GetLocation();
+        static const double startLongitude = origin.longitude;
+        earthLatitude = origin.latitude * (H_PI / 180.0);
+        earthLongitude = origin.longitude * (H_PI / 180.0);
+        earthClockLongitude = startLongitude * (H_PI / 180.0);
+        celestial.sunRealistic = celestial.moonRealistic = true;
+    }
 
     // Legacy phase, computed before any overwrite so the fallback path is unchanged.
     float cosMoonPhase = -(_direction * _moonDirection);
@@ -551,8 +569,8 @@ void LightSun::Recalculate(World* world)
 
     if (celestial.moonRealistic || celestial.sunRealistic)
     {
-        double latitudeRad = astro::GeographicLatitudeFromWorld(static_cast<double>(latitudeCoord));
-        if (celestial.moonLatitudeOverride)
+        double latitudeRad = earth ? earthLatitude : astro::GeographicLatitudeFromWorld(static_cast<double>(latitudeCoord));
+        if (celestial.moonLatitudeOverride && !earth)
         {
             latitudeRad = static_cast<double>(celestial.moonLatitudeDeg) * (H_PI / 180.0);
         }
@@ -560,15 +578,23 @@ void LightSun::Recalculate(World* world)
         double hoursLocal = 12.0;
         CelestialDateTime(celestial, year, month, day, hoursLocal);
 
-        const double jd =
-            astro::JulianDayFromLocal(year, month, day, hoursLocal, static_cast<double>(longitudeCoord));
-        const astro::SkyState sky =
-            astro::Compute(jd, astro::GeoObserver{latitudeRad, static_cast<double>(longitudeCoord)});
+        const double jd = astro::JulianDayFromLocal(year, month, day, hoursLocal,
+                                                    earth ? earthClockLongitude : static_cast<double>(longitudeCoord));
+        const astro::SkyState sky = astro::Compute(
+            jd, astro::GeoObserver{latitudeRad, earth ? earthLongitude : static_cast<double>(longitudeCoord)});
 
         // The terminator's orientation always comes from the REAL sun, even when the
         // drawn/lighting sun is the legacy one: a moon whose phase is right but whose
         // terminator is tilted wrong looks worse than a moon with no phase at all.
         sunToDirection = HorizonToDirection(sky.sun.azimuthRad, sky.sun.altitudeRad);
+        // RFG-195: a native Reforger world puts the sun on the other side east-west. At 11:00 on
+        // 1989-08-14 Workbench lights Everon from the WEST (a village house's east wall in shade,
+        // its shadow across the pavement, matched pose shadowProbe), where this ephemeris -- right
+        // for a world whose +x is east -- put it in the east. Reforger's own sun vector
+        // (GetCurrentSunMoonDirAndPhase) matches ours only with x negated, which says its world x
+        // runs the other way for the sky. Mirrored so the same clock time gives the same light.
+        // POSEIDON_ENFUSION_SUN_MIRROR=0 keeps the plain ephemeris.
+        // (applied below, after every sun path -- see the override block)
 
         if (celestial.sunRealistic)
         {
@@ -623,6 +649,86 @@ void LightSun::Recalculate(World* world)
     // correct when the ephemeris is driving.
     float moonHaloIntensity = _moonIllumination;
     float moonIntensity = floatMin(_moonIllumination * 2.0f, 1.0f);
+
+    // RFG-195 (see the note at the ephemeris): mirror east-west on a native Reforger world, after
+    // whichever sun path ran (the ephemeris or the legacy orbit model).
+    // RFG-214: OFF by default -- the mirror was wrong. Forcing Reforger's own logged sun vector
+    // AS LOGGED (POSEIDON_TEST_SUN_DIR) lights Everon's village facades exactly as Workbench does
+    // (sunlit, full plaster relief, parity pose "village"); x-negated it shades them, the owner's
+    // "facades have no detail, no normals". The unmirrored ephemeris is within 1.5 degrees of
+    // Reforger's azimuth at 11:00. The time mismatch that prompted RFG-195 was the harness date
+    // (--test-world-hour hard-codes 1985-05-11), fixed separately; mirrored, the sun also rose in
+    // the west. POSEIDON_ENFUSION_SUN_MIRROR=1 restores the mirror.
+    {
+        static const bool enfusionMirror = []
+        {
+            const char* v = std::getenv("POSEIDON_ENFUSION_SUN_MIRROR");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (enfusionMirror && GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0)
+        {
+            _direction[0] = -_direction[0];
+            _moonDirection[0] = -_moonDirection[0];
+            _moonSunDirection[0] = -_moonSunDirection[0];
+            _moonDirectionUp[0] = -_moonDirectionUp[0];
+        }
+    }
+    // RFG-187 (parity harness only): POSEIDON_TEST_SUN_DIR=x,y,z puts the sun exactly where a
+    // reference frame had it -- the light's TRAVEL direction, as Reforger's
+    // GetCurrentSunMoonDirAndPhase reports it (same axes as ours: x east, y up, z north). Two
+    // ephemerides that agree on azimuth can still differ by degrees of elevation, and a matched
+    // pose compares lighting only when the light is the same.
+    {
+        struct SunOverride
+        {
+            bool on;
+            Vector3 dir;
+        };
+        static const SunOverride sunOverride = []
+        {
+            const char* v = std::getenv("POSEIDON_TEST_SUN_DIR");
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (v && std::sscanf(v, "%f,%f,%f", &x, &y, &z) == 3 && x * x + y * y + z * z > 1e-6f)
+            {
+                Vector3 d(x, y, z);
+                d.Normalize();
+                return SunOverride{true, d};
+            }
+            return SunOverride{false, Vector3(0.0f, -1.0f, 0.0f)};
+        }();
+        if (sunOverride.on)
+            _direction = sunOverride.dir;
+    }
+
+    // Whole world: publish the sky in the Earth origin's frame (the moon's place, the moon frame's axes
+    // and the renderer's Earth/moon geometry are built from it), then, near the moon, express the light
+    // in the moon frame the world is in (EarthMoonFrame.hpp).
+    if (earth)
+    {
+        const auto location = EarthStreaming::GetLocation();
+        EarthStreaming::SkyGeometry geometry;
+        geometry.valid = true;
+        geometry.originLatitude = location.latitude;
+        geometry.originLongitude = location.longitude;
+        geometry.toSun = {-_direction.X(), -_direction.Y(), -_direction.Z()};
+        geometry.toMoon = {-_moonDirection.X(), -_moonDirection.Y(), -_moonDirection.Z()};
+        EarthStreaming::Celestial().SetSky(geometry);
+        EarthStreaming::Basis world;
+        if (EarthStreaming::MoonFrameActive() &&
+            EarthStreaming::WorldBasis(location.latitude, location.longitude, world))
+        {
+            const auto earthFrame = EarthStreaming::EarthBasis(location.latitude, location.longitude);
+            const auto toWorld = [&](const Vector3& v)
+            {
+                const auto d = EarthStreaming::DirToWorld(world, EarthStreaming::DirToEcef(earthFrame, {v.X(), v.Y(), v.Z()}));
+                return Vector3(float(d.x), float(d.y), float(d.z));
+            };
+            _direction = toWorld(_direction);
+            _moonDirection = toWorld(_moonDirection);
+            _moonSunDirection = toWorld(_moonSunDirection);
+            _moonDirectionUp = toWorld(_moonDirectionUp);
+        }
+    }
 
     float sinSun = -_direction.Y();
     float absSinSun = fabs(sinSun);
@@ -695,6 +801,26 @@ void LightSun::Recalculate(World* world)
         _starsVisible = 0;
 
         _sunColor = _colorFull;
+    }
+
+    // Whole world: real twilight. The 2001 model goes to full night the moment the sun touches the
+    // horizon, so a sunset over the Grand Canyon (sun 1.7 degrees down) rendered as black night with
+    // stars. Night now ramps from the sun at +2 degrees to -8 degrees (civil twilight and a little).
+    if (earth)
+    {
+        // Seen from altitude the horizon dips: from 400 km the sun is still up when it stands 20 degrees
+        // below the ground's horizon. Night is judged at the camera, or orbit stayed "night" while the
+        // sun was in view and then switched to day all at once.
+        float dipDeg = 0.0f;
+        if (GScene && GScene->GetCamera())
+        {
+            const double r = EarthStreaming::MoonFrameActive() ? EarthStreaming::MoonRadius : 6378137.0;
+            const double h = std::max(double(GScene->GetCamera()->Position().Y()), 0.0);
+            dipDeg = float(std::acos(r / (r + h)) * (180.0 / H_PI));
+        }
+        const float altitudeDeg = asin(floatMin(floatMax(sinSun, -1.0f), 1.0f)) * (180.0f / H_PI) + dipDeg;
+        _nightEffect = Saturate01((2.0f - altitudeDeg) / 10.0f);
+        _starsVisible = Saturate01((-2.0f - altitudeDeg) / 8.0f);
     }
 
     float sinMoon = -_moonDirection.Y();
@@ -967,7 +1093,7 @@ void LightPoint::GetDescription(LightDescription& desc) const
     desc.endAttenScale = _endAttenScale; // LGT-014
 }
 
-MuzzleFlashLight::MuzzleFlashLight() : LightPoint(Color(2.0f, 1.55f, 0.9f), Color(0.12f, 0.085f, 0.035f))
+MuzzleFlashLight::MuzzleFlashLight() : LightPoint(Color(3.2f, 2.3f, 1.1f), Color(0.15f, 0.10f, 0.04f))
 {
     SetBrightness(MuzzleFlashPulse::CoreMetres / 50.0f);
     SetEndAttenScale(MuzzleFlashPulse::EndScale);
@@ -1006,10 +1132,11 @@ Color MuzzleFlashLight::Apply(Vector3Par point, Vector3Par normal)
     return LightPoint::Apply(point, normal) * _pulse.Energy(Glob.time.toInt());
 }
 
-float MuzzleFlashLight::FlareIntensity(Vector3Par camPos, Vector3Par camDir) const
+float MuzzleFlashLight::FlareIntensity(Vector3Par, Vector3Par) const
 {
-    if (!IsOn()) return 0;
-    return LightPoint::FlareIntensity(camPos, camDir) * _pulse.Energy(Glob.time.toInt());
+    // No lens-flare sprite: it drew a flat grey-blue disc round every shot. The
+    // flash sheet's HDR core blooms by itself, which is what a camera sees.
+    return 0;
 }
 
 Color MuzzleFlashLight::GetObjectColor() const
@@ -1046,7 +1173,8 @@ float LightReflector::FlareIntensity(Vector3Par camPos, Vector3Par camDir) const
     }
     float size2 = relPos.SquareSize();
 
-    float startAtten = Square(_startAtten);
+    // LGT-REFL-001: an explicit flare range only ever lengthens it; without one this is 2001's
+    float startAtten = Square(_flareRange > _startAtten ? _flareRange : _startAtten);
     float endAtten = startAtten * 100;
     if (size2 >= endAtten)
     {
@@ -1298,6 +1426,14 @@ LightPointVisible::LightPointVisible(LODShapeWithShadow* shape, ColorVal color, 
 
 void LightPointVisible::ToDraw(ClipFlags clipFlags, bool dimmed)
 {
+    // A point light built without a shape (LightPointOnVehicle(vehicle, position): script
+    // lights, the automatic tail and brake lamps, a fireplace before its config is read) has
+    // no bulb to draw; it only lights. A shape that a config named and that failed to load is
+    // reported where it is loaded (LightPointVisible::Load), so nothing is lost here.
+    if (!_shape)
+    {
+        return;
+    }
     // reflector: draw volumetrical light object
     if (GScene->MainLight()->NightEffect() < 0.01)
     {

@@ -6,6 +6,7 @@
 #include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/World/Effects/BuildingInterior.hpp>
 #include <Poseidon/World/Effects/SmokeWorldQuery.hpp>
+#include <Poseidon/World/Entities/Infantry/SwimView.hpp>
 #include <Poseidon/World/Entities/Vehicles/House.hpp>
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/World/Scene/Camera/Camera.hpp>
@@ -22,11 +23,60 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace Poseidon
 {
 RainSystem GRain;
 RainSystem GSnowFlakes;
+
+namespace
+{
+// PERF-031: true when no terrain vertex under the snow window (plus one terrain cell all round)
+// reaches within a metre of `line`. Terrain is piecewise linear between those vertices, so no
+// terrain fragment in the window gets altitude cover (terrain.wgsl snowline_depth: smoothstep from
+// the line upwards, 0 at and below it). Any vertex off the map answers false: the off-map ring is
+// not ours to bound here, so the mask runs as before.
+bool SnowWindowBelowSnowline(const Landscape& land, float x0, float z0, float span, float line)
+{
+    const float grid = land.GetTerrainGrid();
+    const int range = land.GetTerrainRange();
+    if (!(grid > 0.0f) || range <= 0 || !std::isfinite(line))
+        return false;
+    const int xi0 = static_cast<int>(std::floor(x0 / grid)) - 1;
+    const int zi0 = static_cast<int>(std::floor(z0 / grid)) - 1;
+    const int xi1 = static_cast<int>(std::floor((x0 + span) / grid)) + 2;
+    const int zi1 = static_cast<int>(std::floor((z0 + span) / grid)) + 2;
+    if (xi0 < 0 || zi0 < 0 || xi1 >= range || zi1 >= range)
+        return false;
+    for (int z = zi0; z <= zi1; ++z)
+        for (int x = xi0; x <= xi1; ++x)
+            if (!(land.ClippedData(z, x) < line - 1.0f))
+                return false;
+    return true;
+}
+// PERF-031 (second half): the probe answers per building, kept between calls.
+//
+// With snow on, the mask still probed every 0.5 m lattice point under every roof in the window on
+// every call -- the same points, with the same answers, every 0.1 s, because buildings and terrain
+// do not move: 75 ms a call over the Big Shell. The probe points sit on one global lattice (the
+// window origin is a whole multiple of 2 m, the probes 0.25 m + 0.5 m k off it), so each building
+// keeps a byte per lattice point of its footprint: 0 not probed yet, 1 open, 2 covered. A call
+// probes only the points it has not seen and reads the rest. The answer depends on the building's
+// pose and interior and on the terrain height at the point, so a changed pose, radius or interior
+// resets that building, and a terrain height revision resets them all. POSEIDON_SNOW_SHELTER_CACHE=0
+// probes every point every call, as before.
+struct ShelterProbeCache
+{
+    const void* interior = nullptr;
+    Vector3 position, direction, up;
+    float radius = 0.0f;
+    int gx0 = 0, gz0 = 0, w = 0, h = 0; // footprint on the global 0.5 m lattice
+    std::vector<uint8_t> state;
+    uint64_t lastUse = 0;
+};
+} // namespace
 
 void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
 {
@@ -45,6 +95,23 @@ void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
     const auto begin = std::chrono::steady_clock::now();
     size_t probes = 0, masked = 0;
     const float span = n * data[2];
+    // PERF-031 -- the shelter mask writes a deficit under every roof in the 64 m window, probing a
+    // 0.5 m grid against each building's interior voxels: 75 ms every 0.1 s on the main thread over
+    // the MGS2 Big Shell (its modules are buildings whose radius spans the whole window), and that
+    // on Desert Island, where no snow can lie at all -- the alpine snowline is on by default at
+    // ~645 m and nothing there is above 20 m. A deficit only ever subtracts from snow: with no
+    // snowfall deposit in the window (data[3]) the shaders read it only through terrain altitude
+    // cover (terrain.wgsl snow_cover; conform/shader3d snow_depth return 0 without deposit), which
+    // is 0 on every terrain fragment below the line. So when no deposit is present and the window's
+    // terrain stays under the snowline, the mask cannot change a pixel and is skipped.
+    // POSEIDON_SNOW_SHELTER_SKIP=0 masks anyway (for A/B).
+    static const bool skipWhenBare = [] {
+        const char* value = std::getenv("POSEIDON_SNOW_SHELTER_SKIP");
+        return !(value && value[0] == '0');
+    }();
+    if (skipWhenBare && data[3] <= 0.0f &&
+        (!GSnow().EffSnowlineEnabled() || SnowWindowBelowSnowline(land, data[0], data[1], span, GSnow().EffSnowlineHeight())))
+        return;
     const Vector3 centre(data[0] + span*0.5f, 0, data[1] + span*0.5f);
     std::vector<Building*> buildings;
     auto add = [&](Object* object)
@@ -71,6 +138,27 @@ void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
         for (int i = 0; i < GWorld->NFastVehicles(); ++i) add(GWorld->GetFastVehicle(i));
         for (int i = 0; i < GWorld->NOutVehicles(); ++i) add(GWorld->GetOutVehicle(i));
     }
+    static const bool cacheEnabled = [] {
+        const char* value = std::getenv("POSEIDON_SNOW_SHELTER_CACHE");
+        return !(value && value[0] == '0');
+    }();
+    static std::unordered_map<const Building*, ShelterProbeCache> probeCache;
+    static uint64_t cacheHeightRevision = ~0ull;
+    static uint64_t cacheCall = 0;
+    ++cacheCall;
+    if (cacheHeightRevision != land.HeightRevision())
+    {
+        probeCache.clear();
+        cacheHeightRevision = land.HeightRevision();
+    }
+    // Bounded: buildings that have not been in a window for a long while are dropped.
+    if (probeCache.size() > 2048)
+        for (auto it = probeCache.begin(); it != probeCache.end();)
+            it = (cacheCall - it->second.lastUse > 600) ? probeCache.erase(it) : std::next(it);
+    // The lattice mapping below holds only for the window SnowField hands over.
+    const bool latticeOk = cacheEnabled && data[2] == 0.125f && std::fmod(data[0], 2.0f) == 0.0f &&
+                           std::fmod(data[1], 2.0f) == 0.0f;
+    size_t cachedReads = 0;
     for (const Building* building : buildings)
     {
         const auto* interior = BuildingInterior::GetFor(building->GetBType());
@@ -78,6 +166,37 @@ void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
         const auto p = building->Position();
         const float radius = building->GetRadius();
         const auto inv = building->GetInvTransform();
+        const bool tilted = building->DirectionUp().Y() < 0.999f;
+        const auto probe = [&](float wx, float wz)
+        {
+            const Vector3 point(wx, land.SurfaceY(wx, wz)+0.05f, wz);
+            ++probes;
+            bool covered = interior->CoveredFromAboveModel(inv * point);
+            if (tilted)
+                covered = interior->ClassifySegmentModel(inv*point, inv*(point+Vector3(0, radius*2, 0))) != -1;
+            return covered;
+        };
+        ShelterProbeCache* cache = nullptr;
+        if (latticeOk)
+        {
+            ShelterProbeCache& c = probeCache[building];
+            if (c.interior != interior || c.radius != radius || !(c.position == p) ||
+                !(c.direction == building->Direction()) || !(c.up == building->DirectionUp()))
+            {
+                c.interior = interior;
+                c.radius = radius;
+                c.position = p;
+                c.direction = building->Direction();
+                c.up = building->DirectionUp();
+                c.gx0 = static_cast<int>(std::floor((p.X() - radius - 0.25f) / 0.5f)) - 1;
+                c.gz0 = static_cast<int>(std::floor((p.Z() - radius - 0.25f) / 0.5f)) - 1;
+                c.w = static_cast<int>(std::ceil(2.0f * radius / 0.5f)) + 4;
+                c.h = c.w;
+                c.state.assign(static_cast<size_t>(c.w) * static_cast<size_t>(c.h), 0);
+            }
+            c.lastUse = cacheCall;
+            cache = &c;
+        }
         const int x0 = std::max(0, static_cast<int>(std::floor((p.X()-radius-data[0]) / (data[2]*step))) * step);
         const int z0 = std::max(0, static_cast<int>(std::floor((p.Z()-radius-data[1]) / (data[2]*step))) * step);
         const int x1 = std::min(n, static_cast<int>(std::ceil((p.X()+radius-data[0]) / data[2])));
@@ -87,11 +206,26 @@ void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
             {
                 const float wx = data[0] + (x+step*0.5f)*data[2];
                 const float wz = data[1] + (z+step*0.5f)*data[2];
-                const Vector3 point(wx, land.SurfaceY(wx, wz)+0.05f, wz);
-                ++probes;
-                bool covered = interior->CoveredFromAboveModel(inv * point);
-                if (building->DirectionUp().Y() < 0.999f)
-                    covered = interior->ClassifySegmentModel(inv*point, inv*(point+Vector3(0, radius*2, 0))) != -1;
+                bool covered;
+                uint8_t* slot = nullptr;
+                if (cache)
+                {
+                    // wx = 0.25 + 0.5 * gx exactly: data[0] is a whole multiple of 2 m, x of 4 cells.
+                    const int gx = static_cast<int>(data[0] * 2.0f) + x / step - cache->gx0;
+                    const int gz = static_cast<int>(data[1] * 2.0f) + z / step - cache->gz0;
+                    if (gx >= 0 && gz >= 0 && gx < cache->w && gz < cache->h)
+                        slot = &cache->state[static_cast<size_t>(gz) * cache->w + gx];
+                }
+                if (slot && *slot != 0)
+                {
+                    covered = *slot == 2;
+                    ++cachedReads;
+                }
+                else
+                {
+                    covered = probe(wx, wz);
+                    if (slot) *slot = covered ? 2 : 1;
+                }
                 if (!covered) continue;
                 for (int dz = 0; dz < step && z+dz < n; ++dz)
                     for (int dx = 0; dx < step && x+dx < n; ++dx)
@@ -107,7 +241,7 @@ void MaskSnowShelters(const Landscape& land, std::vector<float>& data)
     {
         nextTrace = Glob.time.toFloat() + 2.0f;
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now()-begin).count();
-        LOG_INFO(World, "Snow shelter: buildings={} probes={} masked={} time={:.0f}us", buildings.size(), probes, masked, us);
+        LOG_INFO(World, "Snow shelter: buildings={} probes={} cached={} masked={} time={:.0f}us", buildings.size(), probes, cachedReads, masked, us);
     }
 }
 
@@ -211,6 +345,152 @@ bool SnowParticleInViewVolume(Vector3Par particle, Vector3Par camera, float radi
 {
     const Vector3 offset = particle-camera;
     return offset.X()*offset.X()+offset.Z()*offset.Z() <= radius*radius && std::abs(offset.Y()) <= height;
+}
+
+// (OP, 2026-10-14) RAIN part 2, roof runoff (owner: "make our rain ... better inspired with the tarp
+// runoff demo" of dgreenheck/threejs-particle-fluids). Rain on a roof does not vanish at the
+// roofline: it runs down the roof and leaves it along the eaves, in drips that land in a line
+// under them. The roof of a building type is mapped once, in model space, from its interior's
+// cached shell columns: a covered column with an open neighbour is the roof's edge, and it is an
+// EAVE where the roof falls toward that neighbour (a gable end, where it does not, sheds nothing).
+const std::vector<Vector3>& RainSystem::EavesOf(const Occluder& occluder)
+{
+    const auto found = _eaves.find(occluder.interior);
+    if (found != _eaves.end())
+    {
+        return found->second;
+    }
+    std::vector<Vector3> eaves;
+    int nCovered = 0, nEdges = 0, nLow = 0, nFlat = 0;
+    const LODShapeWithShadow* shape = occluder.object->GetShape();
+    if (shape != nullptr)
+    {
+        const Vector3 lo = shape->Min(), hi = shape->Max();
+        constexpr float step = 0.5f;
+        const int nx = std::clamp(static_cast<int>((hi.X() - lo.X()) / step) + 1, 1, 128);
+        const int nz = std::clamp(static_cast<int>((hi.Z() - lo.Z()) / step) + 1, 1, 128);
+        const BuildingInterior& interior = *occluder.interior;
+        std::vector<unsigned char> covered(static_cast<size_t>(nx) * nz);
+        for (int z = 0; z < nz; ++z)
+            for (int x = 0; x < nx; ++x)
+                covered[static_cast<size_t>(z) * nx + x] =
+                    interior.CoveredFromAboveModel(Vector3(lo.X() + x * step, lo.Y() + 0.1f, lo.Z() + z * step)) ? 1 : 0;
+        for (unsigned char c : covered)
+            nCovered += c;
+        const auto isCovered = [&](int x, int z)
+        { return x >= 0 && z >= 0 && x < nx && z < nz && covered[static_cast<size_t>(z) * nx + x] != 0; };
+        // the roof's height over a column: the topmost shell voxel, scanned down from the top
+        const auto roofY = [&](int x, int z)
+        {
+            const float px = lo.X() + x * step, pz = lo.Z() + z * step;
+            for (float y = hi.Y(); y > lo.Y(); y -= 0.15f)
+                if (interior.ClassifyModel(Vector3(px, y, pz)) == -2)
+                    return y;
+            return lo.Y();
+        };
+        const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int z = 0; z < nz; ++z)
+            for (int x = 0; x < nx; ++x)
+            {
+                if (!isCovered(x, z))
+                    continue;
+                for (const auto& d : dirs)
+                {
+                    if (isCovered(x + d[0], z + d[1]))
+                        continue;
+                    // the roof must fall toward this edge, over the cell behind it
+                    if (!isCovered(x - d[0], z - d[1]))
+                        continue;
+                    ++nEdges;
+                    // the overhang is thin: the outermost covered column often holds no shell voxel at
+                    // the sample points (89 of 106 edges on zluty_statek_in), so the roof's height
+                    // there is taken from the first column inward that has one, and its fall from
+                    // the next one in
+                    float edge = lo.Y();
+                    int k0 = 0;
+                    for (; k0 < 4; ++k0)
+                    {
+                        edge = roofY(x - d[0] * k0, z - d[1] * k0);
+                        if (edge >= lo.Y() + 1.5f)
+                            break;
+                    }
+                    if (k0 == 4)
+                    {
+                        ++nLow;
+                        continue;
+                    }
+                    const float inner = roofY(x - d[0] * (k0 + 1), z - d[1] * (k0 + 1));
+                    if (inner < edge + 0.03f)
+                    {
+                        ++nFlat;
+                        continue;
+                    }
+                    // extrapolate the roof's fall out to the edge column
+                    edge -= (inner - edge) * static_cast<float>(k0);
+                    eaves.emplace_back(lo.X() + (x + d[0] * 0.6f) * step, edge - 0.05f, lo.Z() + (z + d[1] * 0.6f) * step);
+                }
+            }
+    }
+    LOG_INFO(World, "Rain runoff: {} eave points on '{}' ({} covered columns, {} edges, {} low, {} not falling; box {:.1f}..{:.1f} m)",
+             eaves.size(), occluder.object->GetShape() ? occluder.object->GetShape()->Name() : "?", nCovered, nEdges, nLow,
+             nFlat, shape ? shape->Min().Y() : 0.0f, shape ? shape->Max().Y() : 0.0f);
+    return _eaves.emplace(occluder.interior, std::move(eaves)).first->second;
+}
+
+void RainSystem::EmitEaveDrips(float deltaT)
+{
+    static const bool enabled = []
+    {
+        const char* v = std::getenv("WGR_RAIN_EAVES");
+        return !(v && v[0] == '0');
+    }();
+    if (!enabled || _params.snowflakes || _occluders.empty() || deltaT <= 0.0f)
+    {
+        return;
+    }
+    const float density = EffectiveDensity();
+    static const bool trace = std::getenv("POSEIDON_RAIN_TRACE") != nullptr;
+    static float nextTrace = 0.0f;
+    if (trace && Glob.time.toFloat() > nextTrace)
+    {
+        nextTrace = Glob.time.toFloat() + 2.0f;
+        size_t points = 0;
+        for (const Occluder& occluder : _occluders)
+        {
+            const auto it = _eaves.find(occluder.interior);
+            points += it == _eaves.end() ? 0 : it->second.size();
+        }
+        LOG_INFO(World, "Rain runoff: density {:.2f}, {} buildings, {} eave points", density, _occluders.size(), points);
+    }
+    if (density < 0.05f)
+    {
+        return;
+    }
+    // drips per second along each 0.5 m of eave at full rain: a steady patter, heavier than the rain
+    const float perPoint = 2.5f * density;
+    for (const Occluder& occluder : _occluders)
+    {
+        const std::vector<Vector3>& eaves = EavesOf(occluder);
+        if (eaves.empty())
+        {
+            continue;
+        }
+        _dripAccumulator += perPoint * deltaT * static_cast<float>(eaves.size());
+        while (_dripAccumulator >= 1.0f && static_cast<int>(_drops.size()) < _params.maxDrops)
+        {
+            _dripAccumulator -= 1.0f;
+            const Vector3& at = eaves[static_cast<size_t>(RandUnit() * eaves.size()) % eaves.size()];
+            Drop drop;
+            drop.position = occluder.object->PositionModelToWorld(
+                Vector3(at.X() + RandSymmetric() * 0.2f, at.Y(), at.Z() + RandSymmetric() * 0.2f));
+            // a drip leaves the eave slowly and does not ride the wind like spray
+            drop.speed = _params.fallSpeed * (0.85f + 0.1f * RandSymmetric());
+            drop.size = 1.6f;
+            drop.occlusionTimer = RandUnit() * _params.occlusionCadence;
+            _drops.push_back(drop);
+        }
+        _dripAccumulator = std::min(_dripAccumulator, 1.0f);
+    }
 }
 
 float RainSystem::EffectiveDensity() const
@@ -602,7 +882,8 @@ void RainSystem::Simulate(float deltaT)
         // -- fall ---------------------------------------------------------
         drop.position = nextPosition;
 
-        float ground = query.GroundHeight(drop.position.X(), drop.position.Z());
+        // the sea's surface is where a drop over it ends (the seabed was: rain fell through the water)
+        float ground = std::max(query.GroundHeight(drop.position.X(), drop.position.Z()), GLandscape->GetSeaLevel());
         if (nearShell)
         {
             // Under a shell the terrain is not what the drop lands on: the
@@ -824,6 +1105,18 @@ void RainSystem::UpdateAndDraw()
     {
         return;
     }
+    // No rain under water (owner, 2026-10-13: "it is raining under water which is a bug"): a camera
+    // below the surface draws none; above it, drops end on the water (Simulate), not on the seabed.
+    if (const Camera* camera = GScene->GetCamera())
+    {
+        const Vector3 eye = camera->Position();
+        if (eye.Y() < SwimWaterSurfaceY(eye.X(), eye.Z()))
+        {
+            _drops.clear();
+            _splashes.clear();
+            return;
+        }
+    }
 
     if (_forceWeatherRain)
     {
@@ -866,6 +1159,7 @@ void RainSystem::UpdateAndDraw()
 
     auto phase = std::chrono::steady_clock::now();
     Spawn(deltaT);
+    EmitEaveDrips(deltaT);
     auto now = std::chrono::steady_clock::now();
     _stats.spawnMicroseconds = std::chrono::duration<double, std::micro>(now - phase).count();
     phase = now;

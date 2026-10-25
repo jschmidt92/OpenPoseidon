@@ -1,5 +1,7 @@
 #include <Poseidon/Core/Application.hpp>
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/IO/ParamFileExt.hpp>
+#include <Poseidon/Graphics/Rendering/Draw/FontMapping.hpp>
 
 #include <Poseidon/IO/Streams/QBStream.hpp>
 
@@ -7,6 +9,7 @@
 #include <Poseidon/UI/LocalMapWorlds.hpp>
 #include <Poseidon/Foundation/Platform/AppConfig.hpp>
 #include <algorithm>
+#include <set>
 #include <string>
 #include <Poseidon/Foundation/Strings/Mbcs.hpp>
 #include <string.h>
@@ -20,6 +23,7 @@
 
 namespace Poseidon
 {
+RString GetMissionDirectory(); // OptionsUI.cpp
 
 FontID GetFontID(RString baseName)
 {
@@ -40,6 +44,21 @@ FontID GetFontID(RString baseName)
         {
             lookupName = *entry;
             langID = Poseidon::Foundation::GetLangID();
+        }
+    }
+    if (Poseidon::Arma1Compat::Active())
+    {
+        // Arma 1 font families (BitStream, Zeppelin32, ...) have no CWA atlas: keep the
+        // text visible with CWA's own UI font instead of drawing nothing.
+        RString low = lookupName;
+        low.Lower();
+        const RString fxy = GetDefaultName(lookupName, "fonts\\", "") + RString(".fxy");
+        if (!FindFontMapping(low) && !QIFStreamB::FileExist(fxy))
+        {
+            static std::set<std::string> reported;
+            if (reported.insert((const char*)low).second)
+                LOG_INFO(Mission, "Arma 1: font '{}' is drawn with CWA's tahomaB24", (const char*)lookupName);
+            lookupName = "tahomaB24";
         }
     }
     return FontID(GetDefaultName(lookupName, "fonts\\", ""), langID);
@@ -131,14 +150,26 @@ RString GetDefaultName(RString baseName, const char* dDir, const char* dExt)
     {
         return "";
     }
+    // A procedural texture ("#(argb,8,8,3)color(0,0,0,1)", Arma 2 UI and models) is no file:
+    // no folder before it, no extension after it (it became "data\#(argb...).paa").
+    if (baseName[0] == '#')
+    {
+        return baseName;
+    }
     char buf[256];
     *buf = 0;
 
     const char* name = baseName;
-    // Leading slash: caller already supplied a fully-qualified path
-    if (name[0] == '\\' || name[0] == '/')
+    // Leading slash: caller already supplied a fully-qualified path ("@a3\\..." is Arma 3's
+    // way of saying the same in a mission's CfgSounds: from the game's root, not the mission)
+    if (name[0] == '\\' || name[0] == '/' || name[0] == '@')
     {
         name++;
+    }
+    else if (Arma1Compat::IsArmaBankPath(name))
+    {
+        // an Arma archive path written without its leading backslash
+        // ("a3\anims_f\data\anim\...rtm" in Arma 3's binarised moves): used as it is
     }
     else
     {
@@ -204,7 +235,15 @@ RString GetPictureName(RString baseName)
 }
 RString GetSoundName(RString baseName)
 {
-    return GetDefaultName(baseName, "sound\\", ".wss");
+    RString name = GetDefaultName(baseName, "sound\\", ".wss");
+    // --arma1/--arma2: a config sound the rule above misses (Arma1Compat::FindArmaSoundFile).
+    // Only a name that finds no file is looked at again.
+    if (name.GetLength() > 0 && Arma1Compat::Active() && !QIFStreamB::FileExist(name))
+    {
+        if (RString found = Arma1Compat::FindArmaSoundFile(baseName); found.GetLength() > 0)
+            return found;
+    }
+    return name;
 }
 
 #ifndef ACCESS_ONLY
@@ -221,6 +260,9 @@ LSError SoundPars::Serialize(ParamArchive& ar)
 
 RString GetWorldName(RString baseName)
 {
+    // --arma1: a world name inside an Arma 1 mission can mean a different island than
+    // the CWA class of the same name ("intro"). Identity otherwise.
+    baseName = Arma1Compat::WorldClassForMission(baseName, GetMissionDirectory());
     if (IsLocalMapWorldIdentifier(baseName.Data()))
     {
         // Preserve reserved identities even when their source metadata is missing.

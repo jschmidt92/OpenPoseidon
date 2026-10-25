@@ -1,3 +1,6 @@
+#include <Poseidon/World/Scene/ScriptLight.hpp>
+#include <Poseidon/World/Terrain/CraterField.hpp>
+#include <Poseidon/World/Effects/BuildingBreach.hpp>
 #include <Poseidon/Core/Game/GameLoop.hpp> // LockstepPacingActive (SIM-815)
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/World/Weather/SnowField.hpp>
@@ -17,6 +20,8 @@
 #include <Poseidon/UI/Settings/AspectRatio.hpp>
 #include <Poseidon/Graphics/Cursor/GameCursorOverlay.hpp>
 #include <Poseidon/World/World.hpp>
+#include <Poseidon/World/EnvSoundRegions.hpp> // OFP Fusion: ambient loops per island
+#include <Poseidon/Game/Compat/Arma1Compat.hpp>
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
@@ -227,6 +232,7 @@ World::World(Engine* engine, bool editor)
 
 void World::InitGeneral()
 {
+    _heldFog = -1.0f; // FOG-HOLD: a new world takes its weather from its mission
     _wantedOvercast = 0.3;
     _actualOvercast = _wantedOvercast;
     _wantedFog = 0.0;
@@ -255,6 +261,8 @@ void World::InitGeneral(const ParamEntry& cfg)
     _nearImportanceDistributionTime = Poseidon::Foundation::Time(0);
     _farImportanceDistributionTime = Poseidon::Foundation::Time(0);
     _firstFrame = true;
+    // Overcast mission: start with ground already soaked (deep ruts from the start).
+    GMud().SeedWeather(_actualOvercast);
 
     RString time = cfg >> "startTime";
     RString date = cfg >> "startDate";
@@ -289,6 +297,8 @@ void World::InitGeneral(ArcadeIntel& intel)
     _nextWeatherChange = 30 * 60;
     _nearImportanceDistributionTime = Poseidon::Foundation::Time(0);
     _farImportanceDistributionTime = Poseidon::Foundation::Time(0);
+    // Overcast mission: start with ground already soaked (deep ruts from the start).
+    GMud().SeedWeather(_actualOvercast);
 
     int day = intel.day - 1;
     int year = intel.year;
@@ -322,6 +332,63 @@ const AutoArray<Vector3> World::GetTaxiOffPath(TargetSide side)
     return _taxiOffPathsWest;
 }
 
+int World::NearestAirport(Vector3Par pos) const
+{
+    int best = 0;
+    float bestDist2 = 1e30f;
+    for (int i = 0; i < static_cast<int>(_airports.size()); i++)
+    {
+        const float d2 = _airports[i].pos.DistanceXZ2(pos);
+        if (d2 < bestDist2)
+        {
+            bestDist2 = d2;
+            best = i;
+        }
+    }
+    return best;
+}
+
+int World::FindAirport(const char* name) const
+{
+    for (int i = 0; i < static_cast<int>(_airports.size()); i++)
+    {
+        if (!stricmp(_airports[i].name, name))
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool World::GetILS(Vector3& pos, Vector3& dir, TargetSide side, int airport)
+{
+    if (airport <= 0 || airport >= static_cast<int>(_airports.size()))
+    {
+        return GetILS(pos, dir, side);
+    }
+    pos = _airports[airport].pos;
+    dir = _airports[airport].dir;
+    return true;
+}
+
+const AutoArray<Vector3> World::GetTaxiInPath(TargetSide side, int airport)
+{
+    if (airport <= 0 || airport >= static_cast<int>(_airports.size()))
+    {
+        return GetTaxiInPath(side);
+    }
+    return _airports[airport].taxiIn;
+}
+
+const AutoArray<Vector3> World::GetTaxiOffPath(TargetSide side, int airport)
+{
+    if (airport <= 0 || airport >= static_cast<int>(_airports.size()))
+    {
+        return GetTaxiOffPath(side);
+    }
+    return _airports[airport].taxiOff;
+}
+
 #define PLAYER_ONLY 0
 
 void World::InsertSeaGulls() {}
@@ -344,6 +411,28 @@ static void InitEnvSounds(const ParamEntry& cfg)
     GetValue(EnvSoundParsNight[3], cfg >> "Hills" >> "soundNight");
     GetValue(EnvSoundParsNight[4], cfg >> "Rain" >> "soundNight");
     GetValue(EnvSoundParsNight[5], cfg >> "Default" >> "sound");
+
+    // Arma 3 (--arma3): its own ambience (birds, forest, crickets, wind, sea, rain) in place
+    // of CWA's loops, at the CWA slot's loudness; a slot the install cannot fill keeps CWA's.
+    if (Arma1Compat::Active() && Arma1Compat::Generation() >= 3)
+    {
+        static const char* const kSlot[5] = {"sea", "trees", "meadows", "hills", "rain"};
+        for (int slot = 0; slot < 5; slot++)
+            for (int night = 0; night < 2; night++)
+            {
+                const std::string file = Arma1Compat::Arma3EnvSound(slot, night != 0);
+                if (file.empty())
+                    continue;
+                SoundPars& pars = night ? EnvSoundParsNight[slot] : EnvSoundPars[slot];
+                pars.name = GetSoundName(RString(file.c_str()));
+                if (pars.vol <= 0)
+                    pars.vol = 0.1f;
+                if (pars.freq <= 0)
+                    pars.freq = 1.0f;
+                LOG_INFO(Mission, "Arma 3: ambient {} ({}) plays {}", kSlot[slot], night ? "night" : "day",
+                         (const char*)pars.name);
+            }
+    }
 }
 
 SRef<EntityAI> GDummyVehicle;
@@ -868,6 +957,8 @@ void World::InitLandscape(Landscape* landscape)
     GSnow().Reset();
     GMud().Reset();
     GSand().Reset();
+    GCraters().Reset();
+    BuildingBreach::Reset();
     GRainWater().Reset();
     GSnowFlakes.ClearParticles();
     GSnow().enabled = false;
@@ -926,6 +1017,7 @@ void World::InitLandscape(Landscape* landscape)
     LOG_INFO(Core, "InitLandscape phase: World::Clear {} ms", Poseidon::Foundation::GlobalTickCount() - tStep);
 
     tStep = Poseidon::Foundation::GlobalTickCount();
+    _airports.clear(); // a world without a config entry (the land editor) has none
     if (!ENGINE_CONFIG.landEditor || (Pars >> "CfgWorlds").FindEntry(Glob.header.worldname))
     {
         const ParamEntry& world = Pars >> "CfgWorlds" >> Glob.header.worldname;
@@ -952,6 +1044,41 @@ void World::InitLandscape(Landscape* landscape)
 
         GetPosArray(_taxiInPathsWest, world >> "ilsTaxiIn");
         GetPosArray(_taxiOffPathsWest, world >> "ilsTaxiOff");
+
+        // the main airport first, then the world's SecondaryAirports (none: the main one only, as before)
+        _airports.clear();
+        _airports.push_back(Airport{_ilsPosWest, _ilsDirWest, _taxiInPathsWest, _taxiOffPathsWest});
+        _airports[0].name = world.FindEntry("airportName") ? RString(world >> "airportName") : RString("main");
+        if (const ParamEntry* secondary = world.FindEntry("SecondaryAirports"))
+        {
+            for (int i = 0; i < secondary->GetEntryCount(); i++)
+            {
+                const ParamEntry& cls = secondary->GetEntry(i);
+                if (!cls.IsClass() || !cls.FindEntry("ilsPosition") || !cls.FindEntry("ilsDirection"))
+                {
+                    continue;
+                }
+                const ParamEntry& p = cls >> "ilsPosition";
+                const ParamEntry& d = cls >> "ilsDirection";
+                Airport airport;
+                airport.name = cls.GetName();
+                airport.pos = Vector3(p[0], 0, p[1]);
+                airport.pos[1] = GLOB_LAND->SurfaceY(airport.pos[0], airport.pos[2]);
+                airport.dir = Vector3(d[0], d[1], d[2]);
+                airport.dir.Normalize();
+                if (cls.FindEntry("ilsTaxiIn"))
+                {
+                    GetPosArray(airport.taxiIn, cls >> "ilsTaxiIn");
+                }
+                if (cls.FindEntry("ilsTaxiOff"))
+                {
+                    GetPosArray(airport.taxiOff, cls >> "ilsTaxiOff");
+                }
+                _airports.push_back(airport);
+            }
+            LOG_INFO(Core, "{}: {} airport(s) (the main one and {} secondary)", (const char*)Glob.header.worldname,
+                     _airports.size(), _airports.size() - 1);
+        }
     }
     LOG_INFO(Core, "InitLandscape phase: CfgWorlds InitGeneral+ILS {} ms",
              Poseidon::Foundation::GlobalTickCount() - tStep);
@@ -989,6 +1116,7 @@ void World::InitLandscape(Landscape* landscape)
 
         tStep = Poseidon::Foundation::GlobalTickCount();
         InitEnvSounds(world >> "EnvSounds");
+        InitEnvSoundRegions(world); // OFP Fusion: each island its own loops
         InsertSeaGulls();
         LOG_INFO(Core, "InitLandscape phase: InitEnvSounds+SeaGulls {} ms",
                  Poseidon::Foundation::GlobalTickCount() - tStep);
@@ -1074,6 +1202,15 @@ void World::ParseCfgWorld()
 
     _latitude = LoadValue(cls, "latitude", -40) * (H_PI / 180); // -40 - Croatia, -90 - north pole;
     _longitude = LoadValue(cls, "longitude", +15) * (H_PI / 180);
+    // RFG-187: a native Reforger world sits where its own TimeAndWeatherManager says (north is
+    // negative here, as in the CfgWorlds convention above).
+    if (float lat = 0.0f, lon = 0.0f;
+        GLandscape != nullptr && GLandscape->GetEnfusionSurfaceCount() > 0 && GetEnfusionWorldGeo(lat, lon))
+    {
+        _latitude = -lat * (H_PI / 180);
+        _longitude = lon * (H_PI / 180);
+        LOG_INFO(Core, "World geo: native world at latitude {:.3f}, longitude {:.3f} (RFG-187)", lat, lon);
+    }
 
     const ParamEntry& clsGrid = cls >> "Grid";
     _gridOffsetX = clsGrid >> "offsetX";
@@ -1125,6 +1262,7 @@ void World::CleanUpDeinit()
     {
         _titleEffect.Free();
         _cutEffect.Free();
+        _cutLayers.clear();
         if (GSoundScene)
         {
             GSoundScene->StopMusicTrack();
@@ -1162,6 +1300,7 @@ void World::CleanUpDeinit()
 
     extern RefArray<Object> MapDiags;
     MapDiags.Clear();
+    Poseidon::ClearScriptLights(); // LGT-SCRIPT-001: "#lightpoint" lights end with the mission
 
     _engine->TextBank()->FlushTextures();
 }
